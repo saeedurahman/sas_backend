@@ -13,12 +13,19 @@ from app.models.enums import (
     LedgerEntryTypeEnum,
     PaymentMethodEnum,
     ReferenceTypeEnum,
+    RegisterTxTypeEnum,
     StockMovementTypeEnum,
 )
 from app.models.inventory import PurchaseLine
+from app.models.register import RegisterTransaction
 from app.models.sales import DiscountScheme, Sale, SaleLine, SalePayment
 from app.schemas.sales import CreateSaleRequest
-from app.services.customer_service import create_ledger_entry, get_customer_by_id
+from app.services.customer_service import (
+    create_ledger_entry,
+    get_customer_balance,
+    get_customer_by_id,
+)
+from app.services.register_service import verify_open_register_shift
 from app.services.pricing_engine import (
     calculate_line_total,
     calculate_sale_totals,
@@ -52,24 +59,31 @@ async def _get_fifo_cost_per_unit(
     variation_id: UUID | None,
     qty: Decimal,
 ) -> Decimal:
+    # Primary path: the get_fifo_cost stored proc computes true weighted FIFO
+    # cost. Wrap it in a SAVEPOINT so that if the proc errors at the Postgres
+    # level (e.g. no purchase history to aggregate), the savepoint rolls back
+    # and the outer transaction stays usable for the fallback query below —
+    # otherwise the connection is left in an aborted state and every
+    # subsequent statement fails with InFailedSQLTransactionError.
     try:
-        result = await db.execute(
-            text(
-                "SELECT get_fifo_cost(:bid, :pid, :vid, :qty)"
-            ),
-            {
-                "bid": business_id,
-                "pid": product_id,
-                "vid": variation_id,
-                "qty": qty,
-            },
-        )
-        cost = result.scalar_one_or_none()
+        async with db.begin_nested():
+            result = await db.execute(
+                text("SELECT get_fifo_cost(:bid, :pid, :vid, :qty)"),
+                {
+                    "bid": business_id,
+                    "pid": product_id,
+                    "vid": variation_id,
+                    "qty": qty,
+                },
+            )
+            cost = result.scalar_one_or_none()
         if cost is not None:
             return Decimal(str(cost))
     except Exception:
         pass
 
+    # Fallback: most recent recorded purchase cost for this product/variation.
+    # Returns NULL (→ Decimal("0")) for products never received via a purchase.
     stmt = (
         select(PurchaseLine.cost_per_unit)
         .where(
@@ -85,8 +99,7 @@ async def _get_fifo_cost_per_unit(
     else:
         stmt = stmt.where(PurchaseLine.variation_id == variation_id)
 
-    fallback = await db.execute(stmt)
-    last_cost = fallback.scalar_one_or_none()
+    last_cost = (await db.execute(stmt)).scalar_one_or_none()
     if last_cost is not None:
         return Decimal(str(last_cost))
     return Decimal("0")
@@ -268,6 +281,53 @@ async def create_sale(
                 db, data.discount_scheme_id, business_id
             )
 
+        if data.register_shift_id is not None:
+            await verify_open_register_shift(
+                db,
+                data.register_shift_id,
+                business_id,
+                closed_detail="Cannot record sale — shift is not open",
+            )
+
+        credit_payments = [
+            p for p in data.payments
+            if p.payment_method == PaymentMethodEnum.credit
+        ]
+        if credit_payments:
+            if data.customer_id is None:
+                raise HTTPException(
+                    status_code=status.HTTP_400_BAD_REQUEST,
+                    detail="customer_id is required for credit payments",
+                )
+            customer = await get_customer_by_id(
+                db, data.customer_id, business_id
+            )
+            credit_amount_this_sale = sum(
+                (p.amount for p in credit_payments),
+                Decimal("0"),
+            )
+            if customer.credit_limit > Decimal("0"):
+                current_balance = await get_customer_balance(
+                    db, data.customer_id, business_id
+                )
+                projected_balance = current_balance - credit_amount_this_sale
+                if (
+                    projected_balance < Decimal("0")
+                    and abs(projected_balance) > customer.credit_limit
+                ):
+                    if current_balance < Decimal("0"):
+                        available = customer.credit_limit - abs(current_balance)
+                    else:
+                        available = customer.credit_limit
+                    raise HTTPException(
+                        status_code=status.HTTP_400_BAD_REQUEST,
+                        detail=(
+                            "Credit limit exceeded. Customer's available "
+                            f"credit is Rs. {available}, but this sale "
+                            f"requires Rs. {credit_amount_this_sale} on credit."
+                        ),
+                    )
+
         for line in data.lines:
             await verify_product(db, line.product_id, business_id)
             if line.variation_id is not None:
@@ -334,6 +394,9 @@ async def create_sale(
         db.add(sale)
         await db.flush()
 
+        if data.register_shift_id is not None:
+            sale.register_shift_id = data.register_shift_id
+
         created_lines: list[SaleLine] = []
         for snapshot in line_snapshots:
             line_data = snapshot["line_data"]
@@ -374,6 +437,25 @@ async def create_sale(
                 updated_at=now,
             )
             db.add(payment)
+
+            if (
+                data.register_shift_id is not None
+                and payment.status == "completed"
+            ):
+                register_tx = RegisterTransaction(
+                    business_id=business_id,
+                    register_shift_id=data.register_shift_id,
+                    tx_type=RegisterTxTypeEnum.sale.value,
+                    payment_method=payment.payment_method,
+                    amount=payment.amount,
+                    reference_type=ReferenceTypeEnum.sale.value,
+                    reference_id=sale.id,
+                    transacted_at=paid_at,
+                    created_by=created_by,
+                    created_at=now,
+                    updated_at=now,
+                )
+                db.add(register_tx)
 
         for sale_line in created_lines:
             if not allow_negative:

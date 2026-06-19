@@ -595,6 +595,34 @@ async def get_shifts(
     return list(result.scalars().unique().all()), total
 
 
+async def verify_open_register_shift(
+    db: AsyncSession,
+    shift_id: UUID,
+    business_id: UUID,
+    *,
+    closed_detail: str = "Shift is not open",
+) -> RegisterShift:
+    result = await db.execute(
+        select(RegisterShift).where(
+            RegisterShift.id == shift_id,
+            RegisterShift.business_id == business_id,
+            RegisterShift.deleted_at.is_(None),
+        )
+    )
+    shift = result.scalar_one_or_none()
+    if shift is None:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail="Shift not found",
+        )
+    if shift.status != ShiftStatusEnum.open.value:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail=closed_detail,
+        )
+    return shift
+
+
 async def get_shift_by_id(
     db: AsyncSession,
     shift_id: UUID,

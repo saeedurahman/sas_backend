@@ -8,8 +8,10 @@ from app.database import get_db
 from app.dependencies import get_current_user, require_manager
 from app.models.user import User
 from app.schemas.sales import (
+    CreateCustomerPaymentRequest,
     CreateCustomerRequest,
     CustomerLedgerResponse,
+    CustomerPaymentResponse,
     CustomerResponse,
     UpdateCustomerRequest,
 )
@@ -19,6 +21,7 @@ from app.services.customer_service import (
     get_customer_by_id,
     get_customer_ledger,
     get_customers,
+    record_customer_payment,
     update_customer,
 )
 
@@ -111,3 +114,23 @@ async def get_ledger(
         db, customer_id, current_user.business_id, skip, limit
     )
     return entries
+
+
+@router.post(
+    "/{customer_id}/payments",
+    response_model=CustomerPaymentResponse,
+    status_code=status.HTTP_201_CREATED,
+)
+async def record_customer_payment_endpoint(
+    customer_id: UUID,
+    data: CreateCustomerPaymentRequest,
+    current_user: User = Depends(require_manager),
+    db=Depends(get_db),
+):
+    return await record_customer_payment(
+        db,
+        current_user.business_id,
+        customer_id,
+        data,
+        current_user.id,
+    )

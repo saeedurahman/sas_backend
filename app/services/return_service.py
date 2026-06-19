@@ -9,7 +9,13 @@ from sqlalchemy import func, select
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.orm import selectinload
 
-from app.models.enums import LedgerEntryTypeEnum, ReferenceTypeEnum, StockMovementTypeEnum
+from app.models.enums import (
+    LedgerEntryTypeEnum,
+    ReferenceTypeEnum,
+    RegisterTxTypeEnum,
+    StockMovementTypeEnum,
+)
+from app.models.register import RegisterTransaction
 from app.models.sales import Sale, SaleLine, SaleReturn, SaleReturnLine, SaleReturnPayment
 from app.schemas.sales import CreateSaleReturnRequest
 from app.services.customer_service import create_ledger_entry, get_customer_by_id
@@ -236,6 +242,22 @@ async def create_sale_return(
                 updated_at=now,
             )
             db.add(payment)
+
+            if data.register_shift_id is not None:
+                register_tx = RegisterTransaction(
+                    business_id=business_id,
+                    register_shift_id=data.register_shift_id,
+                    tx_type=RegisterTxTypeEnum.sale_return.value,
+                    payment_method=payment.payment_method,
+                    amount=payment.amount,
+                    reference_type=ReferenceTypeEnum.sale_return.value,
+                    reference_id=sale_return.id,
+                    transacted_at=returned_at,
+                    created_by=created_by,
+                    created_at=now,
+                    updated_at=now,
+                )
+                db.add(register_tx)
 
         if customer_id is not None and total_refund > 0:
             await create_ledger_entry(

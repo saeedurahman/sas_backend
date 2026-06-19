@@ -8,9 +8,21 @@ from fastapi import HTTPException, status
 from sqlalchemy import func, or_, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from app.models.enums import LedgerEntryTypeEnum, ReferenceTypeEnum
+from app.models.enums import (
+    LedgerEntryTypeEnum,
+    PaymentMethodEnum,
+    ReferenceTypeEnum,
+    RegisterTxTypeEnum,
+)
+from app.models.register import RegisterTransaction
 from app.models.sales import Customer, CustomerLedger
-from app.schemas.sales import CreateCustomerRequest, UpdateCustomerRequest
+from app.schemas.sales import (
+    CreateCustomerPaymentRequest,
+    CreateCustomerRequest,
+    CustomerPaymentResponse,
+    UpdateCustomerRequest,
+)
+from app.services.register_service import verify_open_register_shift
 
 
 def _now() -> datetime:
@@ -182,3 +194,82 @@ async def create_ledger_entry(
     db.add(entry)
     await db.flush()
     return entry
+
+
+async def record_customer_payment(
+    db: AsyncSession,
+    business_id: UUID,
+    customer_id: UUID,
+    data: CreateCustomerPaymentRequest,
+    created_by: UUID,
+) -> CustomerPaymentResponse:
+    await get_customer_by_id(db, customer_id, business_id)
+
+    if data.register_shift_id is not None:
+        await verify_open_register_shift(
+            db,
+            data.register_shift_id,
+            business_id,
+            closed_detail="Cannot record payment — shift is not open",
+        )
+
+    now = _now()
+    note_parts: list[str] = [
+        f"Payment received via {data.payment_method.value}",
+    ]
+    if data.reference_no:
+        note_parts.append(f"Ref: {data.reference_no}")
+    if data.notes:
+        note_parts.append(data.notes)
+    ledger_notes = " | ".join(note_parts)
+
+    try:
+        entry = await create_ledger_entry(
+            db=db,
+            business_id=business_id,
+            customer_id=customer_id,
+            entry_type=LedgerEntryTypeEnum.payment,
+            amount=data.amount,
+            created_by=created_by,
+            reference_type=ReferenceTypeEnum.manual,
+            reference_id=customer_id,
+            notes=ledger_notes,
+        )
+
+        # register_tx_type_enum has no customer_payment value; cash_in is the
+        # correct existing type for cash received into the drawer.
+        if (
+            data.register_shift_id is not None
+            and data.payment_method == PaymentMethodEnum.cash
+        ):
+            register_tx = RegisterTransaction(
+                business_id=business_id,
+                register_shift_id=data.register_shift_id,
+                tx_type=RegisterTxTypeEnum.cash_in.value,
+                payment_method=PaymentMethodEnum.cash.value,
+                amount=data.amount,
+                reference_type=ReferenceTypeEnum.manual.value,
+                reference_id=entry.id,
+                notes=ledger_notes,
+                transacted_at=now,
+                created_by=created_by,
+                created_at=now,
+                updated_at=now,
+            )
+            db.add(register_tx)
+
+        await db.commit()
+    except HTTPException:
+        await db.rollback()
+        raise
+    except Exception:
+        await db.rollback()
+        raise
+
+    new_balance = await get_customer_balance(db, customer_id, business_id)
+    return CustomerPaymentResponse(
+        ledger_entry_id=entry.id,
+        customer_id=customer_id,
+        amount=data.amount,
+        new_balance=new_balance,
+    )

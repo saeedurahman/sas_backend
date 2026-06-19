@@ -55,6 +55,39 @@ class UpdateCustomerRequest(BaseSchema):
         return value
 
 
+class CreateCustomerPaymentRequest(BaseSchema):
+    amount: Decimal
+    payment_method: PaymentMethodEnum
+    reference_no: str | None = None
+    notes: str | None = None
+    register_shift_id: UUID | None = None
+
+    @field_validator("amount")
+    @classmethod
+    def validate_amount(cls, value: Decimal) -> Decimal:
+        if value <= 0:
+            raise ValueError("amount must be greater than 0")
+        return value
+
+    @field_validator("payment_method")
+    @classmethod
+    def reject_credit_payment_method(
+        cls, value: PaymentMethodEnum
+    ) -> PaymentMethodEnum:
+        if value == PaymentMethodEnum.credit:
+            raise ValueError(
+                "credit is not a valid payment method for paying down balance"
+            )
+        return value
+
+
+class CustomerPaymentResponse(BaseSchema):
+    ledger_entry_id: UUID
+    customer_id: UUID
+    amount: Decimal
+    new_balance: Decimal
+
+
 class CreateTaxRateRequest(BaseSchema):
     name: str = Field(min_length=2, max_length=100)
     rate: Decimal
@@ -173,6 +206,7 @@ class CreatePaymentRequest(BaseSchema):
 
 class CreateSaleRequest(BaseSchema):
     branch_id: UUID
+    register_shift_id: UUID | None = None
     customer_id: UUID | None = None
     sale_type: SaleTypeEnum = SaleTypeEnum.pos
     price_list_id: UUID | None = None
@@ -233,6 +267,7 @@ class CreateRefundPaymentRequest(BaseSchema):
 
 class CreateSaleReturnRequest(BaseSchema):
     branch_id: UUID
+    register_shift_id: UUID | None = None
     sale_id: UUID | None = None
     customer_id: UUID | None = None
     reason: str | None = None

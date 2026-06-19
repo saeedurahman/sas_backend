@@ -1791,9 +1791,9 @@ async def get_recent_transactions(
             u.full_name AS cashier_name,
             COALESCE(SUM({_line_revenue_expr()}), 0) AS total_amount,
             COALESCE(
-                ARRAY_AGG(DISTINCT sp.payment_method)
+                ARRAY_AGG(DISTINCT sp.payment_method::text)
                     FILTER (WHERE sp.payment_method IS NOT NULL),
-                ARRAY[]::varchar[]
+                ARRAY[]::text[]
             ) AS payment_methods
         FROM sales s
         INNER JOIN branches b ON b.id = s.branch_id
