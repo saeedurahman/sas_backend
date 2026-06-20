@@ -18,8 +18,10 @@ from app.models.enums import (
 )
 from app.models.inventory import PurchaseLine
 from app.models.register import RegisterTransaction
-from app.models.sales import DiscountScheme, Sale, SaleLine, SalePayment
+from app.models.sales import Customer, DiscountScheme, Sale, SaleLine, SalePayment
+from app.models.user import User
 from app.schemas.sales import CreateSaleRequest
+from app.services.invoice_service import _round2
 from app.services.customer_service import (
     create_ledger_entry,
     get_customer_balance,
@@ -31,6 +33,7 @@ from app.services.pricing_engine import (
     calculate_sale_totals,
     determine_sale_status,
 )
+from app.services.return_service import get_returned_qty_by_sale_line_ids
 from app.services.stock_service import (
     _now,
     check_sufficient_stock,
@@ -138,6 +141,35 @@ async def _verify_discount_scheme(
     return scheme
 
 
+_ZERO = Decimal("0")
+
+
+async def _fetch_payment_methods_by_sale(
+    db: AsyncSession,
+    business_id: UUID,
+    sale_ids: list[UUID],
+) -> dict[UUID, list[str]]:
+    if not sale_ids:
+        return {}
+
+    result = await db.execute(
+        select(SalePayment.sale_id, SalePayment.payment_method)
+        .where(
+            SalePayment.sale_id.in_(sale_ids),
+            SalePayment.business_id == business_id,
+            SalePayment.deleted_at.is_(None),
+            SalePayment.status == "completed",
+        )
+        .distinct()
+        .order_by(SalePayment.sale_id, SalePayment.payment_method)
+    )
+
+    methods_by_sale: dict[UUID, list[str]] = {sale_id: [] for sale_id in sale_ids}
+    for sale_id, payment_method in result.all():
+        methods_by_sale[sale_id].append(payment_method)
+    return methods_by_sale
+
+
 async def get_sales(
     db: AsyncSession,
     business_id: UUID,
@@ -177,6 +209,17 @@ async def get_sales(
         .correlate(Sale)
         .scalar_subquery()
     )
+    item_count_subq = (
+        select(func.count())
+        .select_from(SaleLine)
+        .where(
+            SaleLine.sale_id == Sale.id,
+            SaleLine.business_id == business_id,
+            SaleLine.deleted_at.is_(None),
+        )
+        .correlate(Sale)
+        .scalar_subquery()
+    )
 
     filters = [
         Sale.business_id == business_id,
@@ -210,16 +253,30 @@ async def get_sales(
             Sale,
             total_amount_subq.label("total_amount"),
             total_paid_subq.label("total_paid"),
+            item_count_subq.label("item_count"),
+            Customer.name.label("customer_name"),
+            User.full_name.label("cashier_name"),
         )
+        .outerjoin(Customer, Sale.customer_id == Customer.id)
+        .join(User, Sale.created_by == User.id)
         .where(*filters)
         .order_by(Sale.sold_at.desc())
         .offset(skip)
         .limit(limit)
     )
 
+    rows = result.all()
+    sale_ids = [row[0].id for row in rows]
+    payment_methods_by_sale = await _fetch_payment_methods_by_sale(
+        db, business_id, sale_ids
+    )
+
     items: list[dict] = []
-    for row in result.all():
+    for row in rows:
         sale = row[0]
+        total_amount = _round2(Decimal(str(row.total_amount)))
+        total_paid = _round2(Decimal(str(row.total_paid)))
+        balance_due = _round2(max(total_amount - total_paid, _ZERO))
         items.append(
             {
                 "id": sale.id,
@@ -230,8 +287,13 @@ async def get_sales(
                 "sale_type": sale.sale_type,
                 "status": sale.status,
                 "sold_at": sale.sold_at,
-                "total_amount": Decimal(str(row.total_amount)),
-                "total_paid": Decimal(str(row.total_paid)),
+                "total_amount": total_amount,
+                "total_paid": total_paid,
+                "balance_due": balance_due,
+                "customer_name": row.customer_name,
+                "cashier_name": row.cashier_name,
+                "item_count": int(row.item_count),
+                "payment_methods": payment_methods_by_sale.get(sale.id, []),
             }
         )
     return items, total
@@ -257,6 +319,19 @@ async def get_sale_by_id(
             status_code=status.HTTP_404_NOT_FOUND,
             detail="Sale not found",
         )
+
+    active_line_ids = [
+        line.id for line in sale.lines if line.deleted_at is None
+    ]
+    returned_by_line = await get_returned_qty_by_sale_line_ids(
+        db, business_id, active_line_ids
+    )
+    for line in sale.lines:
+        if line.deleted_at is None:
+            line.returned_qty = returned_by_line.get(line.id, Decimal("0"))
+        else:
+            line.returned_qty = Decimal("0")
+
     return sale
 
 

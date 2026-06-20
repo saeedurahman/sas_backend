@@ -34,6 +34,22 @@ def _now() -> datetime:
     return datetime.now(timezone.utc)
 
 
+def _shift_user_load_options():
+    return (
+        selectinload(RegisterShift.opened_by_user),
+        selectinload(RegisterShift.closed_by_user),
+        selectinload(RegisterShift.transactions),
+    )
+
+
+def _attach_shift_user_names(shift: RegisterShift) -> RegisterShift:
+    opener = shift.opened_by_user
+    closer = shift.closed_by_user
+    shift.opened_by_name = opener.full_name if opener is not None else "Unknown"
+    shift.closed_by_name = closer.full_name if closer is not None else None
+    return shift
+
+
 async def _log_audit(
     db: AsyncSession,
     *,
@@ -587,12 +603,15 @@ async def get_shifts(
     result = await db.execute(
         select(RegisterShift)
         .where(*filters)
-        .options(selectinload(RegisterShift.transactions))
+        .options(*_shift_user_load_options())
         .order_by(RegisterShift.opened_at.desc())
         .offset(skip)
         .limit(limit)
     )
-    return list(result.scalars().unique().all()), total
+    shifts = list(result.scalars().unique().all())
+    for shift in shifts:
+        _attach_shift_user_names(shift)
+    return shifts, total
 
 
 async def verify_open_register_shift(
@@ -635,7 +654,7 @@ async def get_shift_by_id(
             RegisterShift.business_id == business_id,
             RegisterShift.deleted_at.is_(None),
         )
-        .options(selectinload(RegisterShift.transactions))
+        .options(*_shift_user_load_options())
     )
     shift = result.scalar_one_or_none()
     if shift is None:
@@ -643,4 +662,4 @@ async def get_shift_by_id(
             status_code=status.HTTP_404_NOT_FOUND,
             detail="Shift not found",
         )
-    return shift
+    return _attach_shift_user_names(shift)

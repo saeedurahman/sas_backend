@@ -89,7 +89,9 @@ class RegisterShiftResponse(BaseSchema):
     branch_id: UUID
     cash_register_id: UUID
     opened_by: UUID
+    opened_by_name: str
     closed_by: UUID | None = None
+    closed_by_name: str | None = None
     status: str
     opening_float: Decimal
     expected_cash: Decimal | None = None

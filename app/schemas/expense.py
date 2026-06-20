@@ -32,6 +32,17 @@ class CreateExpensePaymentRequest(BaseSchema):
             raise ValueError("amount must be greater than 0")
         return value
 
+    @field_validator("payment_method")
+    @classmethod
+    def reject_credit_payment_method(
+        cls, value: PaymentMethodEnum
+    ) -> PaymentMethodEnum:
+        if value == PaymentMethodEnum.credit:
+            raise ValueError(
+                "credit is not a valid payment method for expense payments"
+            )
+        return value
+
 
 class CreateExpenseRequest(BaseSchema):
     branch_id: UUID
@@ -101,6 +112,8 @@ class ExpensePaymentResponse(BaseSchema):
     reference_no: str | None = None
     paid_at: datetime
     created_at: datetime
+    total_paid: Decimal | None = None
+    remaining_balance: Decimal | None = None
 
 
 class ExpenseResponse(AuditSchema):

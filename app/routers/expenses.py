@@ -9,15 +9,18 @@ from app.models.user import User
 from app.schemas.auth import MessageResponse
 from app.schemas.expense import (
     CreateExpenseCategoryRequest,
+    CreateExpensePaymentRequest,
     CreateExpenseRequest,
     ExpenseCategoryResponse,
     ExpenseListResponse,
+    ExpensePaymentResponse,
     ExpenseResponse,
     PaginatedExpenseResponse,
     UpdateExpenseCategoryRequest,
     UpdateExpenseRequest,
 )
 from app.services.expense_service import (
+    add_expense_payment,
     create_expense,
     create_expense_category,
     delete_expense,
@@ -146,6 +149,26 @@ async def create_expense_endpoint(
 ):
     return await create_expense(
         db, current_user.business_id, data, current_user.id
+    )
+
+
+@router.post(
+    "/{expense_id}/payments",
+    response_model=ExpensePaymentResponse,
+    status_code=status.HTTP_201_CREATED,
+)
+async def add_expense_payment_endpoint(
+    expense_id: UUID,
+    data: CreateExpensePaymentRequest,
+    current_user: User = Depends(require_manager),
+    db=Depends(get_db),
+):
+    return await add_expense_payment(
+        db,
+        current_user.business_id,
+        expense_id,
+        data,
+        current_user.id,
     )
 
 

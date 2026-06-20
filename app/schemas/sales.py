@@ -360,6 +360,7 @@ class SaleLineResponse(BaseSchema):
     cost_per_unit: Decimal
     notes: str | None
     line_order: int
+    returned_qty: Decimal = Decimal("0")
 
 
 class SaleReturnPaymentResponse(BaseSchema):
@@ -421,6 +422,13 @@ class SaleListResponse(BaseSchema):
     sale_type: str
     status: str
     sold_at: datetime
+    total_amount: Decimal
+    total_paid: Decimal
+    balance_due: Decimal
+    customer_name: str | None
+    cashier_name: str
+    item_count: int
+    payment_methods: list[str] = Field(default_factory=list)
 
 
 class PaginatedSaleResponse(BaseSchema):

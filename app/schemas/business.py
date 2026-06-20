@@ -95,6 +95,9 @@ class BusinessResponse(AuditSchema):
     legal_name: str | None = None
     email: EmailStr | None = None
     phone: str | None = None
+    tax_id: str | None = None
+    address_line1: str | None = None
+    logo_url: str | None = None
     city: str | None = None
     country_code: str
     currency_code: str
@@ -111,3 +114,16 @@ class UpdateBusinessRequest(BaseSchema):
     legal_name: str | None = Field(default=None, max_length=255)
     city: str | None = Field(default=None, max_length=100)
     email: EmailStr | None = None
+    phone: str | None = None
+    tax_id: str | None = Field(default=None, max_length=100)
+    address_line1: str | None = Field(default=None, max_length=255)
+    logo_url: str | None = None
+
+    @field_validator("phone")
+    @classmethod
+    def check_phone(cls, value: str | None) -> str | None:
+        if value is None:
+            return value
+        from app.validators import validate_phone
+
+        return validate_phone(value)

@@ -20,7 +20,9 @@ from app.models.expense import Expense, ExpenseCategory, ExpensePayment
 from app.models.register import RegisterShift, RegisterTransaction
 from app.schemas.expense import (
     CreateExpenseCategoryRequest,
+    CreateExpensePaymentRequest,
     CreateExpenseRequest,
+    ExpensePaymentResponse,
     UpdateExpenseCategoryRequest,
     UpdateExpenseRequest,
 )
@@ -232,6 +234,109 @@ async def get_expense_by_id(
             detail="Expense not found",
         )
     return expense
+
+
+async def _sum_expense_payments(
+    db: AsyncSession,
+    business_id: UUID,
+    expense_id: UUID,
+) -> Decimal:
+    result = await db.execute(
+        select(func.coalesce(func.sum(ExpensePayment.amount), 0)).where(
+            ExpensePayment.expense_id == expense_id,
+            ExpensePayment.business_id == business_id,
+            ExpensePayment.deleted_at.is_(None),
+            ExpensePayment.status == PaymentStatusEnum.completed.value,
+        )
+    )
+    return Decimal(str(result.scalar_one()))
+
+
+async def add_expense_payment(
+    db: AsyncSession,
+    business_id: UUID,
+    expense_id: UUID,
+    data: CreateExpensePaymentRequest,
+    created_by: UUID,
+) -> ExpensePaymentResponse:
+    expense = await get_expense_by_id(db, expense_id, business_id)
+
+    total_liability = expense.amount + expense.tax_amount
+    current_paid = await _sum_expense_payments(db, business_id, expense_id)
+    remaining = max(total_liability - current_paid, Decimal("0"))
+
+    if data.amount > remaining:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail=(
+                f"Payment of Rs. {data.amount} exceeds remaining "
+                f"balance of Rs. {remaining}"
+            ),
+        )
+
+    now = _now()
+    paid_at = data.paid_at or now
+
+    try:
+        payment = ExpensePayment(
+            business_id=business_id,
+            expense_id=expense.id,
+            payment_method=data.payment_method.value,
+            amount=data.amount,
+            status=PaymentStatusEnum.completed.value,
+            paid_at=paid_at,
+            reference_no=data.reference_no,
+            created_by=created_by,
+            created_at=now,
+            updated_at=now,
+        )
+        db.add(payment)
+        await db.flush()
+
+        if data.payment_method == PaymentMethodEnum.cash:
+            active_shift = await _get_active_shift_for_branch(
+                db, business_id, expense.branch_id
+            )
+            if active_shift is not None:
+                register_tx = RegisterTransaction(
+                    business_id=business_id,
+                    register_shift_id=active_shift.id,
+                    tx_type=RegisterTxTypeEnum.expense.value,
+                    payment_method=PaymentMethodEnum.cash.value,
+                    amount=data.amount,
+                    reference_type=_EXPENSE_REF_TYPE,
+                    reference_id=expense.id,
+                    transacted_at=paid_at,
+                    created_by=created_by,
+                    created_at=now,
+                    updated_at=now,
+                )
+                db.add(register_tx)
+
+        await db.commit()
+    except HTTPException:
+        await db.rollback()
+        raise
+    except Exception:
+        await db.rollback()
+        raise
+
+    total_paid = current_paid + data.amount
+    remaining_balance = max(total_liability - total_paid, Decimal("0"))
+
+    return ExpensePaymentResponse(
+        id=payment.id,
+        business_id=payment.business_id,
+        expense_id=payment.expense_id,
+        payment_method=payment.payment_method,
+        amount=payment.amount,
+        status=payment.status,
+        reference_no=payment.reference_no,
+        paid_at=payment.paid_at,
+        created_at=payment.created_at,
+        total_paid=total_paid,
+        remaining_balance=remaining_balance,
+    )
 
 
 async def create_expense(

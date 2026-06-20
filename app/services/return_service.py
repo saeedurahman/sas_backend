@@ -29,6 +29,61 @@ from app.services.stock_service import (
 )
 
 
+_ZERO = Decimal("0")
+
+
+async def get_returned_qty_by_sale_line_ids(
+    db: AsyncSession,
+    business_id: UUID,
+    sale_line_ids: list[UUID],
+) -> dict[UUID, Decimal]:
+    """Sum non-deleted return line qty per sale line across all returns."""
+    if not sale_line_ids:
+        return {}
+
+    result = await db.execute(
+        select(
+            SaleReturnLine.sale_line_id,
+            func.coalesce(func.sum(SaleReturnLine.qty), 0),
+        )
+        .join(SaleReturn, SaleReturnLine.sale_return_id == SaleReturn.id)
+        .where(
+            SaleReturnLine.sale_line_id.in_(sale_line_ids),
+            SaleReturnLine.business_id == business_id,
+            SaleReturnLine.deleted_at.is_(None),
+            SaleReturn.business_id == business_id,
+            SaleReturn.deleted_at.is_(None),
+        )
+        .group_by(SaleReturnLine.sale_line_id)
+    )
+
+    returned: dict[UUID, Decimal] = {line_id: _ZERO for line_id in sale_line_ids}
+    for sale_line_id, qty in result.all():
+        if sale_line_id is not None:
+            returned[sale_line_id] = Decimal(str(qty))
+    return returned
+
+
+async def _sum_returned_qty_for_sale_line(
+    db: AsyncSession,
+    business_id: UUID,
+    sale_line_id: UUID,
+) -> Decimal:
+    result = await db.execute(
+        select(func.coalesce(func.sum(SaleReturnLine.qty), 0))
+        .select_from(SaleReturnLine)
+        .join(SaleReturn, SaleReturnLine.sale_return_id == SaleReturn.id)
+        .where(
+            SaleReturnLine.sale_line_id == sale_line_id,
+            SaleReturnLine.business_id == business_id,
+            SaleReturnLine.deleted_at.is_(None),
+            SaleReturn.business_id == business_id,
+            SaleReturn.deleted_at.is_(None),
+        )
+    )
+    return Decimal(str(result.scalar_one()))
+
+
 async def get_sale_returns(
     db: AsyncSession,
     business_id: UUID,
@@ -130,6 +185,26 @@ async def create_sale_return(
         if customer_id is not None:
             await get_customer_by_id(db, customer_id, business_id)
 
+        sale_line_ids_to_lock = sorted(
+            {
+                line.sale_line_id
+                for line in data.lines
+                if line.sale_line_id is not None
+            }
+        )
+        if sale_line_ids_to_lock:
+            await db.execute(
+                select(SaleLine.id)
+                .where(
+                    SaleLine.id.in_(sale_line_ids_to_lock),
+                    SaleLine.business_id == business_id,
+                    SaleLine.deleted_at.is_(None),
+                )
+                .with_for_update()
+            )
+
+        pending_return_qty: dict[UUID, Decimal] = {}
+
         for line in data.lines:
             await verify_product(db, line.product_id, business_id)
             if line.variation_id is not None:
@@ -151,14 +226,29 @@ async def create_sale_return(
                         status_code=status.HTTP_400_BAD_REQUEST,
                         detail="Original sale line not found",
                     )
-                if line.qty > original_line.qty:
+
+                already_returned_qty = await _sum_returned_qty_for_sale_line(
+                    db, business_id, line.sale_line_id
+                )
+                pending_in_request = pending_return_qty.get(
+                    line.sale_line_id, _ZERO
+                )
+                max_returnable = (
+                    original_line.qty - already_returned_qty - pending_in_request
+                )
+                if line.qty > max_returnable:
                     raise HTTPException(
                         status_code=status.HTTP_400_BAD_REQUEST,
                         detail=(
-                            f"Return qty {line.qty} exceeds sold qty "
-                            f"{original_line.qty}"
+                            f"Cannot return {line.qty} units — only "
+                            f"{max_returnable} units remain returnable for "
+                            f"this item (originally sold: {original_line.qty}, "
+                            f"already returned: {already_returned_qty})"
                         ),
                     )
+                pending_return_qty[line.sale_line_id] = (
+                    pending_in_request + line.qty
+                )
 
         return_number = await generate_document_number(
             db, business_id, "RET", SaleReturn, SaleReturn.return_number

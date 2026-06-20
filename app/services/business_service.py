@@ -50,6 +50,14 @@ async def update_business_info(
         business.city = data.city
     if data.email is not None:
         business.email = str(data.email)
+    if data.phone is not None:
+        business.phone = data.phone
+    if data.tax_id is not None:
+        business.tax_id = data.tax_id
+    if data.address_line1 is not None:
+        business.address_line1 = data.address_line1
+    if data.logo_url is not None:
+        business.logo_url = data.logo_url
 
     business.updated_by = updated_by
     business.updated_at = now
