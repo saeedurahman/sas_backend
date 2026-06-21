@@ -4,7 +4,7 @@ from fastapi import APIRouter, Depends, Query, status
 from pydantic import BaseModel
 
 from app.database import get_db
-from app.dependencies import get_current_user, require_manager
+from app.dependencies import get_current_user
 from app.models.user import User
 from app.schemas.auth import MessageResponse
 from app.schemas.settings import (
@@ -120,7 +120,7 @@ async def remove_notification(
     status_code=status.HTTP_200_OK,
 )
 async def run_alert_checks(
-    current_user: User = Depends(require_manager),
+    current_user: User = Depends(get_current_user),
     db=Depends(get_db),
 ):
     low_stock = await check_low_stock_alerts(db, current_user.business_id)

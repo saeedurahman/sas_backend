@@ -319,14 +319,19 @@ async def get_active_shift(
     cash_register_id: UUID,
 ) -> RegisterShift | None:
     result = await db.execute(
-        select(RegisterShift).where(
+        select(RegisterShift)
+        .where(
             RegisterShift.cash_register_id == cash_register_id,
             RegisterShift.business_id == business_id,
             RegisterShift.status == ShiftStatusEnum.open.value,
             RegisterShift.deleted_at.is_(None),
         )
+        .options(*_shift_user_load_options())
     )
-    return result.scalar_one_or_none()
+    shift = result.scalar_one_or_none()
+    if shift is None:
+        return None
+    return _attach_shift_user_names(shift)
 
 
 async def open_shift(
