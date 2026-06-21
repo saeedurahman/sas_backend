@@ -417,8 +417,7 @@ async def open_shift(
     )
 
     await db.commit()
-    await db.refresh(shift)
-    return shift
+    return await get_shift_by_id(db, shift.id, business_id)
 
 
 async def close_shift(
