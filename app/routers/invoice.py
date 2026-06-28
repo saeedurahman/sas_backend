@@ -6,7 +6,7 @@ from fastapi import APIRouter, Depends, HTTPException, Query, status
 from fastapi.responses import StreamingResponse
 
 from app.database import get_db
-from app.dependencies import get_current_user, require_manager
+from app.dependencies import require_permission
 from app.models.user import User
 from app.schemas.invoice import InvoiceData, ThermalReceiptData
 from app.services.export_service import (
@@ -36,7 +36,7 @@ async def export_sales(
     date_to: date = Query(...),
     branch_id: UUID | None = Query(default=None),
     format: str = Query(default="csv"),
-    current_user: User = Depends(require_manager),
+    current_user: User = Depends(require_permission("reports.export")),
     db=Depends(get_db),
 ):
     if format not in ("csv", "excel"):
@@ -85,7 +85,7 @@ async def export_sales(
 async def export_inventory(
     branch_id: UUID | None = Query(default=None),
     format: str = Query(default="csv"),
-    current_user: User = Depends(require_manager),
+    current_user: User = Depends(require_permission("reports.export")),
     db=Depends(get_db),
 ):
     if format not in ("csv", "excel"):
@@ -125,7 +125,7 @@ async def export_inventory(
 )
 async def invoice_data(
     sale_id: UUID,
-    current_user: User = Depends(get_current_user),
+    current_user: User = Depends(require_permission("sales.view")),
     db=Depends(get_db),
 ):
     return await get_invoice_data(
@@ -140,7 +140,7 @@ async def invoice_data(
 )
 async def thermal_receipt(
     sale_id: UUID,
-    current_user: User = Depends(get_current_user),
+    current_user: User = Depends(require_permission("sales.view")),
     db=Depends(get_db),
 ):
     return await get_thermal_receipt_data(

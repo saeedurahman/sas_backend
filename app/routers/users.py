@@ -3,7 +3,7 @@ from uuid import UUID
 from fastapi import APIRouter, Depends, Query, status
 
 from app.database import get_db
-from app.dependencies import get_current_user, require_manager, require_owner
+from app.dependencies import get_current_user, require_permission
 from app.models.user import User
 from app.schemas.auth import MessageResponse
 from app.schemas.user import (
@@ -27,7 +27,7 @@ router = APIRouter(prefix="/users", tags=["users"])
 @router.get("", response_model=list[UserResponse], status_code=status.HTTP_200_OK)
 async def list_users(
     role: str | None = Query(default=None),
-    current_user: User = Depends(require_manager),
+    current_user: User = Depends(require_permission("users.view")),
     db=Depends(get_db),
 ):
     return await get_users_for_business(db, current_user.business_id, role)
@@ -36,7 +36,7 @@ async def list_users(
 @router.post("", response_model=UserResponse, status_code=status.HTTP_201_CREATED)
 async def create_user(
     data: CreateUserRequest,
-    current_user: User = Depends(require_owner),
+    current_user: User = Depends(require_permission("users.create")),
     db=Depends(get_db),
 ):
     return await create_tenant_user(
@@ -47,7 +47,7 @@ async def create_user(
 @router.get("/{user_id}", response_model=UserResponse, status_code=status.HTTP_200_OK)
 async def get_user(
     user_id: UUID,
-    current_user: User = Depends(require_manager),
+    current_user: User = Depends(require_permission("users.view")),
     db=Depends(get_db),
 ):
     return await get_user_by_id(db, user_id, current_user.business_id)
@@ -57,7 +57,7 @@ async def get_user(
 async def update_user(
     user_id: UUID,
     data: UpdateUserRequest,
-    current_user: User = Depends(require_owner),
+    current_user: User = Depends(require_permission("users.update")),
     db=Depends(get_db),
 ):
     return await update_tenant_user(
@@ -93,7 +93,7 @@ async def update_user_pin(
 )
 async def delete_user(
     user_id: UUID,
-    current_user: User = Depends(require_owner),
+    current_user: User = Depends(require_permission("users.delete")),
     db=Depends(get_db),
 ):
     await soft_delete_tenant_user(

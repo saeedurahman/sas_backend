@@ -125,15 +125,41 @@ async def require_manager(
 
 def _user_permission_keys(user: User) -> set[str]:
     keys: set[str] = set()
+    business_id = user.business_id
     for user_role in user.user_roles:
         if user_role.deleted_at is not None or user_role.role is None:
             continue
-        if user_role.role.deleted_at is not None:
+        if user_role.business_id != business_id:
             continue
-        for role_perm in user_role.role.role_permissions:
+        role = user_role.role
+        if role.deleted_at is not None or role.business_id != business_id:
+            continue
+        for role_perm in role.role_permissions:
+            if role_perm.business_id != business_id:
+                continue
             if role_perm.permission is not None:
                 keys.add(role_perm.permission.permission_key)
     return keys
+
+
+def user_roles_for_response(user: User) -> list[str]:
+    """Role display names for the current business, sorted case-insensitively."""
+    names: list[str] = []
+    business_id = user.business_id
+    for user_role in user.user_roles:
+        if user_role.deleted_at is not None or user_role.role is None:
+            continue
+        if user_role.business_id != business_id:
+            continue
+        role = user_role.role
+        if role.deleted_at is not None or role.business_id != business_id:
+            continue
+        names.append(role.name)
+    return sorted(names, key=str.lower)
+
+
+def user_permission_keys_for_response(user: User) -> list[str]:
+    return sorted(_user_permission_keys(user))
 
 
 def require_permission(permission_key: str) -> Callable[..., User]:
@@ -144,6 +170,23 @@ def require_permission(permission_key: str) -> Callable[..., User]:
             raise HTTPException(
                 status_code=status.HTTP_403_FORBIDDEN,
                 detail=f"Permission required: {permission_key}",
+            )
+        return current_user
+
+    return _checker
+
+
+def require_any_permission(*permission_keys: str) -> Callable[..., User]:
+    if not permission_keys:
+        raise ValueError("require_any_permission requires at least one permission key")
+
+    async def _checker(
+        current_user: User = Depends(get_current_user),
+    ) -> User:
+        if not _user_permission_keys(current_user).intersection(permission_keys):
+            raise HTTPException(
+                status_code=status.HTTP_403_FORBIDDEN,
+                detail=f"One of these permissions required: {', '.join(permission_keys)}",
             )
         return current_user
 

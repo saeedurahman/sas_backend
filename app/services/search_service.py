@@ -1,6 +1,5 @@
 """Global search across products, customers, suppliers, sales, and expenses."""
 
-import asyncio
 from datetime import date, datetime
 from decimal import Decimal
 from typing import Any
@@ -229,13 +228,11 @@ async def global_search(
 
     pattern = f"%{trimmed}%"
 
-    products, customers, suppliers, sales, expenses = await asyncio.gather(
-        _search_products(db, business_id, pattern),
-        _search_customers(db, business_id, pattern),
-        _search_suppliers(db, business_id, pattern),
-        _search_sales(db, business_id, pattern),
-        _search_expenses(db, business_id, pattern),
-    )
+    products = await _search_products(db, business_id, pattern)
+    customers = await _search_customers(db, business_id, pattern)
+    suppliers = await _search_suppliers(db, business_id, pattern)
+    sales = await _search_sales(db, business_id, pattern)
+    expenses = await _search_expenses(db, business_id, pattern)
 
     combined = products + customers + suppliers + sales + expenses
     combined.sort(key=lambda item: _sort_key(trimmed, item))

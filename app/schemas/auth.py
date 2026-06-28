@@ -59,6 +59,8 @@ class UserInfo(BaseSchema):
     branch_id: UUID | None = None
     business_name: str
     business_type_code: str
+    roles: list[str] = Field(default_factory=list)
+    permission_keys: list[str] = Field(default_factory=list)
 
 
 class TokenResponse(BaseSchema):

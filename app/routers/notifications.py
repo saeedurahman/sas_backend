@@ -4,7 +4,7 @@ from fastapi import APIRouter, Depends, Query, status
 from pydantic import BaseModel
 
 from app.database import get_db
-from app.dependencies import get_current_user
+from app.dependencies import require_permission
 from app.models.user import User
 from app.schemas.auth import MessageResponse
 from app.schemas.settings import (
@@ -43,7 +43,7 @@ async def list_notifications(
     notification_type: str | None = Query(default=None),
     skip: int = Query(default=0, ge=0),
     limit: int = Query(default=50, le=200),
-    current_user: User = Depends(get_current_user),
+    current_user: User = Depends(require_permission("notifications.view")),
     db=Depends(get_db),
 ):
     items, total, unread_count = await get_notifications(
@@ -71,7 +71,7 @@ async def list_notifications(
 )
 async def mark_read(
     data: MarkNotificationReadRequest,
-    current_user: User = Depends(get_current_user),
+    current_user: User = Depends(require_permission("notifications.view")),
     db=Depends(get_db),
 ):
     updated = await mark_as_read(
@@ -89,7 +89,7 @@ async def mark_read(
     status_code=status.HTTP_200_OK,
 )
 async def mark_all_read(
-    current_user: User = Depends(get_current_user),
+    current_user: User = Depends(require_permission("notifications.view")),
     db=Depends(get_db),
 ):
     updated = await mark_all_as_read(
@@ -105,7 +105,7 @@ async def mark_all_read(
 )
 async def remove_notification(
     notification_id: UUID,
-    current_user: User = Depends(get_current_user),
+    current_user: User = Depends(require_permission("notifications.view")),
     db=Depends(get_db),
 ):
     await delete_notification(
@@ -120,7 +120,7 @@ async def remove_notification(
     status_code=status.HTTP_200_OK,
 )
 async def run_alert_checks(
-    current_user: User = Depends(get_current_user),
+    current_user: User = Depends(require_permission("notifications.manage")),
     db=Depends(get_db),
 ):
     low_stock = await check_low_stock_alerts(db, current_user.business_id)

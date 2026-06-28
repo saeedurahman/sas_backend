@@ -3,7 +3,7 @@ from uuid import UUID
 from fastapi import APIRouter, Depends, Query, status
 
 from app.database import get_db
-from app.dependencies import get_current_user, require_manager
+from app.dependencies import require_permission
 from app.models.user import User
 from app.schemas.inventory import (
     CreateStockAdjustmentRequest,
@@ -27,7 +27,7 @@ async def list_adjustments(
     branch_id: UUID | None = Query(default=None),
     skip: int = Query(default=0, ge=0),
     limit: int = Query(default=50, le=200),
-    current_user: User = Depends(get_current_user),
+    current_user: User = Depends(require_permission("inventory.view")),
     db=Depends(get_db),
 ):
     adjustments, _ = await get_stock_adjustments(
@@ -43,7 +43,7 @@ async def list_adjustments(
 )
 async def create_adjustment(
     data: CreateStockAdjustmentRequest,
-    current_user: User = Depends(require_manager),
+    current_user: User = Depends(require_permission("inventory.adjust")),
     db=Depends(get_db),
 ):
     return await create_stock_adjustment(
@@ -58,7 +58,7 @@ async def create_adjustment(
 )
 async def get_adjustment(
     adj_id: UUID,
-    current_user: User = Depends(get_current_user),
+    current_user: User = Depends(require_permission("inventory.view")),
     db=Depends(get_db),
 ):
     return await get_stock_adjustment_by_id(

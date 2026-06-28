@@ -4,7 +4,7 @@ from uuid import UUID
 from fastapi import APIRouter, Depends, Query, status
 
 from app.database import get_db
-from app.dependencies import get_current_user, require_manager
+from app.dependencies import require_permission
 from app.models.user import User
 from app.schemas.sales import (
     CreateSaleRequest,
@@ -37,7 +37,7 @@ async def list_sales(
     search: str | None = Query(default=None),
     skip: int = Query(default=0, ge=0),
     limit: int = Query(default=50, le=200),
-    current_user: User = Depends(get_current_user),
+    current_user: User = Depends(require_permission("sales.view")),
     db=Depends(get_db),
 ):
     items, total = await get_sales(
@@ -64,7 +64,7 @@ async def list_sales(
 @router.post("", response_model=SaleResponse, status_code=status.HTTP_201_CREATED)
 async def create_sale_endpoint(
     data: CreateSaleRequest,
-    current_user: User = Depends(require_manager),
+    current_user: User = Depends(require_permission("sales.create")),
     db=Depends(get_db),
 ):
     return await create_sale(
@@ -79,7 +79,7 @@ async def create_sale_endpoint(
 )
 async def get_sale(
     sale_id: UUID,
-    current_user: User = Depends(get_current_user),
+    current_user: User = Depends(require_permission("sales.view")),
     db=Depends(get_db),
 ):
     return await get_sale_by_id(db, sale_id, current_user.business_id)
@@ -92,7 +92,7 @@ async def get_sale(
 )
 async def cancel_sale_endpoint(
     sale_id: UUID,
-    current_user: User = Depends(require_manager),
+    current_user: User = Depends(require_permission("sales.cancel")),
     db=Depends(get_db),
 ):
     return await cancel_sale(

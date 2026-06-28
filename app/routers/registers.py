@@ -3,7 +3,7 @@ from uuid import UUID
 from fastapi import APIRouter, Depends, Query, status
 
 from app.database import get_db
-from app.dependencies import get_current_user, require_manager
+from app.dependencies import require_permission
 from app.models.user import User
 from app.schemas.register import (
     CashRegisterResponse,
@@ -25,7 +25,7 @@ router = APIRouter(prefix="/registers", tags=["Cash Registers"])
 @router.get("", response_model=list[CashRegisterResponse], status_code=status.HTTP_200_OK)
 async def list_registers(
     branch_id: UUID | None = Query(default=None),
-    current_user: User = Depends(get_current_user),
+    current_user: User = Depends(require_permission("registers.view")),
     db=Depends(get_db),
 ):
     return await get_cash_registers(db, current_user.business_id, branch_id)
@@ -34,7 +34,7 @@ async def list_registers(
 @router.post("", response_model=CashRegisterResponse, status_code=status.HTTP_201_CREATED)
 async def create_register(
     data: CreateCashRegisterRequest,
-    current_user: User = Depends(require_manager),
+    current_user: User = Depends(require_permission("registers.manage")),
     db=Depends(get_db),
 ):
     return await create_cash_register(
@@ -49,7 +49,7 @@ async def create_register(
 )
 async def get_register(
     register_id: UUID,
-    current_user: User = Depends(get_current_user),
+    current_user: User = Depends(require_permission("registers.view")),
     db=Depends(get_db),
 ):
     return await get_cash_register_by_id(
@@ -65,7 +65,7 @@ async def get_register(
 async def update_register(
     register_id: UUID,
     data: UpdateCashRegisterRequest,
-    current_user: User = Depends(require_manager),
+    current_user: User = Depends(require_permission("registers.manage")),
     db=Depends(get_db),
 ):
     return await update_cash_register(
@@ -80,7 +80,7 @@ async def update_register(
 )
 async def get_register_active_shift(
     register_id: UUID,
-    current_user: User = Depends(get_current_user),
+    current_user: User = Depends(require_permission("shifts.view")),
     db=Depends(get_db),
 ):
     return await get_active_shift(

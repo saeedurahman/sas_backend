@@ -1,6 +1,5 @@
 """Analytics and reporting services — SQL aggregation only."""
 
-import asyncio
 from datetime import date, datetime, timedelta, timezone
 from decimal import Decimal
 from uuid import UUID
@@ -72,6 +71,57 @@ def _branch_clause(branch_id: UUID | None, alias: str = "s") -> str:
     return f" AND {alias}.branch_id = :branch_id"
 
 
+def _out_of_stock_count_sql(branch_id: UUID | None) -> str:
+    """Count sellable catalog items with zero stock at a branch.
+
+    Uses stock_movement balances (not product_locations) so products that were
+    never received still count as out of stock when they have no movements.
+    """
+    branch_b = ""
+    if branch_id is not None:
+        branch_b = " AND b.id = :branch_id"
+    branch_sm = _branch_clause(branch_id, "sm")
+    return f"""
+        WITH stock_balances AS (
+            SELECT
+                sm.branch_id,
+                sm.product_id,
+                sm.variation_id,
+                COALESCE(SUM(sm.qty), 0) AS current_qty
+            FROM stock_movements sm
+            WHERE sm.business_id = :business_id
+                AND sm.deleted_at IS NULL
+                {branch_sm}
+            GROUP BY sm.branch_id, sm.product_id, sm.variation_id
+        ),
+        catalog AS (
+            SELECT
+                b.id AS branch_id,
+                p.id AS product_id,
+                pv.id AS variation_id
+            FROM branches b
+            INNER JOIN products p ON p.business_id = b.business_id
+            INNER JOIN product_variations pv ON pv.product_id = p.id
+                AND pv.business_id = p.business_id
+                AND pv.deleted_at IS NULL
+                AND pv.is_active = TRUE
+            WHERE b.business_id = :business_id
+                AND b.deleted_at IS NULL
+                AND p.deleted_at IS NULL
+                AND p.is_active = TRUE
+                AND p.is_sellable = TRUE
+                AND p.product_type != 'service'
+                {branch_b}
+        )
+        SELECT COUNT(*)
+        FROM catalog c
+        LEFT JOIN stock_balances sb ON sb.branch_id = c.branch_id
+            AND sb.product_id = c.product_id
+            AND sb.variation_id IS NOT DISTINCT FROM c.variation_id
+        WHERE COALESCE(sb.current_qty, 0) <= 0
+    """
+
+
 def _line_revenue_expr(alias: str = "sl") -> str:
     return f"({alias}.qty * {alias}.unit_price) - {alias}.discount_amount"
 
@@ -92,6 +142,11 @@ async def _scalar_int(db: AsyncSession, sql: str, params: dict) -> int:
 
 
 def _base_sale_joins() -> str:
+    """FROM sale_lines + sales JOIN and base WHERE filters.
+
+    Append extra predicates only (e.g. branch/date). Do not append JOINs after this —
+  use explicit FROM/JOIN/WHERE like get_top_products when more tables are needed.
+    """
     return """
         FROM sale_lines sl
         INNER JOIN sales s ON s.id = sl.sale_id
@@ -199,27 +254,15 @@ async def get_dashboard_summary(
         ) sub
     """
 
-    (
-        today_revenue,
-        today_cost,
-        today_transactions,
-        month_revenue,
-        month_cost,
-        low_stock_alerts,
-        open_shifts,
-        pending_customer,
-        pending_supplier,
-    ) = await asyncio.gather(
-        _scalar(db, today_revenue_sql, params),
-        _scalar(db, today_cost_sql, params),
-        _scalar_int(db, today_tx_sql, params),
-        _scalar(db, month_revenue_sql, params),
-        _scalar(db, month_cost_sql, params),
-        _scalar_int(db, low_stock_sql, params),
-        _scalar_int(db, open_shifts_sql, params),
-        _scalar(db, customer_bal_sql, params),
-        _scalar(db, supplier_bal_sql, params),
-    )
+    today_revenue = await _scalar(db, today_revenue_sql, params)
+    today_cost = await _scalar(db, today_cost_sql, params)
+    today_transactions = await _scalar_int(db, today_tx_sql, params)
+    month_revenue = await _scalar(db, month_revenue_sql, params)
+    month_cost = await _scalar(db, month_cost_sql, params)
+    low_stock_alerts = await _scalar_int(db, low_stock_sql, params)
+    open_shifts = await _scalar_int(db, open_shifts_sql, params)
+    pending_customer = await _scalar(db, customer_bal_sql, params)
+    pending_supplier = await _scalar(db, supplier_bal_sql, params)
 
     today_profit = today_revenue - today_cost
     month_profit = month_revenue - month_cost
@@ -524,9 +567,15 @@ async def get_category_performance(
                 c.name AS category_name,
                 COALESCE(SUM({_line_revenue_expr()}), 0) AS total_revenue,
                 COUNT(DISTINCT s.id) AS total_transactions
-            {_base_sale_joins()}
+            FROM sale_lines sl
+            INNER JOIN sales s ON s.id = sl.sale_id
+                AND s.business_id = sl.business_id
             INNER JOIN products p ON p.id = sl.product_id
             INNER JOIN categories c ON c.id = p.category_id
+            WHERE sl.business_id = :business_id
+                AND sl.deleted_at IS NULL
+                AND s.deleted_at IS NULL
+                AND {_SALE_ACTIVE}
                 {branch_sql}
                 AND s.sold_at::date BETWEEN :date_from AND :date_to
             GROUP BY c.id, c.name
@@ -579,8 +628,14 @@ async def get_branch_comparison(
             COALESCE(SUM({_line_revenue_expr()}), 0) AS total_revenue,
             COUNT(DISTINCT s.id) AS total_transactions,
             COALESCE(SUM({_line_revenue_expr()} - {_line_cost_expr()}), 0) AS total_profit
-        {_base_sale_joins()}
+        FROM sale_lines sl
+        INNER JOIN sales s ON s.id = sl.sale_id
+            AND s.business_id = sl.business_id
         INNER JOIN branches b ON b.id = s.branch_id
+        WHERE sl.business_id = :business_id
+            AND sl.deleted_at IS NULL
+            AND s.deleted_at IS NULL
+            AND {_SALE_ACTIVE}
             AND s.sold_at::date BETWEEN :date_from AND :date_to
         GROUP BY s.branch_id, b.name
         ORDER BY total_revenue DESC
@@ -638,10 +693,15 @@ async def get_cashier_performance(
                 COALESCE(SUM(sl.discount_amount) FILTER (
                     WHERE {_SALE_ACTIVE}
                 ), 0) AS total_discounts
-            {_base_sale_joins()}
+            FROM sale_lines sl
+            INNER JOIN sales s ON s.id = sl.sale_id
+                AND s.business_id = sl.business_id
             INNER JOIN users u ON u.id = s.created_by
-                {branch_sql}
+            WHERE sl.business_id = :business_id
+                AND sl.deleted_at IS NULL
+                AND s.deleted_at IS NULL
                 AND s.sold_at::date BETWEEN :date_from AND :date_to
+                {branch_sql}
             GROUP BY s.created_by, u.full_name
         ),
         return_stats AS (
@@ -753,8 +813,14 @@ async def get_fraud_alerts(
                 u.full_name AS user_name,
                 s.branch_id,
                 AVG(sl.discount_pct) AS avg_discount
-            {_base_sale_joins()}
+            FROM sale_lines sl
+            INNER JOIN sales s ON s.id = sl.sale_id
+                AND s.business_id = sl.business_id
             INNER JOIN users u ON u.id = s.created_by
+            WHERE sl.business_id = :business_id
+                AND sl.deleted_at IS NULL
+                AND s.deleted_at IS NULL
+                AND {_SALE_ACTIVE}
                 {branch_sql}
                 AND s.sold_at::date BETWEEN :date_from AND :date_to
             GROUP BY s.created_by, u.full_name, s.branch_id
@@ -1064,29 +1130,11 @@ async def get_inventory_insights(
         ORDER BY shortage DESC
         LIMIT 50
     """
-    out_of_stock_sql = f"""
-        SELECT COUNT(*)
-        FROM product_locations pl
-        LEFT JOIN LATERAL (
-            SELECT COALESCE(SUM(sm.qty), 0) AS current_qty
-            FROM stock_movements sm
-            WHERE sm.business_id = pl.business_id
-                AND sm.branch_id = pl.branch_id
-                AND sm.product_id = pl.product_id
-                AND sm.variation_id IS NOT DISTINCT FROM pl.variation_id
-                AND sm.deleted_at IS NULL
-        ) stock ON TRUE
-        WHERE pl.business_id = :business_id
-            AND pl.deleted_at IS NULL
-            AND COALESCE(stock.current_qty, 0) <= 0
-            {branch_pl}
-    """
+    out_of_stock_sql = _out_of_stock_count_sql(branch_id)
 
-    total_products, total_stock_value, out_of_stock_count = await asyncio.gather(
-        _scalar_int(db, total_products_sql, params),
-        _scalar(db, stock_value_sql, params),
-        _scalar_int(db, out_of_stock_sql, params),
-    )
+    total_products = await _scalar_int(db, total_products_sql, params)
+    total_stock_value = await _scalar(db, stock_value_sql, params)
+    out_of_stock_count = await _scalar_int(db, out_of_stock_sql, params)
 
     low_result = await db.execute(text(low_stock_sql), params)
     low_items = [
@@ -1339,11 +1387,9 @@ async def _daily_sale_metrics(
     cost_sql = f"SELECT COALESCE(SUM({_line_cost_expr()}), 0) {base}"
     tx_sql = f"SELECT COUNT(DISTINCT s.id) {base}"
 
-    revenue, cost, transactions = await asyncio.gather(
-        _scalar(db, revenue_sql, params),
-        _scalar(db, cost_sql, params),
-        _scalar_int(db, tx_sql, params),
-    )
+    revenue = await _scalar(db, revenue_sql, params)
+    cost = await _scalar(db, cost_sql, params)
+    transactions = await _scalar_int(db, tx_sql, params)
     profit = revenue - cost
     avg_order = revenue / transactions if transactions > 0 else _ZERO
     return revenue, transactions, profit, avg_order.quantize(Decimal("0.01"))
@@ -1358,12 +1404,17 @@ async def get_today_vs_yesterday(
     yesterday = today - timedelta(days=1)
 
     (
-        (today_revenue, today_transactions, today_profit, today_avg),
-        (yesterday_revenue, yesterday_transactions, yesterday_profit, yesterday_avg),
-    ) = await asyncio.gather(
-        _daily_sale_metrics(db, business_id, today, branch_id),
-        _daily_sale_metrics(db, business_id, yesterday, branch_id),
-    )
+        today_revenue,
+        today_transactions,
+        today_profit,
+        today_avg,
+    ) = await _daily_sale_metrics(db, business_id, today, branch_id)
+    (
+        yesterday_revenue,
+        yesterday_transactions,
+        yesterday_profit,
+        yesterday_avg,
+    ) = await _daily_sale_metrics(db, business_id, yesterday, branch_id)
 
     return TodayVsYesterdayResponse(
         today_revenue=today_revenue,
@@ -1739,11 +1790,9 @@ async def get_tax_summary(
             {purchase_branch}
     """
 
-    sales_result, rate_result, purchase_result = await asyncio.gather(
-        db.execute(text(sales_totals_sql), params),
-        db.execute(text(rate_sql), params),
-        db.execute(text(purchase_sql), params),
-    )
+    sales_result = await db.execute(text(sales_totals_sql), params)
+    rate_result = await db.execute(text(rate_sql), params)
+    purchase_result = await db.execute(text(purchase_sql), params)
     sales_row = sales_result.one()
     purchase_row = purchase_result.one()
 
@@ -1996,26 +2045,9 @@ async def get_enhanced_dashboard(
             AND pl.min_stock_level IS NOT NULL
             AND stock.current_qty < pl.min_stock_level
     """
-    out_of_stock_sql = """
-        SELECT COUNT(*)
-        FROM product_locations pl
-        INNER JOIN branches b ON b.id = pl.branch_id
-        LEFT JOIN LATERAL (
-            SELECT COALESCE(SUM(sm.qty), 0) AS current_qty
-            FROM stock_movements sm
-            WHERE sm.business_id = pl.business_id
-                AND sm.branch_id = pl.branch_id
-                AND sm.product_id = pl.product_id
-                AND sm.variation_id IS NOT DISTINCT FROM pl.variation_id
-                AND sm.deleted_at IS NULL
-        ) stock ON TRUE
-        WHERE pl.business_id = :business_id
-            AND pl.deleted_at IS NULL
-            AND stock.current_qty <= 0
-    """
+    out_of_stock_sql = _out_of_stock_count_sql(branch_id)
     if branch_id is not None:
         low_stock_sql += " AND pl.branch_id = :branch_id"
-        out_of_stock_sql += " AND pl.branch_id = :branch_id"
 
     open_shifts_sql = """
         SELECT COUNT(*)
@@ -2050,37 +2082,20 @@ async def get_enhanced_dashboard(
         ) sub
     """
 
-    (
-        today_revenue,
-        today_cost,
-        today_transactions,
-        yesterday_revenue,
-        month_revenue,
-        month_cost,
-        today_expenses,
-        low_stock_alerts,
-        out_of_stock_count,
-        open_shifts,
-        pending_customer,
-        pending_supplier,
-        cash_drawer,
-        recent,
-    ) = await asyncio.gather(
-        _scalar(db, today_revenue_sql, params),
-        _scalar(db, today_cost_sql, params),
-        _scalar_int(db, today_tx_sql, params),
-        _scalar(db, yesterday_revenue_sql, params),
-        _scalar(db, month_revenue_sql, month_params),
-        _scalar(db, month_cost_sql, month_params),
-        _scalar(db, today_expenses_sql, params),
-        _scalar_int(db, low_stock_sql, params),
-        _scalar_int(db, out_of_stock_sql, params),
-        _scalar_int(db, open_shifts_sql, params),
-        _scalar(db, customer_bal_sql, params),
-        _scalar(db, supplier_bal_sql, params),
-        get_cash_in_drawer(db, business_id, branch_id),
-        get_recent_transactions(db, business_id, branch_id, limit=5),
-    )
+    today_revenue = await _scalar(db, today_revenue_sql, params)
+    today_cost = await _scalar(db, today_cost_sql, params)
+    today_transactions = await _scalar_int(db, today_tx_sql, params)
+    yesterday_revenue = await _scalar(db, yesterday_revenue_sql, params)
+    month_revenue = await _scalar(db, month_revenue_sql, month_params)
+    month_cost = await _scalar(db, month_cost_sql, month_params)
+    today_expenses = await _scalar(db, today_expenses_sql, params)
+    low_stock_alerts = await _scalar_int(db, low_stock_sql, params)
+    out_of_stock_count = await _scalar_int(db, out_of_stock_sql, params)
+    open_shifts = await _scalar_int(db, open_shifts_sql, params)
+    pending_customer = await _scalar(db, customer_bal_sql, params)
+    pending_supplier = await _scalar(db, supplier_bal_sql, params)
+    cash_drawer = await get_cash_in_drawer(db, business_id, branch_id)
+    recent = await get_recent_transactions(db, business_id, branch_id, limit=5)
 
     today_profit = today_revenue - today_cost
     month_profit = month_revenue - month_cost

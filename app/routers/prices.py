@@ -5,7 +5,7 @@ from fastapi import APIRouter, Depends, Query, status
 from pydantic import BaseModel
 
 from app.database import get_db
-from app.dependencies import get_current_user, require_manager, require_owner
+from app.dependencies import require_permission
 from app.models.user import User
 from app.schemas.product import (
     CreatePriceListRequest,
@@ -33,7 +33,7 @@ class ProductPriceResponse(BaseModel):
     status_code=status.HTTP_200_OK,
 )
 async def list_price_lists(
-    current_user: User = Depends(get_current_user),
+    current_user: User = Depends(require_permission("products.view")),
     db=Depends(get_db),
 ):
     return await get_price_lists(db, current_user.business_id)
@@ -46,7 +46,7 @@ async def list_price_lists(
 )
 async def create_price_list_endpoint(
     data: CreatePriceListRequest,
-    current_user: User = Depends(require_owner),
+    current_user: User = Depends(require_permission("products.manage_prices")),
     db=Depends(get_db),
 ):
     return await create_price_list(
@@ -62,7 +62,7 @@ async def create_price_list_endpoint(
 async def set_price_endpoint(
     list_id: UUID,
     data: SetPriceRequest,
-    current_user: User = Depends(require_manager),
+    current_user: User = Depends(require_permission("products.manage_prices")),
     db=Depends(get_db),
 ):
     return await set_price(
@@ -79,7 +79,7 @@ async def get_product_price_endpoint(
     product_id: UUID,
     variation_id: UUID | None = Query(default=None),
     price_list_id: UUID | None = Query(default=None),
-    current_user: User = Depends(get_current_user),
+    current_user: User = Depends(require_permission("products.view")),
     db=Depends(get_db),
 ):
     unit_price = await get_product_price(

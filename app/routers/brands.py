@@ -3,7 +3,7 @@ from uuid import UUID
 from fastapi import APIRouter, Depends, status
 
 from app.database import get_db
-from app.dependencies import get_current_user, require_manager
+from app.dependencies import require_permission
 from app.models.user import User
 from app.schemas.auth import MessageResponse
 from app.schemas.product import BrandResponse, CreateBrandRequest, UpdateBrandRequest
@@ -20,7 +20,7 @@ router = APIRouter(prefix="/brands", tags=["Brands"])
 
 @router.get("", response_model=list[BrandResponse], status_code=status.HTTP_200_OK)
 async def list_brands(
-    current_user: User = Depends(get_current_user),
+    current_user: User = Depends(require_permission("products.view")),
     db=Depends(get_db),
 ):
     return await get_brands(db, current_user.business_id)
@@ -29,7 +29,7 @@ async def list_brands(
 @router.post("", response_model=BrandResponse, status_code=status.HTTP_201_CREATED)
 async def create_brand_endpoint(
     data: CreateBrandRequest,
-    current_user: User = Depends(require_manager),
+    current_user: User = Depends(require_permission("products.manage_brands")),
     db=Depends(get_db),
 ):
     return await create_brand(db, current_user.business_id, data, current_user.id)
@@ -42,7 +42,7 @@ async def create_brand_endpoint(
 )
 async def get_brand(
     brand_id: UUID,
-    current_user: User = Depends(get_current_user),
+    current_user: User = Depends(require_permission("products.view")),
     db=Depends(get_db),
 ):
     return await get_brand_by_id(db, brand_id, current_user.business_id)
@@ -56,7 +56,7 @@ async def get_brand(
 async def update_brand_endpoint(
     brand_id: UUID,
     data: UpdateBrandRequest,
-    current_user: User = Depends(require_manager),
+    current_user: User = Depends(require_permission("products.manage_brands")),
     db=Depends(get_db),
 ):
     return await update_brand(
@@ -71,7 +71,7 @@ async def update_brand_endpoint(
 )
 async def delete_brand_endpoint(
     brand_id: UUID,
-    current_user: User = Depends(require_manager),
+    current_user: User = Depends(require_permission("products.manage_brands")),
     db=Depends(get_db),
 ):
     await delete_brand(db, brand_id, current_user.business_id, current_user.id)

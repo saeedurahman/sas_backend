@@ -3,7 +3,7 @@ from uuid import UUID
 from fastapi import APIRouter, Depends, Query, status
 
 from app.database import get_db
-from app.dependencies import get_current_user, require_manager
+from app.dependencies import require_permission
 from app.models.user import User
 from app.schemas.auth import MessageResponse
 from app.schemas.product import (
@@ -25,7 +25,7 @@ router = APIRouter(prefix="/categories", tags=["Categories"])
 @router.get("", response_model=list[CategoryResponse], status_code=status.HTTP_200_OK)
 async def list_categories(
     parent_id: UUID | None = Query(default=None),
-    current_user: User = Depends(get_current_user),
+    current_user: User = Depends(require_permission("products.view")),
     db=Depends(get_db),
 ):
     return await get_categories(db, current_user.business_id, parent_id)
@@ -34,7 +34,7 @@ async def list_categories(
 @router.post("", response_model=CategoryResponse, status_code=status.HTTP_201_CREATED)
 async def create_category_endpoint(
     data: CreateCategoryRequest,
-    current_user: User = Depends(require_manager),
+    current_user: User = Depends(require_permission("products.manage_categories")),
     db=Depends(get_db),
 ):
     return await create_category(
@@ -49,7 +49,7 @@ async def create_category_endpoint(
 )
 async def get_category(
     category_id: UUID,
-    current_user: User = Depends(get_current_user),
+    current_user: User = Depends(require_permission("products.view")),
     db=Depends(get_db),
 ):
     return await get_category_by_id(db, category_id, current_user.business_id)
@@ -63,7 +63,7 @@ async def get_category(
 async def update_category_endpoint(
     category_id: UUID,
     data: UpdateCategoryRequest,
-    current_user: User = Depends(require_manager),
+    current_user: User = Depends(require_permission("products.manage_categories")),
     db=Depends(get_db),
 ):
     return await update_category(
@@ -78,7 +78,7 @@ async def update_category_endpoint(
 )
 async def delete_category_endpoint(
     category_id: UUID,
-    current_user: User = Depends(require_manager),
+    current_user: User = Depends(require_permission("products.manage_categories")),
     db=Depends(get_db),
 ):
     await delete_category(

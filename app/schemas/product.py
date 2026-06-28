@@ -321,6 +321,7 @@ class ProductListResponse(BaseSchema):
     is_active: bool
     category_id: UUID | None
     brand_id: UUID | None
+    image_url: str | None = None
 
 
 class PaginatedProductResponse(BaseSchema):

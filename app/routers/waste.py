@@ -3,7 +3,7 @@ from uuid import UUID
 from fastapi import APIRouter, Depends, Query, status
 
 from app.database import get_db
-from app.dependencies import get_current_user, require_manager
+from app.dependencies import require_permission
 from app.models.user import User
 from app.schemas.inventory import CreateWasteEntryRequest, WasteEntryResponse
 from app.services.waste_service import (
@@ -24,7 +24,7 @@ async def list_waste_entries(
     branch_id: UUID | None = Query(default=None),
     skip: int = Query(default=0, ge=0),
     limit: int = Query(default=50, le=200),
-    current_user: User = Depends(get_current_user),
+    current_user: User = Depends(require_permission("inventory.waste.view")),
     db=Depends(get_db),
 ):
     entries, _ = await get_waste_entries(
@@ -40,7 +40,7 @@ async def list_waste_entries(
 )
 async def create_waste(
     data: CreateWasteEntryRequest,
-    current_user: User = Depends(require_manager),
+    current_user: User = Depends(require_permission("inventory.waste.create")),
     db=Depends(get_db),
 ):
     return await create_waste_entry(
@@ -55,7 +55,7 @@ async def create_waste(
 )
 async def get_waste(
     waste_id: UUID,
-    current_user: User = Depends(get_current_user),
+    current_user: User = Depends(require_permission("inventory.waste.view")),
     db=Depends(get_db),
 ):
     return await get_waste_entry_by_id(

@@ -1,7 +1,7 @@
 from fastapi import APIRouter, Depends, Request, status
 
 from app.database import get_db
-from app.dependencies import get_current_user
+from app.dependencies import get_current_user, require_permission
 from app.models.user import User
 from app.schemas.auth import (
     LoginRequest,
@@ -80,7 +80,7 @@ async def refresh(
 async def logout(
     data: RefreshTokenRequest,
     request: Request,
-    current_user: User = Depends(get_current_user),
+    current_user: User = Depends(require_permission("auth.logout")),
     db=Depends(get_db),
 ):
     await logout_with_refresh_token(

@@ -3,7 +3,7 @@ from uuid import UUID
 from fastapi import APIRouter, Depends, status
 
 from app.database import get_db
-from app.dependencies import get_current_user, require_manager
+from app.dependencies import require_permission
 from app.models.user import User
 from app.schemas.sales import (
     CreateTaxRateRequest,
@@ -22,7 +22,7 @@ router = APIRouter(prefix="/tax-rates", tags=["Tax Rates"])
 
 @router.get("", response_model=list[TaxRateResponse], status_code=status.HTTP_200_OK)
 async def list_tax_rates(
-    current_user: User = Depends(get_current_user),
+    current_user: User = Depends(require_permission("settings.view")),
     db=Depends(get_db),
 ):
     return await get_tax_rates(db, current_user.business_id)
@@ -31,7 +31,7 @@ async def list_tax_rates(
 @router.post("", response_model=TaxRateResponse, status_code=status.HTTP_201_CREATED)
 async def create_tax_rate_endpoint(
     data: CreateTaxRateRequest,
-    current_user: User = Depends(require_manager),
+    current_user: User = Depends(require_permission("settings.manage")),
     db=Depends(get_db),
 ):
     return await create_tax_rate(
@@ -46,7 +46,7 @@ async def create_tax_rate_endpoint(
 )
 async def get_tax_rate(
     tax_rate_id: UUID,
-    current_user: User = Depends(get_current_user),
+    current_user: User = Depends(require_permission("settings.view")),
     db=Depends(get_db),
 ):
     return await get_tax_rate_by_id(
@@ -62,7 +62,7 @@ async def get_tax_rate(
 async def update_tax_rate_endpoint(
     tax_rate_id: UUID,
     data: UpdateTaxRateRequest,
-    current_user: User = Depends(require_manager),
+    current_user: User = Depends(require_permission("settings.manage")),
     db=Depends(get_db),
 ):
     return await update_tax_rate(

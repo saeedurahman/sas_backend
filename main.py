@@ -20,8 +20,10 @@ from app.routers.discounts import router as discounts_router
 from app.routers.expenses import router as expenses_router
 from app.routers.invoice import router as invoice_router
 from app.routers.prices import router as prices_router
+from app.routers.permissions import router as permissions_router
 from app.routers.products import router as products_router
 from app.routers.registers import router as registers_router
+from app.routers.roles import router as roles_router
 from app.routers.notifications import router as notifications_router
 from app.routers.returns import router as returns_router
 from app.routers.sales import router as sales_router
@@ -89,6 +91,8 @@ app.include_router(auth_router, prefix=settings.api_v1_prefix)
 app.include_router(business_router, prefix=settings.api_v1_prefix)
 app.include_router(branches_router, prefix=settings.api_v1_prefix)
 app.include_router(users_router, prefix=settings.api_v1_prefix)
+app.include_router(permissions_router, prefix=settings.api_v1_prefix)
+app.include_router(roles_router, prefix=settings.api_v1_prefix)
 app.include_router(categories_router, prefix=settings.api_v1_prefix)
 app.include_router(brands_router, prefix=settings.api_v1_prefix)
 app.include_router(units_router, prefix=settings.api_v1_prefix)

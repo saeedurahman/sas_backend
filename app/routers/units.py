@@ -3,7 +3,7 @@ from uuid import UUID
 from fastapi import APIRouter, Depends, status
 
 from app.database import get_db
-from app.dependencies import get_current_user, require_manager
+from app.dependencies import require_permission
 from app.models.user import User
 from app.schemas.auth import MessageResponse
 from app.schemas.product import (
@@ -28,7 +28,7 @@ router = APIRouter(prefix="/units", tags=["Units"])
 
 @router.get("", response_model=list[UnitResponse], status_code=status.HTTP_200_OK)
 async def list_units(
-    current_user: User = Depends(get_current_user),
+    current_user: User = Depends(require_permission("products.view")),
     db=Depends(get_db),
 ):
     return await get_units(db, current_user.business_id)
@@ -37,7 +37,7 @@ async def list_units(
 @router.post("", response_model=UnitResponse, status_code=status.HTTP_201_CREATED)
 async def create_unit_endpoint(
     data: CreateUnitRequest,
-    current_user: User = Depends(require_manager),
+    current_user: User = Depends(require_permission("products.manage_units")),
     db=Depends(get_db),
 ):
     return await create_unit(db, current_user.business_id, data, current_user.id)
@@ -50,7 +50,7 @@ async def create_unit_endpoint(
 )
 async def create_conversion_endpoint(
     data: CreateUnitConversionRequest,
-    current_user: User = Depends(require_manager),
+    current_user: User = Depends(require_permission("products.manage_units")),
     db=Depends(get_db),
 ):
     return await create_unit_conversion(
@@ -64,7 +64,7 @@ async def create_conversion_endpoint(
     status_code=status.HTTP_200_OK,
 )
 async def list_conversions(
-    current_user: User = Depends(get_current_user),
+    current_user: User = Depends(require_permission("products.view")),
     db=Depends(get_db),
 ):
     return await get_unit_conversions(db, current_user.business_id)
@@ -77,7 +77,7 @@ async def list_conversions(
 )
 async def get_unit(
     unit_id: UUID,
-    current_user: User = Depends(get_current_user),
+    current_user: User = Depends(require_permission("products.view")),
     db=Depends(get_db),
 ):
     return await get_unit_by_id(db, unit_id, current_user.business_id)
@@ -91,7 +91,7 @@ async def get_unit(
 async def update_unit_endpoint(
     unit_id: UUID,
     data: UpdateUnitRequest,
-    current_user: User = Depends(require_manager),
+    current_user: User = Depends(require_permission("products.manage_units")),
     db=Depends(get_db),
 ):
     return await update_unit(
@@ -106,7 +106,7 @@ async def update_unit_endpoint(
 )
 async def delete_unit_endpoint(
     unit_id: UUID,
-    current_user: User = Depends(require_manager),
+    current_user: User = Depends(require_permission("products.manage_units")),
     db=Depends(get_db),
 ):
     await delete_unit(db, unit_id, current_user.business_id, current_user.id)

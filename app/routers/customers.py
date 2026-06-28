@@ -5,7 +5,7 @@ from fastapi import APIRouter, Depends, Query, status
 from pydantic import BaseModel
 
 from app.database import get_db
-from app.dependencies import get_current_user, require_manager
+from app.dependencies import require_permission
 from app.models.user import User
 from app.schemas.sales import (
     CreateCustomerPaymentRequest,
@@ -36,7 +36,7 @@ class CustomerBalanceResponse(BaseModel):
 @router.get("", response_model=list[CustomerResponse], status_code=status.HTTP_200_OK)
 async def list_customers(
     search: str | None = Query(default=None),
-    current_user: User = Depends(get_current_user),
+    current_user: User = Depends(require_permission("customers.view")),
     db=Depends(get_db),
 ):
     return await get_customers(db, current_user.business_id, search)
@@ -45,7 +45,7 @@ async def list_customers(
 @router.post("", response_model=CustomerResponse, status_code=status.HTTP_201_CREATED)
 async def create_customer_endpoint(
     data: CreateCustomerRequest,
-    current_user: User = Depends(require_manager),
+    current_user: User = Depends(require_permission("customers.create")),
     db=Depends(get_db),
 ):
     return await create_customer(
@@ -60,7 +60,7 @@ async def create_customer_endpoint(
 )
 async def get_customer(
     customer_id: UUID,
-    current_user: User = Depends(get_current_user),
+    current_user: User = Depends(require_permission("customers.view")),
     db=Depends(get_db),
 ):
     return await get_customer_by_id(db, customer_id, current_user.business_id)
@@ -74,7 +74,7 @@ async def get_customer(
 async def update_customer_endpoint(
     customer_id: UUID,
     data: UpdateCustomerRequest,
-    current_user: User = Depends(require_manager),
+    current_user: User = Depends(require_permission("customers.update")),
     db=Depends(get_db),
 ):
     return await update_customer(
@@ -89,7 +89,7 @@ async def update_customer_endpoint(
 )
 async def get_balance(
     customer_id: UUID,
-    current_user: User = Depends(get_current_user),
+    current_user: User = Depends(require_permission("customers.ledger.view")),
     db=Depends(get_db),
 ):
     balance = await get_customer_balance(
@@ -107,7 +107,7 @@ async def get_ledger(
     customer_id: UUID,
     skip: int = Query(default=0, ge=0),
     limit: int = Query(default=50, le=200),
-    current_user: User = Depends(get_current_user),
+    current_user: User = Depends(require_permission("customers.ledger.view")),
     db=Depends(get_db),
 ):
     entries, _ = await get_customer_ledger(
@@ -124,7 +124,7 @@ async def get_ledger(
 async def record_customer_payment_endpoint(
     customer_id: UUID,
     data: CreateCustomerPaymentRequest,
-    current_user: User = Depends(require_manager),
+    current_user: User = Depends(require_permission("customers.update")),
     db=Depends(get_db),
 ):
     return await record_customer_payment(

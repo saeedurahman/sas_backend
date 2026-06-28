@@ -3,7 +3,7 @@ from uuid import UUID
 from fastapi import APIRouter, Depends, Query, status
 
 from app.database import get_db
-from app.dependencies import get_current_user, require_manager
+from app.dependencies import require_permission
 from app.models.user import User
 from app.schemas.auth import MessageResponse
 from app.schemas.inventory import (
@@ -25,7 +25,7 @@ router = APIRouter(prefix="/suppliers", tags=["Suppliers"])
 @router.get("", response_model=list[SupplierResponse], status_code=status.HTTP_200_OK)
 async def list_suppliers(
     search: str | None = Query(default=None),
-    current_user: User = Depends(get_current_user),
+    current_user: User = Depends(require_permission("suppliers.view")),
     db=Depends(get_db),
 ):
     return await get_suppliers(db, current_user.business_id, search)
@@ -34,7 +34,7 @@ async def list_suppliers(
 @router.post("", response_model=SupplierResponse, status_code=status.HTTP_201_CREATED)
 async def create_supplier_endpoint(
     data: CreateSupplierRequest,
-    current_user: User = Depends(require_manager),
+    current_user: User = Depends(require_permission("suppliers.create")),
     db=Depends(get_db),
 ):
     return await create_supplier(
@@ -49,7 +49,7 @@ async def create_supplier_endpoint(
 )
 async def get_supplier(
     supplier_id: UUID,
-    current_user: User = Depends(get_current_user),
+    current_user: User = Depends(require_permission("suppliers.view")),
     db=Depends(get_db),
 ):
     return await get_supplier_by_id(db, supplier_id, current_user.business_id)
@@ -63,7 +63,7 @@ async def get_supplier(
 async def update_supplier_endpoint(
     supplier_id: UUID,
     data: UpdateSupplierRequest,
-    current_user: User = Depends(require_manager),
+    current_user: User = Depends(require_permission("suppliers.update")),
     db=Depends(get_db),
 ):
     return await update_supplier(
@@ -78,7 +78,7 @@ async def update_supplier_endpoint(
 )
 async def delete_supplier_endpoint(
     supplier_id: UUID,
-    current_user: User = Depends(require_manager),
+    current_user: User = Depends(require_permission("suppliers.update")),
     db=Depends(get_db),
 ):
     await delete_supplier(

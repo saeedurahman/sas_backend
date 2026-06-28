@@ -4,7 +4,7 @@ from fastapi import APIRouter, Depends, Query, status
 from pydantic import BaseModel
 
 from app.database import get_db
-from app.dependencies import get_current_user, require_manager
+from app.dependencies import require_permission
 from app.models.enums import PurchaseOrderStatusEnum
 from app.models.user import User
 from app.schemas.inventory import (
@@ -40,7 +40,9 @@ async def list_purchase_orders(
     po_status: str | None = Query(default=None, alias="status"),
     skip: int = Query(default=0, ge=0),
     limit: int = Query(default=50, le=200),
-    current_user: User = Depends(get_current_user),
+    current_user: User = Depends(
+        require_permission("inventory.purchase_orders.view")
+    ),
     db=Depends(get_db),
 ):
     orders, _ = await get_purchase_orders(
@@ -62,7 +64,9 @@ async def list_purchase_orders(
 )
 async def create_purchase_order_endpoint(
     data: CreatePurchaseOrderRequest,
-    current_user: User = Depends(require_manager),
+    current_user: User = Depends(
+        require_permission("inventory.purchase_orders.create")
+    ),
     db=Depends(get_db),
 ):
     return await create_purchase_order(
@@ -77,7 +81,9 @@ async def create_purchase_order_endpoint(
 )
 async def get_purchase_order(
     po_id: UUID,
-    current_user: User = Depends(get_current_user),
+    current_user: User = Depends(
+        require_permission("inventory.purchase_orders.view")
+    ),
     db=Depends(get_db),
 ):
     return await get_purchase_order_by_id(db, po_id, current_user.business_id)
@@ -91,7 +97,9 @@ async def get_purchase_order(
 async def update_po_status(
     po_id: UUID,
     data: UpdatePOStatusRequest,
-    current_user: User = Depends(require_manager),
+    current_user: User = Depends(
+        require_permission("inventory.purchase_orders.create")
+    ),
     db=Depends(get_db),
 ):
     return await update_purchase_order_status(
@@ -106,7 +114,9 @@ async def update_po_status(
 )
 async def create_purchase_receipt_endpoint(
     data: CreatePurchaseReceiptRequest,
-    current_user: User = Depends(require_manager),
+    current_user: User = Depends(
+        require_permission("inventory.purchase_orders.receive")
+    ),
     db=Depends(get_db),
 ):
     return await create_purchase_receipt(
@@ -121,7 +131,9 @@ async def create_purchase_receipt_endpoint(
 )
 async def get_purchase_receipt(
     receipt_id: UUID,
-    current_user: User = Depends(get_current_user),
+    current_user: User = Depends(
+        require_permission("inventory.purchase_orders.view")
+    ),
     db=Depends(get_db),
 ):
     return await get_purchase_receipt_by_id(

@@ -9,7 +9,7 @@ from datetime import datetime, timezone
 from uuid import UUID
 
 from fastapi import HTTPException, status
-from sqlalchemy import select, text
+from sqlalchemy import func, select, text
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.models.business import Branch, Business, BusinessConfig, BusinessType
@@ -17,6 +17,7 @@ from app.models.user import Role, User, UserRole
 from app.schemas.auth import RegisterBusinessRequest
 from app.services.auth_service import hash_password
 from app.services.onboarding_presets import build_onboarding_config_row
+from app.services.role_permission_seed import ensure_standard_roles_and_permissions
 
 
 def _slugify(name: str) -> str:
@@ -161,25 +162,25 @@ async def register_new_business(
         db.add(user)
         await db.flush()
 
+        await ensure_standard_roles_and_permissions(
+            db,
+            business.id,
+            created_by=user.id,
+        )
+
         role_result = await db.execute(
             select(Role).where(
                 Role.business_id == business.id,
-                Role.name == "owner",
+                func.lower(Role.name) == "owner",
                 Role.deleted_at.is_(None),
             )
         )
         owner_role = role_result.scalar_one_or_none()
         if owner_role is None:
-            owner_role = Role(
-                business_id=business.id,
-                name="owner",
-                description="Business owner",
-                is_system=True,
-                created_at=now,
-                updated_at=now,
+            raise HTTPException(
+                status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+                detail="Owner role was not created during registration",
             )
-            db.add(owner_role)
-            await db.flush()
 
         user_role = UserRole(
             business_id=business.id,

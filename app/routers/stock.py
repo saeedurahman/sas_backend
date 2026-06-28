@@ -3,7 +3,7 @@ from uuid import UUID
 from fastapi import APIRouter, Depends, Query, status
 
 from app.database import get_db
-from app.dependencies import get_current_user
+from app.dependencies import require_permission
 from app.models.user import User
 from app.schemas.inventory import (
     PaginatedStockMovementResponse,
@@ -28,7 +28,7 @@ async def get_balance(
     branch_id: UUID,
     product_id: UUID,
     variation_id: UUID | None = Query(default=None),
-    current_user: User = Depends(get_current_user),
+    current_user: User = Depends(require_permission("inventory.view")),
     db=Depends(get_db),
 ):
     return await get_stock_balance_detail(
@@ -48,7 +48,7 @@ async def get_balance(
 async def list_balances(
     branch_id: UUID,
     product_ids: list[UUID] | None = Query(default=None),
-    current_user: User = Depends(get_current_user),
+    current_user: User = Depends(require_permission("inventory.view")),
     db=Depends(get_db),
 ):
     return await get_stock_balances_for_branch(
@@ -67,7 +67,7 @@ async def list_movements(
     movement_type: str | None = Query(default=None),
     skip: int = Query(default=0, ge=0),
     limit: int = Query(default=50, le=200),
-    current_user: User = Depends(get_current_user),
+    current_user: User = Depends(require_permission("inventory.view")),
     db=Depends(get_db),
 ):
     movements, total = await get_stock_movements(

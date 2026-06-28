@@ -7,7 +7,7 @@ from fastapi import APIRouter, Depends, status
 from pydantic import BaseModel
 
 from app.database import get_db
-from app.dependencies import get_current_user, require_owner
+from app.dependencies import require_owner, require_permission
 from app.models.user import User
 from app.schemas.sales import CreateDiscountSchemeRequest, DiscountSchemeResponse
 from app.services.discount_service import (
@@ -36,7 +36,7 @@ class UpdateDiscountSchemeBody(BaseModel):
     status_code=status.HTTP_200_OK,
 )
 async def list_discounts(
-    current_user: User = Depends(get_current_user),
+    current_user: User = Depends(require_permission("discounts.view")),
     db=Depends(get_db),
 ):
     return await get_discount_schemes(db, current_user.business_id)
@@ -64,7 +64,7 @@ async def create_discount(
 )
 async def get_discount(
     scheme_id: UUID,
-    current_user: User = Depends(get_current_user),
+    current_user: User = Depends(require_permission("discounts.view")),
     db=Depends(get_db),
 ):
     return await get_discount_scheme_by_id(

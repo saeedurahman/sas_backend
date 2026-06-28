@@ -334,6 +334,28 @@ async def get_active_shift(
     return _attach_shift_user_names(shift)
 
 
+async def get_active_shift_for_user(
+    db: AsyncSession,
+    business_id: UUID,
+    user_id: UUID,
+) -> RegisterShift | None:
+    """Open shift owned by user_id within the business, if any."""
+    result = await db.execute(
+        select(RegisterShift)
+        .where(
+            RegisterShift.opened_by == user_id,
+            RegisterShift.business_id == business_id,
+            RegisterShift.status == ShiftStatusEnum.open.value,
+            RegisterShift.deleted_at.is_(None),
+        )
+        .options(*_shift_user_load_options())
+    )
+    shift = result.scalar_one_or_none()
+    if shift is None:
+        return None
+    return _attach_shift_user_names(shift)
+
+
 async def open_shift(
     db: AsyncSession,
     business_id: UUID,
@@ -358,15 +380,7 @@ async def open_shift(
             detail="A shift is already open for this register",
         )
 
-    user_shift_result = await db.execute(
-        select(RegisterShift).where(
-            RegisterShift.opened_by == opened_by,
-            RegisterShift.business_id == business_id,
-            RegisterShift.status == ShiftStatusEnum.open.value,
-            RegisterShift.deleted_at.is_(None),
-        )
-    )
-    if user_shift_result.scalar_one_or_none() is not None:
+    if await get_active_shift_for_user(db, business_id, opened_by) is not None:
         raise HTTPException(
             status_code=status.HTTP_400_BAD_REQUEST,
             detail="You already have an open shift",

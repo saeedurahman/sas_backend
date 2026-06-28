@@ -3,7 +3,7 @@ from uuid import UUID
 from fastapi import APIRouter, Depends, Query, status
 
 from app.database import get_db
-from app.dependencies import get_current_user, require_manager
+from app.dependencies import require_permission
 from app.models.user import User
 from app.schemas.inventory import (
     CreateStockTransferRequest,
@@ -29,7 +29,7 @@ async def list_transfers(
     transfer_status: str | None = Query(default=None, alias="status"),
     skip: int = Query(default=0, ge=0),
     limit: int = Query(default=50, le=200),
-    current_user: User = Depends(get_current_user),
+    current_user: User = Depends(require_permission("inventory.transfers.view")),
     db=Depends(get_db),
 ):
     transfers, _ = await get_stock_transfers(
@@ -45,7 +45,9 @@ async def list_transfers(
 )
 async def create_transfer(
     data: CreateStockTransferRequest,
-    current_user: User = Depends(require_manager),
+    current_user: User = Depends(
+        require_permission("inventory.transfers.create")
+    ),
     db=Depends(get_db),
 ):
     return await create_stock_transfer(
@@ -60,7 +62,7 @@ async def create_transfer(
 )
 async def get_transfer(
     transfer_id: UUID,
-    current_user: User = Depends(get_current_user),
+    current_user: User = Depends(require_permission("inventory.transfers.view")),
     db=Depends(get_db),
 ):
     return await get_stock_transfer_by_id(
@@ -75,7 +77,9 @@ async def get_transfer(
 )
 async def receive_transfer(
     transfer_id: UUID,
-    current_user: User = Depends(require_manager),
+    current_user: User = Depends(
+        require_permission("inventory.transfers.receive")
+    ),
     db=Depends(get_db),
 ):
     return await receive_stock_transfer(

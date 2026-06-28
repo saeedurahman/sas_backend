@@ -3,7 +3,7 @@ from uuid import UUID
 from fastapi import APIRouter, Depends, Query, status
 
 from app.database import get_db
-from app.dependencies import get_current_user, require_manager
+from app.dependencies import require_permission
 from app.models.user import User
 from app.schemas.expense import (
     SupplierBalanceResponse,
@@ -27,7 +27,7 @@ router = APIRouter(prefix="/supplier-ledger", tags=["Supplier Ledger"])
 )
 async def supplier_balance(
     supplier_id: UUID,
-    current_user: User = Depends(get_current_user),
+    current_user: User = Depends(require_permission("suppliers.ledger.view")),
     db=Depends(get_db),
 ):
     balance = await get_supplier_balance(
@@ -45,7 +45,7 @@ async def list_supplier_ledger(
     supplier_id: UUID,
     skip: int = Query(default=0, ge=0),
     limit: int = Query(default=50, le=200),
-    current_user: User = Depends(get_current_user),
+    current_user: User = Depends(require_permission("suppliers.ledger.view")),
     db=Depends(get_db),
 ):
     entries, total = await get_supplier_ledger(
@@ -67,7 +67,7 @@ async def list_supplier_ledger(
 async def supplier_payment(
     supplier_id: UUID,
     data: SupplierPaymentRequest,
-    current_user: User = Depends(require_manager),
+    current_user: User = Depends(require_permission("suppliers.ledger.payment")),
     db=Depends(get_db),
 ):
     return await record_supplier_payment(

@@ -10,7 +10,11 @@ from sqlalchemy.orm import selectinload
 
 from app.core.config import settings
 from app.models.business import Business, BusinessConfig
-from app.models.user import User
+from app.models.user import Role, RolePermission, User, UserRole
+from app.dependencies import (
+    user_permission_keys_for_response,
+    user_roles_for_response,
+)
 from app.services.audit_helper import log_auth_event
 from app.services.auth_service import (
     create_access_token,
@@ -351,6 +355,10 @@ async def load_user_for_response(db: AsyncSession, user_id: UUID) -> User:
         .options(
             selectinload(User.business).selectinload(Business.business_type),
             selectinload(User.default_branch),
+            selectinload(User.user_roles)
+            .selectinload(UserRole.role)
+            .selectinload(Role.role_permissions)
+            .selectinload(RolePermission.permission),
         )
     )
     user = result.scalar_one_or_none()
@@ -377,6 +385,8 @@ def build_user_info(user: User) -> UserInfo:
         branch_id=user.default_branch_id,
         business_name=business.name,
         business_type_code=business.business_type.code,
+        roles=user_roles_for_response(user),
+        permission_keys=user_permission_keys_for_response(user),
     )
 
 
