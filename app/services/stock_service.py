@@ -1,11 +1,14 @@
-"""Stock ledger and balance services."""
+"""Stock ledger and balance services.
+
+Document numbers use document_number_counters (atomic daily sequences).
+"""
 
 from datetime import date, datetime, timezone
 from decimal import Decimal
 from uuid import UUID
 
 from fastapi import HTTPException, status
-from sqlalchemy import func, select
+from sqlalchemy import func, select, text
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.orm import InstrumentedAttribute
 
@@ -27,18 +30,36 @@ async def generate_document_number(
     model: type,
     number_column: InstrumentedAttribute,
 ) -> str:
+    """Return the next `{prefix}-YYYYMMDD-####` for this business and day.
+
+    Uses document_number_counters with INSERT ... ON CONFLICT DO UPDATE for
+    atomic increment under concurrency. ``model`` and ``number_column`` are
+    retained for call-site compatibility only.
+    """
+    del model, number_column
     date_str = _now().strftime("%Y%m%d")
-    pattern = f"{prefix}-{date_str}-"
-    count_result = await db.execute(
-        select(func.count())
-        .select_from(model)
-        .where(
-            model.business_id == business_id,
-            number_column.like(f"{pattern}%"),
-        )
+    result = await db.execute(
+        text(
+            """
+            INSERT INTO document_number_counters (
+                id, business_id, prefix, date_key, last_sequence
+            ) VALUES (
+                gen_random_uuid(), :business_id, :prefix, :date_key, 1
+            )
+            ON CONFLICT (business_id, prefix, date_key)
+            DO UPDATE SET
+                last_sequence = document_number_counters.last_sequence + 1
+            RETURNING last_sequence
+            """
+        ),
+        {
+            "business_id": business_id,
+            "prefix": prefix,
+            "date_key": date_str,
+        },
     )
-    seq = count_result.scalar_one() + 1
-    return f"{pattern}{seq:04d}"
+    seq = result.scalar_one()
+    return f"{prefix}-{date_str}-{seq:04d}"
 
 
 async def verify_branch(
@@ -267,6 +288,7 @@ async def create_stock_movement(
     expiry_date: date | None = None,
     notes: str | None = None,
     movement_at: datetime | None = None,
+    movement_sequence: int | None = None,
 ) -> StockMovement:
     now = _now()
     movement = StockMovement(
@@ -284,6 +306,7 @@ async def create_stock_movement(
         expiry_date=expiry_date,
         notes=notes,
         movement_at=movement_at or now,
+        movement_sequence=movement_sequence,
         created_by=created_by,
         created_at=now,
         updated_at=now,

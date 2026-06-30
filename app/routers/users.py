@@ -7,6 +7,7 @@ from app.dependencies import get_current_user, require_permission
 from app.models.user import User
 from app.schemas.auth import MessageResponse
 from app.schemas.user import (
+    AssignUserRolesRequest,
     CreateUserRequest,
     SetPinRequest,
     UpdateUserRequest,
@@ -16,6 +17,7 @@ from app.services.user_service import (
     create_tenant_user,
     get_user_by_id,
     get_users_for_business,
+    replace_user_roles,
     set_user_pin,
     soft_delete_tenant_user,
     update_tenant_user,
@@ -62,6 +64,26 @@ async def update_user(
 ):
     return await update_tenant_user(
         db, user_id, current_user.business_id, data, current_user.id
+    )
+
+
+@router.put(
+    "/{user_id}/roles",
+    response_model=UserResponse,
+    status_code=status.HTTP_200_OK,
+)
+async def replace_user_roles_endpoint(
+    user_id: UUID,
+    data: AssignUserRolesRequest,
+    current_user: User = Depends(require_permission("users.roles.manage")),
+    db=Depends(get_db),
+):
+    return await replace_user_roles(
+        db,
+        user_id,
+        current_user.business_id,
+        data.role_ids,
+        current_user.id,
     )
 
 

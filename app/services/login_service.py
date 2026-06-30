@@ -27,7 +27,10 @@ from app.services.auth_service import (
     verify_pin,
 )
 from app.schemas.auth import RegisterBusinessRequest, TokenResponse, UserInfo
-from app.services.registration_service import register_new_business
+from app.services.registration_service import (
+    business_slug_from_business,
+    register_new_business,
+)
 from app.services.token_service import (
     is_refresh_token_valid,
     revoke_refresh_token,
@@ -158,7 +161,10 @@ async def login_with_password(
         select(User)
         .where(User.phone == phone, User.deleted_at.is_(None))
         .options(
-            selectinload(User.business).selectinload(Business.business_type),
+            selectinload(User.business).options(
+                selectinload(Business.business_type),
+                selectinload(Business.config),
+            ),
             selectinload(User.default_branch),
         )
     )
@@ -256,7 +262,10 @@ async def login_with_pin(
             User.deleted_at.is_(None),
         )
         .options(
-            selectinload(User.business).selectinload(Business.business_type),
+            selectinload(User.business).options(
+                selectinload(Business.business_type),
+                selectinload(Business.config),
+            ),
             selectinload(User.default_branch),
         )
     )
@@ -353,7 +362,10 @@ async def load_user_for_response(db: AsyncSession, user_id: UUID) -> User:
         select(User)
         .where(User.id == user_id, User.deleted_at.is_(None))
         .options(
-            selectinload(User.business).selectinload(Business.business_type),
+            selectinload(User.business).options(
+                selectinload(Business.business_type),
+                selectinload(Business.config),
+            ),
             selectinload(User.default_branch),
             selectinload(User.user_roles)
             .selectinload(UserRole.role)
@@ -385,6 +397,7 @@ def build_user_info(user: User) -> UserInfo:
         branch_id=user.default_branch_id,
         business_name=business.name,
         business_type_code=business.business_type.code,
+        business_slug=business_slug_from_business(business),
         roles=user_roles_for_response(user),
         permission_keys=user_permission_keys_for_response(user),
     )

@@ -27,6 +27,23 @@ def _slugify(name: str) -> str:
     return value[:200] or "business"
 
 
+def business_slug_from_business(business: Business) -> str:
+    """Read tenant slug from business_configs.config_json (PIN login identifier)."""
+    config = business.config
+    if config is None or config.deleted_at is not None:
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail="Business configuration not loaded",
+        )
+    slug = (config.config_json or {}).get("slug")
+    if not slug:
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail="Business slug not configured",
+        )
+    return str(slug)
+
+
 async def _slug_exists(db: AsyncSession, slug: str) -> bool:
     result = await db.execute(
         text(

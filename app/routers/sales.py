@@ -4,19 +4,22 @@ from uuid import UUID
 from fastapi import APIRouter, Depends, Query, status
 
 from app.database import get_db
-from app.dependencies import require_permission
+from app.dependencies import _user_permission_keys, require_permission
 from app.models.user import User
 from app.schemas.sales import (
     CreateSaleRequest,
     PaginatedSaleResponse,
     SaleListResponse,
+    SalePricePreviewResponse,
     SaleResponse,
 )
 from app.services.sale_service import (
     cancel_sale,
+    compute_sale_pricing,
     create_sale,
     get_sale_by_id,
     get_sales,
+    void_sale,
 )
 
 router = APIRouter(prefix="/sales", tags=["Sales"])
@@ -68,7 +71,29 @@ async def create_sale_endpoint(
     db=Depends(get_db),
 ):
     return await create_sale(
-        db, current_user.business_id, data, current_user.id
+        db,
+        current_user.business_id,
+        data,
+        current_user.id,
+        _user_permission_keys(current_user),
+    )
+
+
+@router.post(
+    "/price-preview",
+    response_model=SalePricePreviewResponse,
+    status_code=status.HTTP_200_OK,
+)
+async def preview_sale_price(
+    data: CreateSaleRequest,
+    current_user: User = Depends(require_permission("sales.create")),
+    db=Depends(get_db),
+):
+    return await compute_sale_pricing(
+        db,
+        current_user.business_id,
+        data,
+        _user_permission_keys(current_user),
     )
 
 
@@ -96,5 +121,20 @@ async def cancel_sale_endpoint(
     db=Depends(get_db),
 ):
     return await cancel_sale(
+        db, sale_id, current_user.business_id, current_user.id
+    )
+
+
+@router.post(
+    "/{sale_id}/void",
+    response_model=SaleResponse,
+    status_code=status.HTTP_200_OK,
+)
+async def void_sale_endpoint(
+    sale_id: UUID,
+    current_user: User = Depends(require_permission("sales.cancel")),
+    db=Depends(get_db),
+):
+    return await void_sale(
         db, sale_id, current_user.business_id, current_user.id
     )

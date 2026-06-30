@@ -39,7 +39,10 @@ async def get_current_user(
         select(User)
         .where(User.id == user_id)
         .options(
-            selectinload(User.business).selectinload(Business.business_type),
+            selectinload(User.business).options(
+                selectinload(Business.business_type),
+                selectinload(Business.config),
+            ),
             selectinload(User.default_branch),
             selectinload(User.user_roles)
             .selectinload(UserRole.role)

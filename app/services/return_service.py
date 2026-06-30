@@ -19,6 +19,7 @@ from app.models.register import RegisterTransaction
 from app.models.sales import Sale, SaleLine, SaleReturn, SaleReturnLine, SaleReturnPayment
 from app.schemas.sales import CreateSaleReturnRequest
 from app.services.customer_service import create_ledger_entry, get_customer_by_id
+from app.services.fifo_service import restore_sale_line_inventory
 from app.services.stock_service import (
     _now,
     create_stock_movement,
@@ -203,6 +204,14 @@ async def create_sale_return(
                 .with_for_update()
             )
 
+        if original_sale is not None:
+            await db.refresh(original_sale, attribute_names=["status"])
+            if original_sale.status in ("cancelled", "voided"):
+                raise HTTPException(
+                    status_code=status.HTTP_400_BAD_REQUEST,
+                    detail="Cannot return against a cancelled or voided sale",
+                )
+
         pending_return_qty: dict[UUID, Decimal] = {}
 
         for line in data.lines:
@@ -293,31 +302,51 @@ async def create_sale_return(
             line_refund = line_data.qty * line_data.unit_price + line_data.tax_amount
             total_refund += line_refund
 
-            cost_per_unit = Decimal("0")
             if line_data.sale_line_id is not None:
                 sl_result = await db.execute(
-                    select(SaleLine.cost_per_unit).where(
-                        SaleLine.id == line_data.sale_line_id
+                    select(SaleLine).where(
+                        SaleLine.id == line_data.sale_line_id,
+                        SaleLine.business_id == business_id,
+                        SaleLine.deleted_at.is_(None),
                     )
                 )
-                stored_cost = sl_result.scalar_one_or_none()
-                if stored_cost is not None:
-                    cost_per_unit = Decimal(str(stored_cost))
-
-            await create_stock_movement(
-                db=db,
-                business_id=business_id,
-                branch_id=data.branch_id,
-                product_id=line_data.product_id,
-                variation_id=line_data.variation_id,
-                movement_type=StockMovementTypeEnum.sale_return,
-                qty=line_data.qty,
-                cost_per_unit=cost_per_unit,
-                reference_type=ReferenceTypeEnum.sale_return_line,
-                reference_id=return_line.id,
-                created_by=created_by,
-                movement_at=returned_at,
-            )
+                original_line = sl_result.scalar_one_or_none()
+                if original_line is None:
+                    raise HTTPException(
+                        status_code=status.HTTP_400_BAD_REQUEST,
+                        detail="Original sale line not found",
+                    )
+                await restore_sale_line_inventory(
+                    db,
+                    business_id=business_id,
+                    branch_id=data.branch_id,
+                    product_id=line_data.product_id,
+                    variation_id=line_data.variation_id,
+                    sale_line_id=original_line.id,
+                    sale_line_qty=original_line.qty,
+                    sale_line_cost_per_unit=original_line.cost_per_unit,
+                    qty_to_restore=line_data.qty,
+                    movement_type=StockMovementTypeEnum.sale_return,
+                    reference_type=ReferenceTypeEnum.sale_return_line,
+                    reference_id=return_line.id,
+                    created_by=created_by,
+                    movement_at=returned_at,
+                )
+            else:
+                await create_stock_movement(
+                    db=db,
+                    business_id=business_id,
+                    branch_id=data.branch_id,
+                    product_id=line_data.product_id,
+                    variation_id=line_data.variation_id,
+                    movement_type=StockMovementTypeEnum.sale_return,
+                    qty=line_data.qty,
+                    cost_per_unit=Decimal("0"),
+                    reference_type=ReferenceTypeEnum.sale_return_line,
+                    reference_id=return_line.id,
+                    created_by=created_by,
+                    movement_at=returned_at,
+                )
 
         for refund in data.refund_payments:
             payment = SaleReturnPayment(

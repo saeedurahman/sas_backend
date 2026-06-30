@@ -23,6 +23,140 @@ def _is_owner(user: User) -> bool:
     return False
 
 
+async def _count_active_owners(db: AsyncSession, business_id: UUID) -> int:
+    owners_result = await db.execute(
+        select(User)
+        .where(User.business_id == business_id, User.deleted_at.is_(None))
+        .options(selectinload(User.user_roles).selectinload(UserRole.role))
+    )
+    count = 0
+    for user in owners_result.scalars().unique().all():
+        if _is_owner(user):
+            count += 1
+    return count
+
+
+async def _resolve_business_roles(
+    db: AsyncSession,
+    business_id: UUID,
+    role_ids: list[UUID],
+) -> list[Role]:
+    unique_ids = list(dict.fromkeys(role_ids))
+    result = await db.execute(
+        select(Role).where(
+            Role.business_id == business_id,
+            Role.id.in_(unique_ids),
+            Role.deleted_at.is_(None),
+        )
+    )
+    roles = list(result.scalars().all())
+    if len(roles) != len(unique_ids):
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="One or more roles not found for this business",
+        )
+    return roles
+
+
+async def _load_user_role_assignments(
+    db: AsyncSession,
+    *,
+    business_id: UUID,
+    user_id: UUID,
+) -> list[UserRole]:
+    result = await db.execute(
+        select(UserRole).where(
+            UserRole.business_id == business_id,
+            UserRole.user_id == user_id,
+        )
+    )
+    return list(result.scalars().all())
+
+
+async def _replace_user_roles(
+    db: AsyncSession,
+    user: User,
+    roles: list[Role],
+    *,
+    updated_by: UUID,
+) -> None:
+    business_id = user.business_id
+    new_role_ids = {role.id for role in roles}
+    branch_id = user.default_branch_id
+    now = datetime.now(timezone.utc)
+
+    assignments = await _load_user_role_assignments(
+        db, business_id=business_id, user_id=user.id
+    )
+    by_role_id: dict[UUID, list[UserRole]] = {}
+    for assignment in assignments:
+        by_role_id.setdefault(assignment.role_id, []).append(assignment)
+
+    for assignment in assignments:
+        if assignment.deleted_at is None and assignment.role_id not in new_role_ids:
+            assignment.deleted_at = now
+            assignment.updated_at = now
+
+    for role in roles:
+        existing = by_role_id.get(role.id, [])
+        active = next((a for a in existing if a.deleted_at is None), None)
+        if active is not None:
+            continue
+
+        reactivate = next(
+            (
+                a
+                for a in existing
+                if a.deleted_at is not None and a.branch_id == branch_id
+            ),
+            None,
+        )
+        if reactivate is not None:
+            reactivate.deleted_at = None
+            reactivate.updated_at = now
+            continue
+
+        db.add(
+            UserRole(
+                business_id=business_id,
+                user_id=user.id,
+                role_id=role.id,
+                branch_id=branch_id,
+                created_by=updated_by,
+                created_at=now,
+                updated_at=now,
+            )
+        )
+
+    await db.flush()
+
+
+async def replace_user_roles(
+    db: AsyncSession,
+    user_id: UUID,
+    business_id: UUID,
+    role_ids: list[UUID],
+    updated_by: UUID,
+) -> User:
+    user = await get_user_by_id(db, user_id, business_id)
+    roles = await _resolve_business_roles(db, business_id, role_ids)
+
+    owner_role = next((r for r in roles if r.name.lower() == "owner"), None)
+    if _is_owner(user) and owner_role is None:
+        if await _count_active_owners(db, business_id) <= 1:
+            raise HTTPException(
+                status_code=status.HTTP_400_BAD_REQUEST,
+                detail="Cannot remove the owner role from the last owner of the business",
+            )
+
+    now = datetime.now(timezone.utc)
+    await _replace_user_roles(db, user, roles, updated_by=updated_by)
+    user.updated_by = updated_by
+    user.updated_at = now
+    await db.commit()
+    return await get_user_by_id(db, user_id, business_id)
+
+
 async def get_users_for_business(
     db: AsyncSession,
     business_id: UUID,
@@ -124,6 +258,7 @@ async def get_user_by_id(
         select(User)
         .where(User.id == user_id, User.deleted_at.is_(None))
         .options(selectinload(User.user_roles).selectinload(UserRole.role))
+        .execution_options(populate_existing=True)
     )
     user = result.scalar_one_or_none()
     if user is None:
@@ -200,17 +335,7 @@ async def soft_delete_tenant_user(
     user = await get_user_by_id(db, user_id, business_id)
     now = datetime.now(timezone.utc)
 
-    owners_result = await db.execute(
-        select(User)
-        .where(User.business_id == business_id, User.deleted_at.is_(None))
-        .options(selectinload(User.user_roles).selectinload(UserRole.role))
-    )
-    active_owners = 0
-    for u in owners_result.scalars().unique().all():
-        if _is_owner(u):
-            active_owners += 1
-
-    if _is_owner(user) and active_owners <= 1:
+    if _is_owner(user) and await _count_active_owners(db, business_id) <= 1:
         raise HTTPException(
             status_code=status.HTTP_400_BAD_REQUEST,
             detail="Cannot delete the last owner of the business",

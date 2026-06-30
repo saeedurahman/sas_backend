@@ -345,6 +345,29 @@ class SalePaymentResponse(BaseSchema):
     created_at: datetime
 
 
+class SalePricePreviewLineResponse(BaseSchema):
+    product_id: UUID
+    variation_id: UUID | None
+    qty: Decimal
+    unit_price: Decimal
+    line_order: int
+    line_subtotal: Decimal
+    discount_pct: Decimal
+    discount_amount: Decimal
+    tax_rate: Decimal
+    tax_amount: Decimal
+    line_total: Decimal
+
+
+class SalePricePreviewResponse(BaseSchema):
+    discount_scheme_id: UUID | None
+    subtotal: Decimal
+    total_discount: Decimal
+    total_tax: Decimal
+    total_amount: Decimal
+    lines: list[SalePricePreviewLineResponse] = Field(default_factory=list)
+
+
 class SaleLineResponse(BaseSchema):
     id: UUID
     business_id: UUID

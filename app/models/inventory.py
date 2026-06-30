@@ -3,7 +3,7 @@ from datetime import date, datetime
 from decimal import Decimal
 from typing import TYPE_CHECKING
 
-from sqlalchemy import Boolean, Date, DateTime, ForeignKey, Integer, Numeric, String, Text, Uuid
+from sqlalchemy import Boolean, Date, DateTime, ForeignKey, Integer, Numeric, SmallInteger, String, Text, Uuid
 from sqlalchemy.orm import Mapped, mapped_column, relationship
 
 from app.models.base import AuditMixin, Base, SoftDeleteMixin, SyncMixin
@@ -341,6 +341,9 @@ class StockMovement(Base, SoftDeleteMixin, SyncMixin):
     notes: Mapped[str | None] = mapped_column(Text, nullable=True)
     movement_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True), nullable=False
+    )
+    movement_sequence: Mapped[int | None] = mapped_column(
+        SmallInteger, nullable=True
     )
     sync_status: Mapped[str] = mapped_column(
         sync_status_enum, nullable=False, default="pending"

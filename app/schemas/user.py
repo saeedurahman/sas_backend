@@ -63,12 +63,19 @@ class UserResponse(AuditSchema):
     is_active: bool
     is_locked: bool
     last_login_at: datetime | None = None
+    role_ids: list[UUID] = Field(default_factory=list)
 
     @model_validator(mode="before")
     @classmethod
     def map_user_fields(cls, data: object) -> object:
         if not hasattr(data, "status"):
             return data
+        role_ids: list[UUID] = []
+        if hasattr(data, "user_roles"):
+            for user_role in data.user_roles:
+                if user_role.deleted_at is not None:
+                    continue
+                role_ids.append(user_role.role_id)
         return {
             "id": data.id,
             "business_id": data.business_id,
@@ -78,6 +85,7 @@ class UserResponse(AuditSchema):
             "is_active": data.status == "active" and data.deleted_at is None,
             "is_locked": data.is_locked,
             "last_login_at": data.last_login_at,
+            "role_ids": role_ids,
             "created_at": data.created_at,
             "updated_at": data.updated_at,
             "deleted_at": data.deleted_at,
@@ -106,6 +114,21 @@ class UpdateUserRequest(BaseSchema):
     full_name: str | None = Field(default=None, min_length=2, max_length=100)
     branch_id: UUID | None = None
     is_active: bool | None = None
+
+
+class AssignUserRolesRequest(BaseSchema):
+    role_ids: list[UUID] = Field(min_length=1)
+
+    @field_validator("role_ids")
+    @classmethod
+    def dedupe_role_ids(cls, value: list[UUID]) -> list[UUID]:
+        seen: set[UUID] = set()
+        deduped: list[UUID] = []
+        for role_id in value:
+            if role_id not in seen:
+                seen.add(role_id)
+                deduped.append(role_id)
+        return deduped
 
 
 class SetPinRequest(BaseSchema):
