@@ -430,3 +430,54 @@ audit_action_enum = ENUM(
     name="audit_action_enum",
     create_type=False,
 )
+
+
+class TableStatusEnum(str, Enum):
+    available = "available"
+    occupied = "occupied"
+    reserved = "reserved"
+    billing = "billing"
+    cleaning = "cleaning"
+
+
+class KotStatusEnum(str, Enum):
+    pending = "pending"
+    preparing = "preparing"
+    ready = "ready"
+    served = "served"
+    cancelled = "cancelled"
+
+
+class ModifierSelectionTypeEnum(str, Enum):
+    single = "single"
+    multiple = "multiple"
+    optional = "optional"
+
+
+table_status_enum = ENUM(
+    "available",
+    "occupied",
+    "reserved",
+    "billing",
+    "cleaning",
+    name="table_status_enum",
+    create_type=False,
+)
+
+kot_status_enum = ENUM(
+    "pending",
+    "preparing",
+    "ready",
+    "served",
+    "cancelled",
+    name="kot_status_enum",
+    create_type=False,
+)
+
+modifier_selection_type_enum = ENUM(
+    "single",
+    "multiple",
+    "optional",
+    name="modifier_selection_type_enum",
+    create_type=False,
+)

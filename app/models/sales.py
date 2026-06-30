@@ -22,6 +22,7 @@ from app.models.enums import (
 if TYPE_CHECKING:
     from app.models.business import Branch, Business
     from app.models.product import Product, ProductVariation
+    from app.models.restaurant import DiningTable, KotOrder
 
 
 class Customer(Base, AuditMixin, SoftDeleteMixin, SyncMixin):
@@ -218,7 +219,11 @@ class Sale(Base, AuditMixin, SoftDeleteMixin, SyncMixin):
         ForeignKey("discount_schemes.id", ondelete="SET NULL"),
         nullable=True,
     )
-    table_id: Mapped[uuid.UUID | None] = mapped_column(Uuid(as_uuid=True), nullable=True)
+    table_id: Mapped[uuid.UUID | None] = mapped_column(
+        Uuid(as_uuid=True),
+        ForeignKey("tables.id", ondelete="SET NULL"),
+        nullable=True,
+    )
     sync_status: Mapped[str] = mapped_column(
         sync_status_enum, nullable=False, default="pending"
     )
@@ -241,6 +246,14 @@ class Sale(Base, AuditMixin, SoftDeleteMixin, SyncMixin):
     )
     returns: Mapped[list["SaleReturn"]] = relationship(
         back_populates="original_sale",
+        lazy="selectin",
+    )
+    dining_table: Mapped["DiningTable | None"] = relationship(
+        back_populates="sales",
+        lazy="selectin",
+    )
+    kot_orders: Mapped[list["KotOrder"]] = relationship(
+        back_populates="sale",
         lazy="selectin",
     )
 

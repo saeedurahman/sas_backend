@@ -17,7 +17,33 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from app.models.user import Permission, Role, RolePermission
 
 # All granular keys from seeds/002_full_permissions.sql (66 keys) plus
-# seeds/003_discounts_view_permission.sql (discounts.view).
+# seeds/003_discounts_view_permission.sql (discounts.view) plus
+# seeds/004_restaurant_permissions.sql (10 restaurant.* keys).
+RESTAURANT_PERMISSION_KEYS: frozenset[str] = frozenset(
+    {
+        "restaurant.floor_plans.view",
+        "restaurant.floor_plans.manage",
+        "restaurant.tables.view",
+        "restaurant.tables.manage",
+        "restaurant.tables.update_status",
+        "restaurant.modifiers.view",
+        "restaurant.modifiers.manage",
+        "restaurant.kot.view",
+        "restaurant.kot.update_status",
+        "restaurant.kot.fire",
+    }
+)
+
+RESTAURANT_CASHIER_PERMISSION_KEYS: frozenset[str] = frozenset(
+    {
+        "restaurant.floor_plans.view",
+        "restaurant.tables.view",
+        "restaurant.tables.update_status",
+        "restaurant.modifiers.view",
+        "restaurant.kot.fire",
+    }
+)
+
 ALL_PERMISSION_KEYS: frozenset[str] = frozenset(
     {
         "auth.login",
@@ -88,7 +114,7 @@ ALL_PERMISSION_KEYS: frozenset[str] = frozenset(
         "notifications.view",
         "notifications.manage",
     }
-)
+) | RESTAURANT_PERMISSION_KEYS
 
 # Legacy coarse key from seeds/001_permissions.sql — owner only.
 OWNER_LEGACY_PERMISSION_KEYS: frozenset[str] = frozenset({"products.manage"})
@@ -124,7 +150,7 @@ CASHIER_PERMISSION_KEYS: frozenset[str] = frozenset(
         "shifts.cash_movement",
         "notifications.view",
     }
-)
+) | RESTAURANT_CASHIER_PERMISSION_KEYS
 
 STANDARD_ROLE_NAMES: tuple[str, str, str] = ("owner", "manager", "cashier")
 

@@ -23,6 +23,9 @@ from app.routers.prices import router as prices_router
 from app.routers.permissions import router as permissions_router
 from app.routers.products import router as products_router
 from app.routers.registers import router as registers_router
+from app.routers.restaurant_kot import router as restaurant_kot_router
+from app.routers.restaurant_modifiers import router as restaurant_modifiers_router
+from app.routers.restaurant_tables import router as restaurant_tables_router
 from app.routers.roles import router as roles_router
 from app.routers.notifications import router as notifications_router
 from app.routers.returns import router as returns_router
@@ -110,6 +113,9 @@ app.include_router(discounts_router, prefix=settings.api_v1_prefix)
 app.include_router(sales_router, prefix=settings.api_v1_prefix)
 app.include_router(search_router, prefix=settings.api_v1_prefix)
 app.include_router(returns_router, prefix=settings.api_v1_prefix)
+app.include_router(restaurant_tables_router, prefix=settings.api_v1_prefix)
+app.include_router(restaurant_modifiers_router, prefix=settings.api_v1_prefix)
+app.include_router(restaurant_kot_router, prefix=settings.api_v1_prefix)
 app.include_router(registers_router, prefix=settings.api_v1_prefix)
 app.include_router(shifts_router, prefix=settings.api_v1_prefix)
 app.include_router(expenses_router, prefix=settings.api_v1_prefix)

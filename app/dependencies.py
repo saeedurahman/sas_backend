@@ -212,3 +212,40 @@ async def get_business_config(
             detail="Business configuration not found",
         )
     return config
+
+
+def require_feature_flags(*flag_keys: str) -> Callable[..., BusinessConfig]:
+    """Return 403 when any config_json feature flag is disabled."""
+
+    async def _checker(
+        config: BusinessConfig = Depends(get_business_config),
+    ) -> BusinessConfig:
+        from app.services.feature_flags import get_feature_flag
+
+        for flag_key in flag_keys:
+            if not get_feature_flag(config.config_json, flag_key):
+                raise HTTPException(
+                    status_code=status.HTTP_403_FORBIDDEN,
+                    detail=f"Feature not enabled: {flag_key}",
+                )
+        return config
+
+    return _checker
+
+
+def require_feature_flag(flag_key: str) -> Callable[..., BusinessConfig]:
+    """Return 403 when a config_json feature flag is disabled for the tenant."""
+
+    async def _checker(
+        config: BusinessConfig = Depends(get_business_config),
+    ) -> BusinessConfig:
+        from app.services.feature_flags import get_feature_flag
+
+        if not get_feature_flag(config.config_json, flag_key):
+            raise HTTPException(
+                status_code=status.HTTP_403_FORBIDDEN,
+                detail=f"Feature not enabled: {flag_key}",
+            )
+        return config
+
+    return _checker

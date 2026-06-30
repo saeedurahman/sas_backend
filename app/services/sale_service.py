@@ -285,6 +285,7 @@ async def get_sale_by_id(
             Sale.deleted_at.is_(None),
         )
         .options(*_sale_detail_options())
+        .execution_options(populate_existing=True)
     )
     sale = result.scalar_one_or_none()
     if sale is None:
@@ -1009,13 +1010,23 @@ async def cancel_sale(
 
         now = _now()
 
-        await _restore_all_sale_line_inventory(
-            db,
-            sale,
-            business_id=business_id,
-            restored_by=cancelled_by,
-            movement_at=now,
+        skip_inventory_restore = (
+            sale.sale_type == "dine_in"
+            and sale.status
+            in (
+                SaleStatusEnum.held.value,
+                SaleStatusEnum.draft.value,
+                SaleStatusEnum.partially_paid.value,
+            )
         )
+        if not skip_inventory_restore:
+            await _restore_all_sale_line_inventory(
+                db,
+                sale,
+                business_id=business_id,
+                restored_by=cancelled_by,
+                movement_at=now,
+            )
         if _sale_has_completed_payments(sale):
             await _reverse_completed_sale_settlements(
                 db,
@@ -1029,6 +1040,12 @@ async def cancel_sale(
         sale.deleted_by = cancelled_by
         sale.updated_by = cancelled_by
         sale.updated_at = now
+
+        from app.services.restaurant_tab_service import on_held_tab_cancelled
+
+        await on_held_tab_cancelled(
+            db, sale, cancelled_by=cancelled_by
+        )
 
         await db.commit()
     except HTTPException:

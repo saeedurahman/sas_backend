@@ -58,6 +58,15 @@ from app.models.product import (
     Unit,
     UnitConversion,
 )
+from app.models.restaurant import (
+    DiningTable,
+    FloorPlan,
+    KotOrder,
+    KotOrderLine,
+    Modifier,
+    ModifierGroup,
+    ProductModifierGroup,
+)
 from app.models.user import (
     Permission,
     RefreshToken,
@@ -88,6 +97,13 @@ __all__ = [
     "Barcode",
     "PriceList",
     "PriceListItem",
+    "FloorPlan",
+    "DiningTable",
+    "ModifierGroup",
+    "Modifier",
+    "ProductModifierGroup",
+    "KotOrder",
+    "KotOrderLine",
     "Supplier",
     "PurchaseOrder",
     "PurchaseLine",

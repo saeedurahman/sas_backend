@@ -4,14 +4,32 @@ from uuid import UUID
 from fastapi import APIRouter, Depends, Query, status
 
 from app.database import get_db
-from app.dependencies import _user_permission_keys, require_permission
+from app.dependencies import (
+    _user_permission_keys,
+    require_feature_flag,
+    require_feature_flags,
+    require_permission,
+)
+from app.models.business import BusinessConfig
 from app.models.user import User
 from app.schemas.sales import (
+    AddSaleLinesRequest,
+    CompleteTabRequest,
     CreateSaleRequest,
+    FireToKitchenRequest,
+    OpenTabRequest,
     PaginatedSaleResponse,
+    RequestBillRequest,
     SaleListResponse,
     SalePricePreviewResponse,
     SaleResponse,
+)
+from app.services.restaurant_tab_service import (
+    add_lines_to_tab,
+    complete_tab,
+    fire_tab_to_kitchen,
+    open_tab,
+    request_tab_bill,
 )
 from app.services.sale_service import (
     cancel_sale,
@@ -93,6 +111,127 @@ async def preview_sale_price(
         db,
         current_user.business_id,
         data,
+        _user_permission_keys(current_user),
+    )
+
+
+@router.post(
+    "/open-tab",
+    response_model=SaleResponse,
+    status_code=status.HTTP_201_CREATED,
+)
+async def open_tab_endpoint(
+    data: OpenTabRequest,
+    current_user: User = Depends(require_permission("sales.create")),
+    _config: BusinessConfig = Depends(
+        require_feature_flags("enable_restaurant", "enable_table_management")
+    ),
+    db=Depends(get_db),
+):
+    return await open_tab(
+        db,
+        current_user.business_id,
+        data,
+        current_user.id,
+    )
+
+
+@router.post(
+    "/{sale_id}/lines",
+    response_model=SaleResponse,
+    status_code=status.HTTP_200_OK,
+)
+async def add_tab_lines_endpoint(
+    sale_id: UUID,
+    data: AddSaleLinesRequest,
+    current_user: User = Depends(require_permission("sales.create")),
+    _config: BusinessConfig = Depends(require_feature_flag("enable_restaurant")),
+    db=Depends(get_db),
+):
+    return await add_lines_to_tab(
+        db,
+        current_user.business_id,
+        sale_id,
+        data,
+        current_user.id,
+        _user_permission_keys(current_user),
+    )
+
+
+@router.post(
+    "/{sale_id}/fire",
+    response_model=dict,
+    status_code=status.HTTP_201_CREATED,
+)
+async def fire_tab_endpoint(
+    sale_id: UUID,
+    data: FireToKitchenRequest | None = None,
+    current_user: User = Depends(require_permission("restaurant.kot.fire")),
+    _config: BusinessConfig = Depends(
+        require_feature_flags("enable_restaurant", "enable_kot")
+    ),
+    db=Depends(get_db),
+):
+    payload = data or FireToKitchenRequest()
+    kot_order = await fire_tab_to_kitchen(
+        db,
+        current_user.business_id,
+        sale_id,
+        sale_line_ids=payload.sale_line_ids,
+        notes=payload.notes,
+        created_by=current_user.id,
+    )
+    return {
+        "id": kot_order.id,
+        "kot_number": kot_order.kot_number,
+        "sale_id": kot_order.sale_id,
+        "table_id": kot_order.table_id,
+        "status": kot_order.status,
+    }
+
+
+@router.post(
+    "/{sale_id}/request-bill",
+    response_model=SaleResponse,
+    status_code=status.HTTP_200_OK,
+)
+async def request_tab_bill_endpoint(
+    sale_id: UUID,
+    _data: RequestBillRequest | None = None,
+    current_user: User = Depends(require_permission("sales.create")),
+    _config: BusinessConfig = Depends(
+        require_feature_flags("enable_restaurant", "enable_table_management")
+    ),
+    db=Depends(get_db),
+):
+    return await request_tab_bill(
+        db,
+        current_user.business_id,
+        sale_id,
+        current_user.id,
+    )
+
+
+@router.post(
+    "/{sale_id}/complete",
+    response_model=SaleResponse,
+    status_code=status.HTTP_200_OK,
+)
+async def complete_tab_endpoint(
+    sale_id: UUID,
+    data: CompleteTabRequest,
+    current_user: User = Depends(require_permission("sales.create")),
+    _config: BusinessConfig = Depends(
+        require_feature_flags("enable_restaurant", "enable_table_management")
+    ),
+    db=Depends(get_db),
+):
+    return await complete_tab(
+        db,
+        current_user.business_id,
+        sale_id,
+        data,
+        current_user.id,
         _user_permission_keys(current_user),
     )
 

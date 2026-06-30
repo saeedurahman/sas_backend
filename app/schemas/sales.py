@@ -153,6 +153,7 @@ class CreateSaleLineRequest(BaseSchema):
     tax_rate: Decimal = Decimal("0")
     notes: str | None = None
     line_order: int = 0
+    modifier_ids: list[UUID] = Field(default_factory=list)
 
     @field_validator("qty")
     @classmethod
@@ -221,6 +222,44 @@ class CreateSaleRequest(BaseSchema):
         if len(self.lines) < 1:
             raise ValueError("At least one line required")
         return self
+
+
+class TabSaleLineRequest(CreateSaleLineRequest):
+    """Sale line for dine-in tab append — supports modifier_ids."""
+
+
+class OpenTabRequest(BaseSchema):
+    branch_id: UUID
+    table_id: UUID
+    register_shift_id: UUID | None = None
+    customer_id: UUID | None = None
+    price_list_id: UUID | None = None
+    notes: str | None = None
+
+
+class AddSaleLinesRequest(BaseSchema):
+    lines: list[TabSaleLineRequest]
+
+    @model_validator(mode="after")
+    def validate_lines(self) -> "AddSaleLinesRequest":
+        if len(self.lines) < 1:
+            raise ValueError("At least one line required")
+        return self
+
+
+class FireToKitchenRequest(BaseSchema):
+    sale_line_ids: list[UUID] | None = None
+    notes: str | None = None
+
+
+class CompleteTabRequest(BaseSchema):
+    register_shift_id: UUID | None = None
+    payments: list[CreatePaymentRequest] = Field(default_factory=list)
+    sold_at: datetime | None = None
+
+
+class RequestBillRequest(BaseSchema):
+    pass
 
 
 class CreateReturnLineRequest(BaseSchema):
@@ -427,6 +466,7 @@ class SaleResponse(SalesAuditSchema):
     business_id: UUID
     branch_id: UUID
     customer_id: UUID | None
+    table_id: UUID | None = None
     sale_number: str
     sale_type: str
     status: str
