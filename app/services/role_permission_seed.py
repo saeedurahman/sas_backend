@@ -18,7 +18,9 @@ from app.models.user import Permission, Role, RolePermission
 
 # All granular keys from seeds/002_full_permissions.sql (66 keys) plus
 # seeds/003_discounts_view_permission.sql (discounts.view) plus
-# seeds/004_restaurant_permissions.sql (10 restaurant.* keys).
+# seeds/004_restaurant_permissions.sql (10 restaurant.* keys) plus
+# seeds/005_manufacturing_permissions.sql (6 manufacturing.* keys).
+# seeds/006_accounting_permissions.sql (5 accounting.* keys).
 RESTAURANT_PERMISSION_KEYS: frozenset[str] = frozenset(
     {
         "restaurant.floor_plans.view",
@@ -41,6 +43,34 @@ RESTAURANT_CASHIER_PERMISSION_KEYS: frozenset[str] = frozenset(
         "restaurant.tables.update_status",
         "restaurant.modifiers.view",
         "restaurant.kot.fire",
+    }
+)
+
+MANUFACTURING_PERMISSION_KEYS: frozenset[str] = frozenset(
+    {
+        "manufacturing.bom.view",
+        "manufacturing.bom.manage",
+        "manufacturing.production.view",
+        "manufacturing.production.create",
+        "manufacturing.production.complete",
+        "manufacturing.production.cancel",
+    }
+)
+
+ACCOUNTING_PERMISSION_KEYS: frozenset[str] = frozenset(
+    {
+        "accounting.coa.view",
+        "accounting.coa.manage",
+        "accounting.journal.view",
+        "accounting.journal.create",
+        "accounting.journal.post",
+    }
+)
+
+ACCOUNTING_MANAGER_VIEW_KEYS: frozenset[str] = frozenset(
+    {
+        "accounting.coa.view",
+        "accounting.journal.view",
     }
 )
 
@@ -114,11 +144,12 @@ ALL_PERMISSION_KEYS: frozenset[str] = frozenset(
         "notifications.view",
         "notifications.manage",
     }
-) | RESTAURANT_PERMISSION_KEYS
+) | RESTAURANT_PERMISSION_KEYS | MANUFACTURING_PERMISSION_KEYS | ACCOUNTING_PERMISSION_KEYS
 
 # Legacy coarse key from seeds/001_permissions.sql — owner only.
 OWNER_LEGACY_PERMISSION_KEYS: frozenset[str] = frozenset({"products.manage"})
 
+# Manager role excludes write/post accounting keys (see MANAGER_EXCLUDED_KEYS).
 MANAGER_EXCLUDED_KEYS: frozenset[str] = frozenset(
     {
         "users.roles.manage",
@@ -128,6 +159,9 @@ MANAGER_EXCLUDED_KEYS: frozenset[str] = frozenset(
         "expenses.delete",
         "products.delete",
         "registers.manage",
+        "accounting.coa.manage",
+        "accounting.journal.create",
+        "accounting.journal.post",
     }
 )
 

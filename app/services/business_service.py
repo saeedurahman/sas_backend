@@ -12,6 +12,8 @@ from sqlalchemy.orm import selectinload
 
 from app.models.business import Branch, Business, BusinessConfig, BusinessType
 from app.schemas.business import UpdateBusinessRequest
+from app.services.accounting_coa_seed_service import seed_default_chart_of_accounts
+from app.services.feature_flags import get_feature_flag
 
 
 async def get_business_by_id(db: AsyncSession, business_id: UUID) -> Business:
@@ -86,11 +88,19 @@ async def update_business_config(
         )
 
     merged = deepcopy(config.config_json or {})
+    was_accounting_enabled = get_feature_flag(merged, "enable_accounting")
     merged.update(new_config)
+    now_accounting_enabled = get_feature_flag(merged, "enable_accounting")
     now = datetime.now(timezone.utc)
     config.config_json = merged
     config.updated_by = updated_by
     config.updated_at = now
+    if now_accounting_enabled and not was_accounting_enabled:
+        await seed_default_chart_of_accounts(
+            db,
+            business_id,
+            created_by=updated_by,
+        )
     await db.commit()
     await db.refresh(config)
     return config

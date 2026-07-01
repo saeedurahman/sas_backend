@@ -294,7 +294,7 @@ def test_auth_me_roles_and_permissions(
         owner_headers,
         label="owner",
         expected_roles=["owner"],
-        expected_permission_count=68,
+        expected_permission_count=len(expected_owner),
         expected_permission_keys=set(expected_owner),
     )
 
@@ -311,7 +311,7 @@ def test_auth_me_roles_and_permissions(
         manager_headers,
         label="manager",
         expected_roles=["manager"],
-        expected_permission_count=60,
+        expected_permission_count=len(expected_manager),
         expected_permission_keys=set(expected_manager),
     )
 

@@ -123,6 +123,9 @@ class ReferenceTypeEnum(str, Enum):
     production_line = "production_line"
     waste_entry = "waste_entry"
     waste_entry_line = "waste_entry_line"
+    expense = "expense"
+    expense_payment = "expense_payment"
+    sale_payment = "sale_payment"
     opening_balance = "opening_balance"
     manual = "manual"
 
@@ -185,6 +188,9 @@ reference_type_enum = ENUM(
     "production_line",
     "waste_entry",
     "waste_entry_line",
+    "expense",
+    "expense_payment",
+    "sale_payment",
     "opening_balance",
     "manual",
     name="reference_type_enum",
@@ -454,6 +460,13 @@ class ModifierSelectionTypeEnum(str, Enum):
     optional = "optional"
 
 
+class ProductionOrderStatusEnum(str, Enum):
+    draft = "draft"
+    in_progress = "in_progress"
+    completed = "completed"
+    cancelled = "cancelled"
+
+
 table_status_enum = ENUM(
     "available",
     "occupied",
@@ -479,5 +492,73 @@ modifier_selection_type_enum = ENUM(
     "multiple",
     "optional",
     name="modifier_selection_type_enum",
+    create_type=False,
+)
+
+production_order_status_enum = ENUM(
+    "draft",
+    "in_progress",
+    "completed",
+    "cancelled",
+    name="production_order_status_enum",
+    create_type=False,
+)
+
+
+class AccountTypeEnum(str, Enum):
+    asset = "asset"
+    liability = "liability"
+    equity = "equity"
+    income = "income"
+    expense = "expense"
+
+
+class AccountSubtypeEnum(str, Enum):
+    cash = "cash"
+    bank = "bank"
+    accounts_receivable = "accounts_receivable"
+    accounts_payable = "accounts_payable"
+    inventory = "inventory"
+    cogs = "cogs"
+    sales_revenue = "sales_revenue"
+    tax_payable = "tax_payable"
+    other = "other"
+
+
+class JournalEntryStatusEnum(str, Enum):
+    draft = "draft"
+    posted = "posted"
+    voided = "voided"
+
+
+account_type_enum = ENUM(
+    "asset",
+    "liability",
+    "equity",
+    "income",
+    "expense",
+    name="account_type_enum",
+    create_type=False,
+)
+
+account_subtype_enum = ENUM(
+    "cash",
+    "bank",
+    "accounts_receivable",
+    "accounts_payable",
+    "inventory",
+    "cogs",
+    "sales_revenue",
+    "tax_payable",
+    "other",
+    name="account_subtype_enum",
+    create_type=False,
+)
+
+journal_entry_status_enum = ENUM(
+    "draft",
+    "posted",
+    "voided",
+    name="journal_entry_status_enum",
     create_type=False,
 )

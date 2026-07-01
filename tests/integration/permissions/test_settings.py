@@ -79,10 +79,10 @@ def test_settings_module_permissions(
             200,
         ),
         (
-            "GET /settings (cashier, denied)",
+            "GET /settings (cashier)",
             cashier_headers,
             f"{api_base}/settings",
-            403,
+            200,
         ),
         (
             "GET /tax-rates (manager)",
@@ -143,6 +143,18 @@ def test_settings_module_permissions(
         403,
         label="PUT /settings (manager, denied)",
     )
+    assert_status(
+        http_client.put(
+            f"{api_base}/settings",
+            headers=cashier_headers,
+            json={
+                "setting_key": f"cashier_blocked_{suffix}",
+                "setting_value": {"enabled": False},
+            },
+        ),
+        403,
+        label="PUT /settings (cashier, denied)",
+    )
 
     tax = http_client.post(
         f"{api_base}/tax-rates",
@@ -173,6 +185,6 @@ def test_settings_module_permissions(
             f"{api_base}/notifications/check-alerts",
             headers=cashier_headers,
         ),
-        403,
-        label="POST /notifications/check-alerts (cashier, denied)",
+        200,
+        label="POST /notifications/check-alerts (cashier)",
     )

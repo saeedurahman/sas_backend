@@ -1,4 +1,5 @@
 from contextlib import asynccontextmanager
+import os
 
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
@@ -7,6 +8,7 @@ from fastapi.security import HTTPBearer  # noqa: F401 — BearerAuth scheme for 
 
 from app.core.config import settings
 from app.database import engine
+from app.routers.accounting import router as accounting_router
 from app.routers.adjustments import router as adjustments_router
 from app.routers.analytics import router as analytics_router
 from app.routers.audit import router as audit_router
@@ -23,6 +25,8 @@ from app.routers.prices import router as prices_router
 from app.routers.permissions import router as permissions_router
 from app.routers.products import router as products_router
 from app.routers.registers import router as registers_router
+from app.routers.manufacturing_bom import router as manufacturing_bom_router
+from app.routers.manufacturing_production import router as manufacturing_production_router
 from app.routers.restaurant_kot import router as restaurant_kot_router
 from app.routers.restaurant_modifiers import router as restaurant_modifiers_router
 from app.routers.restaurant_tables import router as restaurant_tables_router
@@ -83,9 +87,17 @@ def custom_openapi():
 
 app.openapi = custom_openapi
 
+# Comma-separated origins; default covers local dev. Set ALLOWED_ORIGINS in production
+# (e.g. "https://app.pakpos.com,https://admin.pakpos.com").
+ALLOWED_ORIGINS = os.getenv(
+    "ALLOWED_ORIGINS",
+    "http://localhost:8000,http://localhost:3000",
+).split(",")
+
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],
+    allow_origins=ALLOWED_ORIGINS,
+    allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
 )
@@ -116,6 +128,9 @@ app.include_router(returns_router, prefix=settings.api_v1_prefix)
 app.include_router(restaurant_tables_router, prefix=settings.api_v1_prefix)
 app.include_router(restaurant_modifiers_router, prefix=settings.api_v1_prefix)
 app.include_router(restaurant_kot_router, prefix=settings.api_v1_prefix)
+app.include_router(manufacturing_bom_router, prefix=settings.api_v1_prefix)
+app.include_router(manufacturing_production_router, prefix=settings.api_v1_prefix)
+app.include_router(accounting_router, prefix=settings.api_v1_prefix)
 app.include_router(registers_router, prefix=settings.api_v1_prefix)
 app.include_router(shifts_router, prefix=settings.api_v1_prefix)
 app.include_router(expenses_router, prefix=settings.api_v1_prefix)

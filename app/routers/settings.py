@@ -3,7 +3,7 @@ from uuid import UUID
 from fastapi import APIRouter, Depends, HTTPException, Query, status
 
 from app.database import get_db
-from app.dependencies import require_permission
+from app.dependencies import get_current_user, require_permission
 from app.models.user import User
 from app.schemas.auth import MessageResponse
 from app.schemas.settings import (
@@ -25,7 +25,7 @@ router = APIRouter(prefix="/settings", tags=["Settings"])
 @router.get("", response_model=list[SettingResponse], status_code=status.HTTP_200_OK)
 async def list_settings(
     branch_id: UUID | None = Query(default=None),
-    current_user: User = Depends(require_permission("settings.view")),
+    current_user: User = Depends(get_current_user),
     db=Depends(get_db),
 ):
     return await get_settings(db, current_user.business_id, branch_id)
@@ -61,7 +61,7 @@ async def bulk_upsert_settings_endpoint(
 async def get_setting_endpoint(
     setting_key: str,
     branch_id: UUID | None = Query(default=None),
-    current_user: User = Depends(require_permission("settings.view")),
+    current_user: User = Depends(get_current_user),
     db=Depends(get_db),
 ):
     setting = await get_setting(

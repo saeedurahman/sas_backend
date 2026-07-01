@@ -49,3 +49,29 @@ def test_require_feature_flag_defaults_to_false_when_missing() -> None:
         assert exc_info.value.detail == "Feature not enabled: enable_restaurant"
 
     asyncio.run(_run())
+
+
+def test_require_feature_flag_manufacturing_when_disabled() -> None:
+    async def _run() -> None:
+        config = BusinessConfig(config_json={"enable_manufacturing": False})
+        checker = require_feature_flag("enable_manufacturing")
+
+        with pytest.raises(HTTPException) as exc_info:
+            await checker(config=config)
+
+        assert exc_info.value.status_code == 403
+        assert exc_info.value.detail == "Feature not enabled: enable_manufacturing"
+
+    asyncio.run(_run())
+
+
+def test_require_feature_flag_manufacturing_when_enabled() -> None:
+    async def _run() -> None:
+        config = BusinessConfig(config_json={"enable_manufacturing": True})
+        checker = require_feature_flag("enable_manufacturing")
+
+        result = await checker(config=config)
+
+        assert result is config
+
+    asyncio.run(_run())

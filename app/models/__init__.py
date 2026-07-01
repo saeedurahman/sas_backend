@@ -58,6 +58,17 @@ from app.models.product import (
     Unit,
     UnitConversion,
 )
+from app.models.accounting import (
+    ChartOfAccount,
+    JournalEntry,
+    JournalLine,
+)
+from app.models.manufacturing import (
+    BomHeader,
+    BomLine,
+    ProductionLine,
+    ProductionOrder,
+)
 from app.models.restaurant import (
     DiningTable,
     FloorPlan,
@@ -104,6 +115,13 @@ __all__ = [
     "ProductModifierGroup",
     "KotOrder",
     "KotOrderLine",
+    "BomHeader",
+    "BomLine",
+    "ProductionOrder",
+    "ProductionLine",
+    "ChartOfAccount",
+    "JournalEntry",
+    "JournalLine",
     "Supplier",
     "PurchaseOrder",
     "PurchaseLine",

@@ -18,6 +18,7 @@ from app.models.enums import (
 
 if TYPE_CHECKING:
     from app.models.business import Branch, Business
+    from app.models.manufacturing import ProductionOrder
     from app.models.product import Product, ProductVariation
 
 
@@ -120,10 +121,15 @@ class PurchaseLine(Base, SoftDeleteMixin, SyncMixin):
         ForeignKey("businesses.id", ondelete="CASCADE"),
         nullable=False,
     )
-    purchase_order_id: Mapped[uuid.UUID] = mapped_column(
+    purchase_order_id: Mapped[uuid.UUID | None] = mapped_column(
         Uuid(as_uuid=True),
         ForeignKey("purchase_orders.id", ondelete="CASCADE"),
-        nullable=False,
+        nullable=True,
+    )
+    production_order_id: Mapped[uuid.UUID | None] = mapped_column(
+        Uuid(as_uuid=True),
+        ForeignKey("production_orders.id", ondelete="SET NULL"),
+        nullable=True,
     )
     product_id: Mapped[uuid.UUID] = mapped_column(
         Uuid(as_uuid=True),
@@ -163,8 +169,12 @@ class PurchaseLine(Base, SoftDeleteMixin, SyncMixin):
         Uuid(as_uuid=True), nullable=True
     )
 
-    purchase_order: Mapped["PurchaseOrder"] = relationship(
+    purchase_order: Mapped["PurchaseOrder | None"] = relationship(
         back_populates="lines",
+        lazy="selectin",
+    )
+    production_order: Mapped["ProductionOrder | None"] = relationship(
+        back_populates="cost_layers",
         lazy="selectin",
     )
     product: Mapped["Product"] = relationship(lazy="selectin")
