@@ -10,6 +10,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.orm import selectinload
 
 from app.models.product import PriceList, PriceListItem, Product
+from app.services.audit_helper import log_audit
 from app.schemas.product import CreatePriceListRequest, SetPriceRequest
 
 
@@ -146,6 +147,7 @@ async def set_price(
     result = await db.execute(stmt)
     item = result.scalar_one_or_none()
 
+    old_price = item.unit_price if item is not None else None
     if item is not None:
         item.unit_price = data.unit_price
         item.min_qty = data.min_qty
@@ -164,7 +166,25 @@ async def set_price(
             updated_at=now,
         )
         db.add(item)
+        await db.flush()
 
+    await log_audit(
+        db,
+        business_id=business_id,
+        user_id=created_by,
+        branch_id=None,  # price lists are business-wide
+        action="update" if old_price is not None else "create",
+        table_name="price_list_items",
+        record_id=item.id,
+        old_values=None if old_price is None else {"unit_price": str(old_price)},
+        new_values={
+            "price_list_id": str(price_list_id),
+            "product_id": str(data.product_id),
+            "variation_id": str(data.variation_id) if data.variation_id else None,
+            "unit_price": str(data.unit_price),
+            "min_qty": str(data.min_qty),
+        },
+    )
     await db.commit()
     await db.refresh(item)
     return item

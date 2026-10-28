@@ -3,6 +3,7 @@ from uuid import UUID
 
 from fastapi import APIRouter, Depends, Query, status
 
+from app.branch_scope import scoped_branch_query
 from app.database import get_db
 from app.dependencies import require_feature_flag, require_permission
 from app.models.business import BusinessConfig
@@ -144,7 +145,7 @@ async def list_journal_entries_endpoint(
     status_filter: str | None = Query(default=None, alias="status"),
     date_from: date | None = Query(default=None),
     date_to: date | None = Query(default=None),
-    branch_id: UUID | None = Query(default=None),
+    branch_id: UUID | None = Depends(scoped_branch_query),
     skip: int = Query(default=0, ge=0),
     limit: int = Query(default=50, le=200),
     current_user: User = Depends(require_permission("accounting.journal.view")),

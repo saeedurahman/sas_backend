@@ -16,6 +16,7 @@ class AuditLogResponse(BaseSchema):
     business_id: UUID
     user_id: UUID | None = None
     user_name: str | None = None
+    branch_id: UUID | None = None
     action: str
     table_name: str
     record_id: UUID

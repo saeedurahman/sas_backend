@@ -4,6 +4,7 @@ from fastapi import APIRouter, Depends, Query, Request, status
 from pydantic import BaseModel
 
 from app.core.idempotency import run_idempotent
+from app.branch_scope import guard_body_branches, guard_record, scoped_branch_query
 from app.database import get_db
 from app.dependencies import require_permission
 from app.models.enums import PurchaseOrderStatusEnum
@@ -23,7 +24,7 @@ from app.services.purchase_service import (
     update_purchase_order_status,
 )
 
-router = APIRouter(prefix="/purchases", tags=["Purchases"])
+router = APIRouter(prefix="/purchases", tags=["Purchases"], dependencies=[Depends(guard_body_branches)])
 
 
 class UpdatePOStatusRequest(BaseModel):
@@ -36,7 +37,7 @@ class UpdatePOStatusRequest(BaseModel):
     status_code=status.HTTP_200_OK,
 )
 async def list_purchase_orders(
-    branch_id: UUID | None = Query(default=None),
+    branch_id: UUID | None = Depends(scoped_branch_query),
     supplier_id: UUID | None = Query(default=None),
     po_status: str | None = Query(default=None, alias="status"),
     skip: int = Query(default=0, ge=0),
@@ -79,6 +80,7 @@ async def create_purchase_order_endpoint(
     "/orders/{po_id}",
     response_model=PurchaseOrderResponse,
     status_code=status.HTTP_200_OK,
+    dependencies=[Depends(guard_record("purchase_orders", "po_id"))],
 )
 async def get_purchase_order(
     po_id: UUID,
@@ -94,6 +96,7 @@ async def get_purchase_order(
     "/orders/{po_id}/status",
     response_model=PurchaseOrderResponse,
     status_code=status.HTTP_200_OK,
+    dependencies=[Depends(guard_record("purchase_orders", "po_id"))],
 )
 async def update_po_status(
     po_id: UUID,
@@ -138,6 +141,7 @@ async def create_purchase_receipt_endpoint(
     "/receipts/{receipt_id}",
     response_model=PurchaseReceiptResponse,
     status_code=status.HTTP_200_OK,
+    dependencies=[Depends(guard_record("purchase_receipts", "receipt_id"))],
 )
 async def get_purchase_receipt(
     receipt_id: UUID,

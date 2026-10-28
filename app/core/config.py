@@ -15,6 +15,13 @@ _DEFAULT_SECRET_MARKERS = (
 )
 
 
+PLATFORM_RATE_DEFAULTS = {
+    "login_ip": "10/minute",
+    "login_account": "5/minute",
+    "api": "300/minute",
+}
+
+
 class ConfigurationError(ValueError):
     """Raised at startup when production settings are unsafe."""
 
@@ -115,6 +122,55 @@ class Settings(BaseSettings):
         default=False, validation_alias="LOGIN_REQUIRE_BUSINESS_SLUG"
     )
 
+    # --- Subscription (every business gets every feature; only time gates access) ---
+    trial_days: int = Field(default=14, ge=0, validation_alias="TRIAL_DAYS")
+    grace_days: int = Field(default=3, ge=0, validation_alias="GRACE_DAYS")
+
+    # --- Platform admin (separate audience + secret from tenant JWTs) -----------
+    platform_jwt_secret: str = Field(default="", validation_alias="PLATFORM_JWT_SECRET")
+    platform_token_expire_minutes: int = Field(
+        default=60, ge=1, validation_alias="PLATFORM_TOKEN_EXPIRE_MINUTES"
+    )
+    platform_max_login_attempts: int = Field(
+        default=5, ge=1, validation_alias="PLATFORM_MAX_LOGIN_ATTEMPTS"
+    )
+    platform_lockout_minutes: int = Field(
+        default=30, ge=1, validation_alias="PLATFORM_LOCKOUT_MINUTES"
+    )
+    # "login_ip=10/minute,login_account=5/minute,api=300/minute"; omitted keys use defaults.
+    platform_admin_rate_limits: str = Field(
+        default="", validation_alias="PLATFORM_ADMIN_RATE_LIMITS"
+    )
+    rate_limit_license_revocations: str = Field(
+        default="60/minute", validation_alias="RATE_LIMIT_LICENSE_REVOCATIONS"
+    )
+
+    # --- License signing (Ed25519, base64url of the raw 32-byte key) ------------
+    license_signing_private_key: str = Field(
+        default="", validation_alias="LICENSE_SIGNING_PRIVATE_KEY"
+    )
+    license_public_key: str = Field(default="", validation_alias="LICENSE_PUBLIC_KEY")
+
+    @property
+    def platform_rate_limits(self) -> dict[str, str]:
+        from app.core.rate_limit import parse_rate
+
+        limits = dict(PLATFORM_RATE_DEFAULTS)
+        for part in self.platform_admin_rate_limits.split(","):
+            part = part.strip()
+            if not part:
+                continue
+            key, _, value = part.partition("=")
+            key = key.strip()
+            if key not in PLATFORM_RATE_DEFAULTS:
+                raise ConfigurationError(
+                    f"PLATFORM_ADMIN_RATE_LIMITS: unknown key {key!r} "
+                    f"(use {', '.join(PLATFORM_RATE_DEFAULTS)})"
+                )
+            parse_rate(value)  # validates
+            limits[key] = value.strip()
+        return limits
+
     @property
     def is_production(self) -> bool:
         return self.env.strip().lower() in {"production", "prod"}
@@ -151,6 +207,19 @@ class Settings(BaseSettings):
             problems.append("RATE_LIMIT_ENABLED must be true")
         if self.registration_captcha_enabled and not self.captcha_secret:
             problems.append("CAPTCHA_SECRET is required when captcha is enabled")
+        if self.platform_jwt_secret:
+            if len(self.platform_jwt_secret) < MIN_PRODUCTION_SECRET_LENGTH:
+                problems.append(
+                    f"PLATFORM_JWT_SECRET must be at least {MIN_PRODUCTION_SECRET_LENGTH} characters"
+                )
+            elif _looks_default(self.platform_jwt_secret):
+                problems.append("PLATFORM_JWT_SECRET looks like a placeholder/default value")
+            if self.platform_jwt_secret in (self.jwt_secret_key, self.jwt_refresh_secret_key):
+                problems.append("PLATFORM_JWT_SECRET must differ from the tenant JWT secrets")
+        if bool(self.license_signing_private_key) != bool(self.license_public_key):
+            problems.append(
+                "LICENSE_SIGNING_PRIVATE_KEY and LICENSE_PUBLIC_KEY must be set together"
+            )
 
         if problems:
             raise ConfigurationError(

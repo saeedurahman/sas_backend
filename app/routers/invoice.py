@@ -5,6 +5,7 @@ from uuid import UUID
 from fastapi import APIRouter, Depends, HTTPException, Query, status
 from fastapi.responses import StreamingResponse
 
+from app.branch_scope import scoped_branch_query
 from app.database import get_db
 from app.dependencies import apply_business_timezone, require_permission
 from app.models.user import User
@@ -38,7 +39,7 @@ _EXCEL_MEDIA_TYPE = (
 async def export_sales(
     date_from: date = Query(...),
     date_to: date = Query(...),
-    branch_id: UUID | None = Query(default=None),
+    branch_id: UUID | None = Depends(scoped_branch_query),
     format: str = Query(default="csv"),
     current_user: User = Depends(require_permission("reports.export")),
     db=Depends(get_db),
@@ -87,7 +88,7 @@ async def export_sales(
     status_code=status.HTTP_200_OK,
 )
 async def export_inventory(
-    branch_id: UUID | None = Query(default=None),
+    branch_id: UUID | None = Depends(scoped_branch_query),
     format: str = Query(default="csv"),
     current_user: User = Depends(require_permission("reports.export")),
     db=Depends(get_db),

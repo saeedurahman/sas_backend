@@ -18,10 +18,14 @@ from app.core.middleware import (
     SecurityHeadersMiddleware,
 )
 from app.database import engine
+from app.services.subscription import SubscriptionBlocked
 from app.routers.accounting import router as accounting_router
 from app.routers.adjustments import router as adjustments_router
 from app.routers.analytics import router as analytics_router
 from app.routers.audit import router as audit_router
+from app.routers.license_public import router as license_public_router
+from app.routers.platform import router as platform_router
+from app.routers.subscription import router as subscription_router
 from app.routers.auth import router as auth_router
 from app.routers.brands import router as brands_router
 from app.routers.business import router as business_router
@@ -92,6 +96,12 @@ async def _pool_exhausted_handler(request, exc):
         content={"detail": "Server is busy, retry shortly"},
         headers={"Retry-After": "1"},
     )
+
+
+@app.exception_handler(SubscriptionBlocked)
+async def _subscription_blocked_handler(request, exc: SubscriptionBlocked):
+    """402 with the machine-readable code, message and the owner's contact details."""
+    return JSONResponse(status_code=402, content=exc.body())
 
 
 def custom_openapi():
@@ -167,6 +177,10 @@ app.include_router(settings_router, prefix=settings.api_v1_prefix)
 app.include_router(notifications_router, prefix=settings.api_v1_prefix)
 app.include_router(invoice_router, prefix=settings.api_v1_prefix)
 app.include_router(audit_router, prefix=settings.api_v1_prefix)
+app.include_router(subscription_router, prefix=settings.api_v1_prefix)
+# Platform owner API and offline-license endpoints live outside the tenant /api/v1 tree.
+app.include_router(platform_router)
+app.include_router(license_public_router)
 
 
 @app.get("/health")

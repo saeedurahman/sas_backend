@@ -1,13 +1,20 @@
+from uuid import UUID
+
 from fastapi import APIRouter, Depends, Request, status
 
 from app.core.config import settings
 from app.core.rate_limit import enforce_rate_limit, ip_rate_limit
 from app.database import get_db
-from app.dependencies import get_current_user, require_permission
+from app.dependencies import (
+    get_current_user,
+    require_permission,
+    subscription_exempt,
+)
 from app.models.user import User
 from app.schemas.auth import (
     ChangePasswordRequest,
     LoginRequest,
+    MeResponse,
     MessageResponse,
     PinLoginRequest,
     RefreshTokenRequest,
@@ -17,12 +24,14 @@ from app.schemas.auth import (
     UserInfo,
 )
 from app.services.login_service import (
+    build_subscription_summary,
     build_user_info,
     login_password_and_build_response,
     login_pin_and_build_response,
     logout_with_refresh_token,
     refresh_tokens,
     register_business_and_authenticate,
+    subscription_summary_for_business,
 )
 from app.routers._request_meta import client_ip, user_agent
 from app.services.captcha_service import verify_registration_captcha
@@ -111,8 +120,14 @@ async def refresh(
     access_token, new_refresh_token = await refresh_tokens(
         db, data.refresh_token, client_ip(request), user_agent(request)
     )
+    # Re-check the business on every refresh and report its current subscription.
+    from app.services.auth_service import decode_token
+
+    business_id = UUID(str(decode_token(access_token)["business_id"]))
     return RefreshTokenResponse(
-        access_token=access_token, refresh_token=new_refresh_token
+        access_token=access_token,
+        refresh_token=new_refresh_token,
+        subscription=await subscription_summary_for_business(db, business_id),
     )
 
 
@@ -138,7 +153,12 @@ async def change_password(
     return MessageResponse(message="Password changed. Please sign in again.")
 
 
-@router.post("/logout", response_model=MessageResponse, status_code=status.HTTP_200_OK)
+@router.post(
+    "/logout",
+    response_model=MessageResponse,
+    status_code=status.HTTP_200_OK,
+    dependencies=[Depends(subscription_exempt)],
+)
 async def logout(
     data: RefreshTokenRequest,
     request: Request,
@@ -155,6 +175,15 @@ async def logout(
     return MessageResponse(message="Logged out successfully")
 
 
-@router.get("/me", response_model=UserInfo, status_code=status.HTTP_200_OK)
+@router.get(
+    "/me",
+    response_model=MeResponse,
+    status_code=status.HTTP_200_OK,
+    dependencies=[Depends(subscription_exempt)],
+)
 async def me(current_user: User = Depends(get_current_user)):
-    return build_user_info(current_user)
+    info = build_user_info(current_user)
+    return MeResponse(
+        **info.model_dump(),
+        subscription=build_subscription_summary(current_user.business),
+    )

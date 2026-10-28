@@ -9,7 +9,8 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.orm import selectinload
 
 from app.models.enums import ReferenceTypeEnum, StockMovementTypeEnum
-from app.models.inventory import StockAdjustment, StockAdjustmentLine
+from app.models.inventory import StockAdjustment, StockAdjustmentLine, StockMovement
+from app.services.audit_helper import log_audit
 from app.schemas.inventory import CreateStockAdjustmentRequest
 from app.models.enums import AdjustmentReasonEnum
 from app.services.fifo_service import (
@@ -116,6 +117,25 @@ async def create_stock_adjustment(
             data.branch_id,
             [(l.product_id, l.variation_id) for l in data.lines],
         )
+
+        # On-hand before the change (after the position locks, so it cannot move under us).
+        on_hand_before: dict[tuple[UUID, UUID | None], Decimal] = {}
+        for line in data.lines:
+            key = (line.product_id, line.variation_id)
+            if key not in on_hand_before:
+                on_hand_before[key] = (
+                    await db.execute(
+                        select(func.coalesce(func.sum(StockMovement.qty), 0)).where(
+                            StockMovement.business_id == business_id,
+                            StockMovement.branch_id == data.branch_id,
+                            StockMovement.product_id == line.product_id,
+                            StockMovement.variation_id.is_(None)
+                            if line.variation_id is None
+                            else StockMovement.variation_id == line.variation_id,
+                            StockMovement.deleted_at.is_(None),
+                        )
+                    )
+                ).scalar_one()
 
         if not allow_negative:
             out_demand: dict[tuple[UUID, UUID | None], Decimal] = {}
@@ -228,6 +248,38 @@ async def create_stock_adjustment(
                     notes=line_data.notes,
                 )
                 adj_line.cost_per_unit = weighted
+
+        audit_lines = []
+        running = dict(on_hand_before)
+        for line_data in data.lines:
+            key = (line_data.product_id, line_data.variation_id)
+            before_qty = running[key]
+            running[key] = before_qty + line_data.qty_delta
+            audit_lines.append(
+                {
+                    "product_id": str(line_data.product_id),
+                    "variation_id": str(line_data.variation_id) if line_data.variation_id else None,
+                    "qty_before": str(before_qty),
+                    "qty_delta": str(line_data.qty_delta),
+                    "qty_after": str(running[key]),
+                }
+            )
+        await log_audit(
+            db,
+            business_id=business_id,
+            user_id=created_by,
+            branch_id=data.branch_id,
+            action="create",
+            table_name="stock_adjustments",
+            record_id=adjustment.id,
+            old_values={"qty_before": {l["product_id"]: l["qty_before"] for l in audit_lines}},
+            new_values={
+                "event": "stock_adjustment",
+                "adjustment_number": adjustment_number,
+                "reason": data.reason.value,
+                "lines": audit_lines,
+            },
+        )
 
         await db.commit()
     except HTTPException:

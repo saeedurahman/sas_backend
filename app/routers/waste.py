@@ -3,6 +3,7 @@ from uuid import UUID
 from fastapi import APIRouter, Depends, Query, Request, status
 
 from app.core.idempotency import run_idempotent
+from app.branch_scope import guard_body_branches, guard_record, scoped_branch_query
 from app.database import get_db
 from app.dependencies import require_permission
 from app.models.user import User
@@ -13,7 +14,7 @@ from app.services.waste_service import (
     get_waste_entry_by_id,
 )
 
-router = APIRouter(prefix="/waste", tags=["Waste"])
+router = APIRouter(prefix="/waste", tags=["Waste"], dependencies=[Depends(guard_body_branches)])
 
 
 @router.get(
@@ -22,7 +23,7 @@ router = APIRouter(prefix="/waste", tags=["Waste"])
     status_code=status.HTTP_200_OK,
 )
 async def list_waste_entries(
-    branch_id: UUID | None = Query(default=None),
+    branch_id: UUID | None = Depends(scoped_branch_query),
     skip: int = Query(default=0, ge=0),
     limit: int = Query(default=50, le=200),
     current_user: User = Depends(require_permission("inventory.waste.view")),
@@ -62,6 +63,7 @@ async def create_waste(
     "/{waste_id}",
     response_model=WasteEntryResponse,
     status_code=status.HTTP_200_OK,
+    dependencies=[Depends(guard_record("waste_entries", "waste_id"))],
 )
 async def get_waste(
     waste_id: UUID,

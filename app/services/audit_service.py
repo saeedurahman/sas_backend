@@ -17,6 +17,7 @@ def _audit_log_to_dict(log: AuditLog) -> dict:
         "business_id": log.business_id,
         "user_id": log.user_id,
         "user_name": user_name,
+        "branch_id": log.branch_id,
         "action": log.action,
         "table_name": log.table_name,
         "record_id": log.record_id,

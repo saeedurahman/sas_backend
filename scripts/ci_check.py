@@ -91,6 +91,16 @@ def check_migrations_single_head() -> None:
     check("alembic has a single head", len(heads) == 1, f"heads: {heads}")
 
 
+def check_route_guards() -> None:
+    result = subprocess.run(
+        [sys.executable, str(ROOT / "scripts" / "route_permission_report.py")],
+        cwd=ROOT,
+        capture_output=True,
+        text=True,
+    )
+    check("every non-public route has a permission/ownership guard", result.returncode == 0, result.stdout[-600:])
+
+
 def run_pytest(label: str, *paths: str, extra: tuple[str, ...] = ()) -> None:
     cmd = [sys.executable, "-m", "pytest", *paths, "-q", "-p", "no:cacheprovider", *extra]
     result = subprocess.run(cmd, cwd=ROOT)
@@ -106,12 +116,15 @@ def main() -> int:
     check_env_example()
     check_compiles()
     check_migrations_single_head()
+    check_route_guards()
     run_pytest(
         "unit tests",
         "tests/unit/test_security_config.py",
         "tests/unit/test_rate_limit.py",
         "tests/unit/test_http_hardening.py",
         "tests/unit/test_require_feature_flag.py",
+        "tests/unit/test_license_keys.py",
+        "tests/unit/test_subscription_state.py",
     )
     if args.integration:
         run_pytest("security integration tests", "tests/security")

@@ -1,7 +1,7 @@
 from collections.abc import Callable
 from uuid import UUID
 
-from fastapi import Depends, HTTPException, status
+from fastapi import Depends, HTTPException, Request, status
 from fastapi.security import OAuth2PasswordBearer
 from sqlalchemy import select, text
 from sqlalchemy.ext.asyncio import AsyncSession
@@ -20,7 +20,41 @@ oauth2_scheme = OAuth2PasswordBearer(
 )
 
 
+async def subscription_exempt(request: Request) -> None:
+    """Whitelist: this route works for expired/suspended/grace businesses.
+
+    Applied as a route/router dependency (it runs before ``get_current_user``).
+    """
+    request.state.subscription_exempt = True
+
+
+async def allow_in_grace(request: Request) -> None:
+    """Whitelist: writes are allowed during the read-only grace period (not after it)."""
+    request.state.grace_write_ok = True
+
+
+_READ_METHODS = frozenset({"GET", "HEAD", "OPTIONS"})
+
+
+async def _enforce_subscription(request: Request, business, db: AsyncSession) -> None:
+    from app.services import subscription as sub
+
+    if getattr(request.state, "subscription_exempt", False):
+        return
+    state = sub.compute_state(business)
+    if state.status in (sub.ACTIVE, sub.TRIAL):
+        return
+    if state.status == sub.GRACE:
+        if request.method in _READ_METHODS or getattr(
+            request.state, "grace_write_ok", False
+        ):
+            return
+        raise await sub.build_blocked(db, state, business, grace_write=True)
+    raise await sub.build_blocked(db, state, business, grace_write=False)
+
+
 async def get_current_user(
+    request: Request,
     token: str = Depends(oauth2_scheme),
     db: AsyncSession = Depends(get_db),
 ) -> User:
@@ -107,6 +141,9 @@ async def get_current_user(
             headers={"WWW-Authenticate": "Bearer"},
         )
 
+    # Uses the business row loaded above: no extra query on the happy path.
+    await _enforce_subscription(request, user.business, db)
+
     if cached_keys is not None:
         user._permission_keys = cached_keys
     else:
@@ -149,6 +186,11 @@ async def require_manager(
     return current_user
 
 
+# Markers read by scripts/route_permission_report.py (CI): a route must depend on one.
+require_owner.__route_guard__ = "owner"  # type: ignore[attr-defined]
+require_manager.__route_guard__ = "manager"  # type: ignore[attr-defined]
+
+
 def _user_permission_keys(user: User) -> set[str]:
     cached = getattr(user, "_permission_keys", None)
     if cached is not None:
@@ -175,20 +217,42 @@ def _compute_permission_keys(user: User) -> set[str]:
     return keys
 
 
-def user_can_access_branch(user: User, branch_id: UUID) -> bool:
-    """True for owners, users with an unscoped role, or staff assigned to the branch."""
-    if user.default_branch_id == branch_id:
-        return True
+def allowed_branch_ids(user: User) -> frozenset[UUID] | None:
+    """Branches this user may touch; ``None`` means every branch of the business.
+
+    * Owners see everything.
+    * ``user_roles.branch_id`` is honoured: a role scoped to a branch grants access to
+      that branch only.
+    * A user with an assigned branch (``default_branch_id``) is limited to it (plus any
+      scoped-role branches), even when their roles are not branch-scoped.
+    * A user with no assigned branch and an unscoped role is business-wide.
+    """
+    scoped: set[UUID] = set()
+    unscoped = False
     for user_role in user.user_roles:
         if user_role.deleted_at is not None or user_role.role is None:
             continue
         if user_role.role.deleted_at is not None:
             continue
+        if user_role.business_id != user.business_id:
+            continue
         if user_role.role.name.lower() == "owner":
-            return True
-        if user_role.branch_id is None or user_role.branch_id == branch_id:
-            return True
-    return False
+            return None
+        if user_role.branch_id is None:
+            unscoped = True
+        else:
+            scoped.add(user_role.branch_id)
+    if user.default_branch_id is not None:
+        scoped.add(user.default_branch_id)
+        return frozenset(scoped)
+    if unscoped or not scoped:
+        return None
+    return frozenset(scoped)
+
+
+def user_can_access_branch(user: User, branch_id: UUID) -> bool:
+    allowed = allowed_branch_ids(user)
+    return allowed is None or branch_id in allowed
 
 
 def user_roles_for_response(user: User) -> list[str]:
@@ -211,6 +275,28 @@ def user_permission_keys_for_response(user: User) -> list[str]:
     return sorted(_user_permission_keys(user))
 
 
+def permissions_version(user: User) -> str:
+    """Stable fingerprint of what this user may do (roles, permission keys, branch scope).
+
+    Content-derived, so it is identical across workers/restarts and changes exactly when
+    the effective access changes. Clients compare it with the value they stored and
+    re-fetch /auth/me when it differs.
+    """
+    import hashlib
+    import json
+
+    branches = allowed_branch_ids(user)
+    material = json.dumps(
+        {
+            "roles": sorted(r.lower() for r in user_roles_for_response(user)),
+            "keys": sorted(_user_permission_keys(user)),
+            "branches": None if branches is None else sorted(str(b) for b in branches),
+        },
+        separators=(",", ":"),
+    )
+    return hashlib.sha256(material.encode()).hexdigest()[:16]
+
+
 def require_permission(permission_key: str) -> Callable[..., User]:
     async def _checker(
         current_user: User = Depends(get_current_user),
@@ -222,6 +308,7 @@ def require_permission(permission_key: str) -> Callable[..., User]:
             )
         return current_user
 
+    _checker.__route_guard__ = f"permission:{permission_key}"  # type: ignore[attr-defined]
     return _checker
 
 
@@ -239,6 +326,7 @@ def require_any_permission(*permission_keys: str) -> Callable[..., User]:
             )
         return current_user
 
+    _checker.__route_guard__ = "permission:any"  # type: ignore[attr-defined]
     return _checker
 
 

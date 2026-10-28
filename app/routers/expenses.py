@@ -4,6 +4,7 @@ from uuid import UUID
 from fastapi import APIRouter, Depends, Query, Request, status
 
 from app.core.idempotency import run_idempotent
+from app.branch_scope import guard_body_branches, guard_record, scoped_branch_query
 from app.database import get_db
 from app.dependencies import require_permission
 from app.models.user import User
@@ -34,7 +35,7 @@ from app.services.expense_service import (
     update_expense_category,
 )
 
-router = APIRouter(prefix="/expenses", tags=["Expenses"])
+router = APIRouter(prefix="/expenses", tags=["Expenses"], dependencies=[Depends(guard_body_branches)])
 
 
 @router.get(
@@ -113,7 +114,7 @@ async def delete_category(
 
 @router.get("", response_model=PaginatedExpenseResponse, status_code=status.HTTP_200_OK)
 async def list_expenses(
-    branch_id: UUID | None = Query(default=None),
+    branch_id: UUID | None = Depends(scoped_branch_query),
     category_id: UUID | None = Query(default=None),
     supplier_id: UUID | None = Query(default=None),
     date_from: date | None = Query(default=None),
@@ -166,6 +167,7 @@ async def create_expense_endpoint(
     "/{expense_id}/payments",
     response_model=ExpensePaymentResponse,
     status_code=status.HTTP_201_CREATED,
+    dependencies=[Depends(guard_record("expenses", "expense_id"))],
 )
 async def add_expense_payment_endpoint(
     request: Request,
@@ -195,6 +197,7 @@ async def add_expense_payment_endpoint(
     "/{expense_id}",
     response_model=ExpenseResponse,
     status_code=status.HTTP_200_OK,
+    dependencies=[Depends(guard_record("expenses", "expense_id"))],
 )
 async def get_expense(
     expense_id: UUID,
@@ -208,6 +211,7 @@ async def get_expense(
     "/{expense_id}",
     response_model=ExpenseResponse,
     status_code=status.HTTP_200_OK,
+    dependencies=[Depends(guard_record("expenses", "expense_id"))],
 )
 async def update_expense_endpoint(
     expense_id: UUID,
@@ -224,6 +228,7 @@ async def update_expense_endpoint(
     "/{expense_id}",
     response_model=MessageResponse,
     status_code=status.HTTP_200_OK,
+    dependencies=[Depends(guard_record("expenses", "expense_id"))],
 )
 async def delete_expense_endpoint(
     expense_id: UUID,

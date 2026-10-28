@@ -25,6 +25,7 @@ from app.schemas.register import (
     ShiftSummaryResponse,
     UpdateCashRegisterRequest,
 )
+from app.services.audit_helper import log_audit
 from app.services.stock_service import verify_branch
 
 _ZERO = Decimal("0")
@@ -60,27 +61,19 @@ async def _log_audit(
     table_name: str,
     record_id: UUID,
     new_values: dict,
+    old_values: dict | None = None,
+    branch_id: UUID | None = None,
 ) -> None:
-    await db.execute(
-        text(
-            """
-            INSERT INTO audit_logs (
-                business_id, user_id, action, table_name,
-                record_id, new_values
-            ) VALUES (
-                :business_id, :user_id, CAST(:action AS audit_action_enum),
-                :table_name, :record_id, CAST(:new_values AS jsonb)
-            )
-            """
-        ),
-        {
-            "business_id": business_id,
-            "user_id": user_id,
-            "action": action,
-            "table_name": table_name,
-            "record_id": record_id,
-            "new_values": json.dumps(new_values),
-        },
+    await log_audit(
+        db,
+        business_id=business_id,
+        user_id=user_id,
+        branch_id=branch_id,
+        action=action,
+        table_name=table_name,
+        record_id=record_id,
+        old_values=old_values,
+        new_values=new_values,
     )
 
 
@@ -434,6 +427,7 @@ async def open_shift(
         action="create",
         table_name="register_shifts",
         record_id=shift.id,
+        branch_id=shift.branch_id,
         new_values={
             "event": "shift_opened",
             "register_id": str(data.cash_register_id),
@@ -518,11 +512,19 @@ async def close_shift(
         action="update",
         table_name="register_shifts",
         record_id=shift.id,
+        branch_id=shift.branch_id,
+        old_values={
+            "status": "open",
+            "expected_cash": str(expected_cash),
+            "opened_by": str(shift.opened_by),
+        },
         new_values={
             "event": "shift_closed",
             "expected": str(expected_cash),
             "actual": str(data.actual_cash),
             "difference": str(cash_difference),
+            "closed_by": str(closed_by),
+            "closed_other_users_shift": shift.opened_by != closed_by,
         },
     )
 
@@ -580,7 +582,12 @@ async def add_cash_movement(
         action="create",
         table_name="register_transactions",
         record_id=tx.id,
-        new_values={"event": data.tx_type.value},
+        branch_id=shift.branch_id,
+        new_values={
+            "event": data.tx_type.value,
+            "amount": str(tx.amount),
+            "shift_id": str(shift.id),
+        },
     )
 
     await db.commit()

@@ -56,10 +56,18 @@ class RefreshTokenRequest(BaseSchema):
     refresh_token: str = Field(min_length=1)
 
 
+class SubscriptionSummary(BaseSchema):
+    """Compact subscription state returned with every sign-in."""
+
+    status: str  # trial | active | grace | expired | suspended | cancelled
+    days_left: int | None = None
+
+
 class RefreshTokenResponse(BaseSchema):
     access_token: str
     refresh_token: str
     token_type: str = "bearer"
+    subscription: SubscriptionSummary | None = None
 
 
 class ChangePasswordRequest(BaseSchema):
@@ -83,6 +91,12 @@ class UserInfo(BaseSchema):
     business_slug: str
     roles: list[str] = Field(default_factory=list)
     permission_keys: list[str] = Field(default_factory=list)
+    # Fingerprint of roles + permissions + branch scope; changes when access changes.
+    permissions_version: str = ""
+
+
+class MeResponse(UserInfo):
+    subscription: SubscriptionSummary | None = None
 
 
 class TokenResponse(BaseSchema):
@@ -90,6 +104,7 @@ class TokenResponse(BaseSchema):
     refresh_token: str
     token_type: str = "bearer"
     user: UserInfo
+    subscription: SubscriptionSummary | None = None
 
 
 class MessageResponse(BaseSchema):

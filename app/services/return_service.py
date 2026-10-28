@@ -19,6 +19,7 @@ from app.models.enums import (
 from app.models.register import RegisterTransaction
 from app.models.sales import Sale, SaleLine, SaleReturn, SaleReturnLine, SaleReturnPayment
 from app.schemas.sales import CreateSaleReturnRequest
+from app.services.audit_helper import log_audit
 from app.services.customer_service import create_ledger_entry, lock_customer
 from app.services.fifo_service import (
     create_fifo_layer,
@@ -551,6 +552,31 @@ async def create_sale_return(
                 reference_type=ReferenceTypeEnum.sale_return,
                 reference_id=sale_return.id,
             )
+
+        await log_audit(
+            db,
+            business_id=business_id,
+            user_id=created_by,
+            branch_id=data.branch_id,
+            action="create",
+            table_name="sale_returns",
+            record_id=sale_return.id,
+            old_values={"sale_id": str(sale_id)},
+            new_values={
+                "event": "return",
+                "return_number": return_number,
+                "total_refund": str(total_refund),
+                "cash_out": str(cash_out),
+                "credit_to_account": str(credit_portion),
+                "lines": [
+                    {
+                        "sale_line_id": str(i["request"].sale_line_id),
+                        "qty": str(i["request"].qty),
+                    }
+                    for i in prepared
+                ],
+            },
+        )
 
         await db.commit()
     except HTTPException:

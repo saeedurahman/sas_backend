@@ -80,6 +80,10 @@ class Business(Base, AuditMixin, SoftDeleteMixin, SyncMixin):
     subscription_ends_at: Mapped[datetime | None] = mapped_column(
         DateTime(timezone=True), nullable=True
     )
+    # Price tier the business pays on (plans.id). A plan gates nothing; it is only a price.
+    plan_id: Mapped[uuid.UUID | None] = mapped_column(
+        Uuid(as_uuid=True), ForeignKey("plans.id", ondelete="SET NULL"), nullable=True
+    )
     is_active: Mapped[bool] = mapped_column(Boolean, nullable=False, default=True)
     sync_status: Mapped[str] = mapped_column(
         sync_status_enum, nullable=False, default="synced"

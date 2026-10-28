@@ -1,5 +1,14 @@
 from app.models.audit import AuditLog
 from app.models.idempotency import IdempotencyKey
+from app.models.platform import (
+    License,
+    Plan,
+    PlatformAdmin,
+    PlatformAuditLog,
+    PlatformBusinessNote,
+    PlatformSetting,
+    SubscriptionPayment,
+)
 from app.models.business import (
     Branch,
     Business,

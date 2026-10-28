@@ -9,11 +9,17 @@ from sqlalchemy import event
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker, create_async_engine
 from sqlalchemy.pool import NullPool
 
+from starlette.requests import Request
+
 from app.core import permission_cache
 from app.core.config import settings
 from app.dependencies import _user_permission_keys, get_current_user
 
 pytestmark = pytest.mark.integration
+
+
+def _request() -> Request:
+    return Request({"type": "http", "method": "GET", "headers": [], "query_string": b""})
 
 
 def _run(token: str) -> tuple[list[str], list[str], set[str], set[str]]:
@@ -28,12 +34,12 @@ def _run(token: str) -> tuple[list[str], list[str], set[str], set[str]]:
         maker = async_sessionmaker(engine, class_=AsyncSession, expire_on_commit=False)
         try:
             async with maker() as db:
-                user = await get_current_user(token, db)
+                user = await get_current_user(_request(), token, db)
                 cold_keys = _user_permission_keys(user)
             cold = list(statements)
             statements.clear()
             async with maker() as db:
-                user = await get_current_user(token, db)
+                user = await get_current_user(_request(), token, db)
                 warm_keys = _user_permission_keys(user)
             return cold, list(statements), cold_keys, warm_keys
         finally:

@@ -2,6 +2,7 @@ from uuid import UUID
 
 from fastapi import APIRouter, Depends, Query, status
 
+from app.branch_scope import guard_body_branches, guard_record, scoped_branch_query
 from app.database import get_db
 from app.dependencies import require_permission
 from app.models.user import User
@@ -19,12 +20,12 @@ from app.services.register_service import (
     update_cash_register,
 )
 
-router = APIRouter(prefix="/registers", tags=["Cash Registers"])
+router = APIRouter(prefix="/registers", tags=["Cash Registers"], dependencies=[Depends(guard_body_branches)])
 
 
 @router.get("", response_model=list[CashRegisterResponse], status_code=status.HTTP_200_OK)
 async def list_registers(
-    branch_id: UUID | None = Query(default=None),
+    branch_id: UUID | None = Depends(scoped_branch_query),
     current_user: User = Depends(require_permission("registers.view")),
     db=Depends(get_db),
 ):
@@ -46,6 +47,7 @@ async def create_register(
     "/{register_id}",
     response_model=CashRegisterResponse,
     status_code=status.HTTP_200_OK,
+    dependencies=[Depends(guard_record("cash_registers", "register_id"))],
 )
 async def get_register(
     register_id: UUID,
@@ -61,6 +63,7 @@ async def get_register(
     "/{register_id}",
     response_model=CashRegisterResponse,
     status_code=status.HTTP_200_OK,
+    dependencies=[Depends(guard_record("cash_registers", "register_id"))],
 )
 async def update_register(
     register_id: UUID,
@@ -77,6 +80,7 @@ async def update_register(
     "/{register_id}/active-shift",
     response_model=RegisterShiftResponse | None,
     status_code=status.HTTP_200_OK,
+    dependencies=[Depends(guard_record("cash_registers", "register_id"))],
 )
 async def get_register_active_shift(
     register_id: UUID,

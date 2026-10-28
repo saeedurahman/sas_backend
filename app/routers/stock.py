@@ -2,6 +2,7 @@ from uuid import UUID
 
 from fastapi import APIRouter, Depends, Query, status
 
+from app.branch_scope import required_branch_query, scoped_branch_query
 from app.database import get_db
 from app.dependencies import require_permission
 from app.models.user import User
@@ -25,9 +26,9 @@ router = APIRouter(prefix="/stock", tags=["Stock"])
     status_code=status.HTTP_200_OK,
 )
 async def get_balance(
-    branch_id: UUID,
     product_id: UUID,
     variation_id: UUID | None = Query(default=None),
+    branch_id: UUID = Depends(required_branch_query),
     current_user: User = Depends(require_permission("inventory.view")),
     db=Depends(get_db),
 ):
@@ -46,7 +47,7 @@ async def get_balance(
     status_code=status.HTTP_200_OK,
 )
 async def list_balances(
-    branch_id: UUID,
+    branch_id: UUID = Depends(required_branch_query),
     product_ids: list[UUID] | None = Query(default=None),
     current_user: User = Depends(require_permission("inventory.view")),
     db=Depends(get_db),
@@ -62,7 +63,7 @@ async def list_balances(
     status_code=status.HTTP_200_OK,
 )
 async def list_movements(
-    branch_id: UUID | None = Query(default=None),
+    branch_id: UUID | None = Depends(scoped_branch_query),
     product_id: UUID | None = Query(default=None),
     movement_type: str | None = Query(default=None),
     skip: int = Query(default=0, ge=0),

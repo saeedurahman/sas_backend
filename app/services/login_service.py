@@ -17,9 +17,11 @@ from app.database import AsyncSessionLocal
 from app.models.business import Business, BusinessConfig
 from app.models.user import Role, RolePermission, User, UserRole
 from app.dependencies import (
+    permissions_version,
     user_permission_keys_for_response,
     user_roles_for_response,
 )
+from app.services.subscription import compute_state, summary
 from app.services.audit_helper import log_auth_event
 from app.services.auth_service import (
     TokenError,
@@ -31,7 +33,12 @@ from app.services.auth_service import (
     verify_password,
     verify_pin,
 )
-from app.schemas.auth import RegisterBusinessRequest, TokenResponse, UserInfo
+from app.schemas.auth import (
+    RegisterBusinessRequest,
+    SubscriptionSummary,
+    TokenResponse,
+    UserInfo,
+)
 from app.services.registration_service import (
     business_slug_from_business,
     register_new_business,
@@ -631,7 +638,21 @@ def build_user_info(user: User) -> UserInfo:
         business_slug=business_slug_from_business(business),
         roles=user_roles_for_response(user),
         permission_keys=user_permission_keys_for_response(user),
+        permissions_version=permissions_version(user),
     )
+
+
+def build_subscription_summary(business) -> SubscriptionSummary:
+    return SubscriptionSummary(**summary(compute_state(business)))
+
+
+async def subscription_summary_for_business(
+    db: AsyncSession, business_id: UUID
+) -> SubscriptionSummary | None:
+    business = await db.get(Business, business_id)
+    if business is None:
+        return None
+    return build_subscription_summary(business)
 
 
 async def build_token_response(
@@ -648,6 +669,7 @@ async def build_token_response(
         refresh_token=refresh_token,
         token_type="bearer",
         user=build_user_info(loaded),
+        subscription=build_subscription_summary(loaded.business),
     )
 
 

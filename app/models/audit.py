@@ -32,6 +32,7 @@ class AuditLog(Base, SyncMixin):
         ForeignKey("users.id", ondelete="SET NULL"),
         nullable=True,
     )
+    branch_id: Mapped[uuid.UUID | None] = mapped_column(Uuid(as_uuid=True), nullable=True)
     action: Mapped[str] = mapped_column(audit_action_enum, nullable=False)
     table_name: Mapped[str] = mapped_column(String(100), nullable=False)
     record_id: Mapped[uuid.UUID] = mapped_column(Uuid(as_uuid=True), nullable=False)

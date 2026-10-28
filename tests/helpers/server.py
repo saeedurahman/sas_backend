@@ -38,6 +38,27 @@ RELAXED_ENV = {
 }
 
 
+# One license key pair for the whole test run; tests verify issued keys with the public half.
+from app.licensing.keys import generate_keypair  # noqa: E402
+
+TEST_LICENSE_PRIVATE_KEY, TEST_LICENSE_PUBLIC_KEY = generate_keypair()
+TEST_PLATFORM_JWT_SECRET = "test-platform-jwt-secret-0123456789abcdef-xyz"
+
+RELAXED_ENV.update(
+    {
+        "PLATFORM_JWT_SECRET": TEST_PLATFORM_JWT_SECRET,
+        "PLATFORM_ADMIN_RATE_LIMITS": "login_ip=100000/minute,login_account=100000/minute,api=100000/minute",
+        "PLATFORM_MAX_LOGIN_ATTEMPTS": "3",
+        "PLATFORM_LOCKOUT_MINUTES": "15",
+        "RATE_LIMIT_LICENSE_REVOCATIONS": "100000/minute",
+        "LICENSE_SIGNING_PRIVATE_KEY": TEST_LICENSE_PRIVATE_KEY,
+        "LICENSE_PUBLIC_KEY": TEST_LICENSE_PUBLIC_KEY,
+        "TRIAL_DAYS": "14",
+        "GRACE_DAYS": "3",
+    }
+)
+
+
 def _free_port() -> int:
     with socket.socket() as sock:
         sock.bind(("127.0.0.1", 0))

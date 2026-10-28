@@ -3,6 +3,7 @@ from uuid import UUID
 from fastapi import APIRouter, Depends, Query, Request, status
 
 from app.core.idempotency import run_idempotent
+from app.branch_scope import guard_body_branches, guard_record, scoped_branch_query
 from app.database import get_db
 from app.dependencies import require_permission
 from app.models.user import User
@@ -17,7 +18,7 @@ from app.services.transfer_service import (
     receive_stock_transfer,
 )
 
-router = APIRouter(prefix="/transfers", tags=["Transfers"])
+router = APIRouter(prefix="/transfers", tags=["Transfers"], dependencies=[Depends(guard_body_branches)])
 
 
 @router.get(
@@ -26,7 +27,7 @@ router = APIRouter(prefix="/transfers", tags=["Transfers"])
     status_code=status.HTTP_200_OK,
 )
 async def list_transfers(
-    branch_id: UUID | None = Query(default=None),
+    branch_id: UUID | None = Depends(scoped_branch_query),
     transfer_status: str | None = Query(default=None, alias="status"),
     skip: int = Query(default=0, ge=0),
     limit: int = Query(default=50, le=200),
@@ -69,6 +70,7 @@ async def create_transfer(
     "/{transfer_id}",
     response_model=StockTransferResponse,
     status_code=status.HTTP_200_OK,
+    dependencies=[Depends(guard_record("stock_transfers", "transfer_id"))],
 )
 async def get_transfer(
     transfer_id: UUID,
@@ -84,6 +86,7 @@ async def get_transfer(
     "/{transfer_id}/receive",
     response_model=StockTransferResponse,
     status_code=status.HTTP_200_OK,
+    dependencies=[Depends(guard_record("stock_transfers", "transfer_id"))],
 )
 async def receive_transfer(
     request: Request,

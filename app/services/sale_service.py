@@ -49,6 +49,7 @@ from app.services.discount_engine import (
     merge_line_discount_inputs,
 )
 from app.services.price_service import get_product_price
+from app.services.audit_helper import log_audit
 from app.services.fifo_service import (
     allocate_sale_line_fifo,
     create_sale_line_stock_movements,
@@ -701,28 +702,18 @@ async def _log_sale_audit(
     sale_id: UUID,
     old_values: dict,
     new_values: dict,
+    branch_id: UUID | None = None,
 ) -> None:
-    await db.execute(
-        text(
-            """
-            INSERT INTO audit_logs (
-                business_id, user_id, action, table_name,
-                record_id, old_values, new_values
-            ) VALUES (
-                :business_id, :user_id, CAST(:action AS audit_action_enum),
-                'sales', :record_id,
-                CAST(:old_values AS jsonb), CAST(:new_values AS jsonb)
-            )
-            """
-        ),
-        {
-            "business_id": business_id,
-            "user_id": user_id,
-            "action": "update",
-            "record_id": sale_id,
-            "old_values": json.dumps(old_values),
-            "new_values": json.dumps(new_values),
-        },
+    await log_audit(
+        db,
+        business_id=business_id,
+        user_id=user_id,
+        branch_id=branch_id,
+        action="update",
+        table_name="sales",
+        record_id=sale_id,
+        old_values=old_values,
+        new_values=new_values,
     )
 
 
@@ -959,7 +950,12 @@ async def void_sale(
             business_id=business_id,
             user_id=voided_by,
             sale_id=sale.id,
-            old_values={"status": old_status},
+            branch_id=sale.branch_id,
+            old_values={
+                "status": old_status,
+                "total": str(_sale_invoice_total(sale)),
+                "sale_number": sale.sale_number,
+            },
             new_values={
                 "status": SaleStatusEnum.voided.value,
                 "action": "void",
@@ -1028,10 +1024,24 @@ async def cancel_sale(
                 transacted_at=now,
             )
 
+        old_status = sale.status
         sale.status = SaleStatusEnum.cancelled.value
         sale.deleted_by = cancelled_by
         sale.updated_by = cancelled_by
         sale.updated_at = now
+        await _log_sale_audit(
+            db,
+            business_id=business_id,
+            user_id=cancelled_by,
+            sale_id=sale.id,
+            branch_id=sale.branch_id,
+            old_values={
+                "status": old_status,
+                "sale_number": sale.sale_number,
+                "total": str(_sale_invoice_total(sale)),
+            },
+            new_values={"status": SaleStatusEnum.cancelled.value, "action": "cancel"},
+        )
 
         from app.services.restaurant_tab_service import on_held_tab_cancelled
 

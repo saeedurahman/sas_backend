@@ -3,6 +3,7 @@ from uuid import UUID
 from fastapi import APIRouter, Depends, Query, Request, status
 
 from app.core.idempotency import run_idempotent
+from app.branch_scope import guard_body_branches, guard_record, scoped_branch_query
 from app.database import get_db
 from app.dependencies import require_permission
 from app.models.user import User
@@ -13,7 +14,7 @@ from app.services.return_service import (
     get_sale_returns,
 )
 
-router = APIRouter(prefix="/returns", tags=["Returns"])
+router = APIRouter(prefix="/returns", tags=["Returns"], dependencies=[Depends(guard_body_branches)])
 
 
 @router.get(
@@ -22,7 +23,7 @@ router = APIRouter(prefix="/returns", tags=["Returns"])
     status_code=status.HTTP_200_OK,
 )
 async def list_returns(
-    branch_id: UUID | None = Query(default=None),
+    branch_id: UUID | None = Depends(scoped_branch_query),
     skip: int = Query(default=0, ge=0),
     limit: int = Query(default=50, le=200),
     current_user: User = Depends(require_permission("sales.returns.view")),
@@ -62,6 +63,7 @@ async def create_return(
     "/{return_id}",
     response_model=SaleReturnResponse,
     status_code=status.HTTP_200_OK,
+    dependencies=[Depends(guard_record("sale_returns", "return_id"))],
 )
 async def get_return(
     return_id: UUID,

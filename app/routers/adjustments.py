@@ -3,6 +3,7 @@ from uuid import UUID
 from fastapi import APIRouter, Depends, Query, Request, status
 
 from app.core.idempotency import run_idempotent
+from app.branch_scope import guard_body_branches, guard_record, scoped_branch_query
 from app.database import get_db
 from app.dependencies import require_permission
 from app.models.user import User
@@ -16,7 +17,7 @@ from app.services.adjustment_service import (
     get_stock_adjustments,
 )
 
-router = APIRouter(prefix="/adjustments", tags=["Adjustments"])
+router = APIRouter(prefix="/adjustments", tags=["Adjustments"], dependencies=[Depends(guard_body_branches)])
 
 
 @router.get(
@@ -25,7 +26,7 @@ router = APIRouter(prefix="/adjustments", tags=["Adjustments"])
     status_code=status.HTTP_200_OK,
 )
 async def list_adjustments(
-    branch_id: UUID | None = Query(default=None),
+    branch_id: UUID | None = Depends(scoped_branch_query),
     skip: int = Query(default=0, ge=0),
     limit: int = Query(default=50, le=200),
     current_user: User = Depends(require_permission("inventory.view")),
@@ -65,6 +66,7 @@ async def create_adjustment(
     "/{adj_id}",
     response_model=StockAdjustmentResponse,
     status_code=status.HTTP_200_OK,
+    dependencies=[Depends(guard_record("stock_adjustments", "adj_id"))],
 )
 async def get_adjustment(
     adj_id: UUID,

@@ -19,6 +19,9 @@ _AUTH_ACTION_MAP = {
     "password_reset": "update",
     "pin_changed": "update",
     "pin_reset": "update",
+    "user_deactivated": "update",
+    "user_reactivated": "update",
+    "user_deleted": "delete",
 }
 
 
@@ -32,6 +35,7 @@ async def log_auth_event(
     ip_address: str | None = None,
     user_agent: str | None = None,
     extra: dict[str, Any] | None = None,
+    branch_id: UUID | None = None,
 ) -> None:
     action = _AUTH_ACTION_MAP.get(event, "login")
     new_values = {"event": event, **(extra or {})}
@@ -39,10 +43,10 @@ async def log_auth_event(
         text(
             """
             INSERT INTO audit_logs (
-                business_id, user_id, action, table_name,
+                business_id, user_id, branch_id, action, table_name,
                 record_id, new_values, ip_address, user_agent
             ) VALUES (
-                :business_id, :user_id, CAST(:action AS audit_action_enum),
+                :business_id, :user_id, :branch_id, CAST(:action AS audit_action_enum),
                 'users', :record_id,
                 CAST(:new_values AS jsonb),
                 CAST(:ip_address AS inet), :user_agent
@@ -52,10 +56,53 @@ async def log_auth_event(
         {
             "business_id": business_id,
             "user_id": user_id,
+            "branch_id": branch_id,
             "action": action,
             "record_id": record_id,
             "new_values": json.dumps(new_values),
             "ip_address": ip_address,
             "user_agent": user_agent,
+        },
+    )
+
+
+async def log_audit(
+    db: AsyncSession,
+    *,
+    business_id: UUID,
+    user_id: UUID | None,
+    branch_id: UUID | None,
+    action: str,
+    table_name: str,
+    record_id: UUID,
+    old_values: dict[str, Any] | None = None,
+    new_values: dict[str, Any] | None = None,
+    ip_address: str | None = None,
+) -> None:
+    """Tenant audit row with actor, branch and before/after (``action``: create/update/delete)."""
+    await db.execute(
+        text(
+            """
+            INSERT INTO audit_logs (
+                business_id, user_id, branch_id, action, table_name, record_id,
+                old_values, new_values, ip_address
+            ) VALUES (
+                :business_id, :user_id, :branch_id, CAST(:action AS audit_action_enum),
+                :table_name, :record_id,
+                CAST(:old_values AS jsonb), CAST(:new_values AS jsonb),
+                CAST(:ip_address AS inet)
+            )
+            """
+        ),
+        {
+            "business_id": business_id,
+            "user_id": user_id,
+            "branch_id": branch_id,
+            "action": action,
+            "table_name": table_name,
+            "record_id": record_id,
+            "old_values": None if old_values is None else json.dumps(old_values, default=str),
+            "new_values": None if new_values is None else json.dumps(new_values, default=str),
+            "ip_address": ip_address,
         },
     )

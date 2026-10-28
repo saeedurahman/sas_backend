@@ -3,6 +3,7 @@ from uuid import UUID
 
 from fastapi import APIRouter, Depends, Query, status
 
+from app.branch_scope import scoped_branch_query
 from app.database import get_db
 from app.dependencies import apply_business_timezone, require_permission
 from app.models.user import User
@@ -70,7 +71,7 @@ router = APIRouter(
     status_code=status.HTTP_200_OK,
 )
 async def dashboard(
-    branch_id: UUID | None = Query(default=None),
+    branch_id: UUID | None = Depends(scoped_branch_query),
     current_user: User = Depends(require_permission("reports.view")),
     db=Depends(get_db),
 ):
@@ -87,7 +88,7 @@ async def dashboard(
 async def sales_summary(
     date_from: date = Query(...),
     date_to: date = Query(...),
-    branch_id: UUID | None = Query(default=None),
+    branch_id: UUID | None = Depends(scoped_branch_query),
     current_user: User = Depends(require_permission("reports.sales")),
     db=Depends(get_db),
 ):
@@ -105,7 +106,7 @@ async def sales_trend(
     date_from: date = Query(...),
     date_to: date = Query(...),
     period: str = Query(default="daily"),
-    branch_id: UUID | None = Query(default=None),
+    branch_id: UUID | None = Depends(scoped_branch_query),
     current_user: User = Depends(require_permission("reports.sales")),
     db=Depends(get_db),
 ):
@@ -127,7 +128,7 @@ async def sales_trend(
 async def payment_breakdown(
     date_from: date = Query(...),
     date_to: date = Query(...),
-    branch_id: UUID | None = Query(default=None),
+    branch_id: UUID | None = Depends(scoped_branch_query),
     current_user: User = Depends(require_permission("reports.sales")),
     db=Depends(get_db),
 ):
@@ -144,7 +145,7 @@ async def payment_breakdown(
 async def top_products(
     date_from: date = Query(...),
     date_to: date = Query(...),
-    branch_id: UUID | None = Query(default=None),
+    branch_id: UUID | None = Depends(scoped_branch_query),
     limit: int = Query(default=20, ge=1, le=100),
     current_user: User = Depends(require_permission("reports.sales")),
     db=Depends(get_db),
@@ -167,7 +168,7 @@ async def top_products(
 async def category_performance(
     date_from: date = Query(...),
     date_to: date = Query(...),
-    branch_id: UUID | None = Query(default=None),
+    branch_id: UUID | None = Depends(scoped_branch_query),
     current_user: User = Depends(require_permission("reports.sales")),
     db=Depends(get_db),
 ):
@@ -200,7 +201,7 @@ async def branch_comparison(
 async def cashier_performance(
     date_from: date = Query(...),
     date_to: date = Query(...),
-    branch_id: UUID | None = Query(default=None),
+    branch_id: UUID | None = Depends(scoped_branch_query),
     current_user: User = Depends(require_permission("reports.sales")),
     db=Depends(get_db),
 ):
@@ -217,7 +218,7 @@ async def cashier_performance(
 async def fraud_alerts(
     date_from: date = Query(...),
     date_to: date = Query(...),
-    branch_id: UUID | None = Query(default=None),
+    branch_id: UUID | None = Depends(scoped_branch_query),
     current_user: User = Depends(require_permission("reports.fraud_alerts")),
     db=Depends(get_db),
 ):
@@ -232,7 +233,7 @@ async def fraud_alerts(
     status_code=status.HTTP_200_OK,
 )
 async def stock_valuation(
-    branch_id: UUID | None = Query(default=None),
+    branch_id: UUID | None = Depends(scoped_branch_query),
     current_user: User = Depends(require_permission("reports.inventory")),
     db=Depends(get_db),
 ):
@@ -247,7 +248,7 @@ async def stock_valuation(
     status_code=status.HTTP_200_OK,
 )
 async def inventory_insights(
-    branch_id: UUID | None = Query(default=None),
+    branch_id: UUID | None = Depends(scoped_branch_query),
     current_user: User = Depends(require_permission("reports.inventory")),
     db=Depends(get_db),
 ):
@@ -280,7 +281,7 @@ async def customer_insights(
 async def profit_loss(
     date_from: date = Query(...),
     date_to: date = Query(...),
-    branch_id: UUID | None = Query(default=None),
+    branch_id: UUID | None = Depends(scoped_branch_query),
     current_user: User = Depends(require_permission("reports.financial")),
     db=Depends(get_db),
 ):
@@ -297,7 +298,7 @@ async def profit_loss(
 async def expense_summary(
     date_from: date = Query(...),
     date_to: date = Query(...),
-    branch_id: UUID | None = Query(default=None),
+    branch_id: UUID | None = Depends(scoped_branch_query),
     current_user: User = Depends(require_permission("reports.financial")),
     db=Depends(get_db),
 ):
@@ -312,7 +313,7 @@ async def expense_summary(
     status_code=status.HTTP_200_OK,
 )
 async def enhanced_dashboard(
-    branch_id: UUID | None = Query(default=None),
+    branch_id: UUID | None = Depends(scoped_branch_query),
     current_user: User = Depends(require_permission("reports.view")),
     db=Depends(get_db),
 ):
@@ -327,7 +328,7 @@ async def enhanced_dashboard(
     status_code=status.HTTP_200_OK,
 )
 async def today_vs_yesterday(
-    branch_id: UUID | None = Query(default=None),
+    branch_id: UUID | None = Depends(scoped_branch_query),
     current_user: User = Depends(require_permission("reports.view")),
     db=Depends(get_db),
 ):
@@ -344,7 +345,7 @@ async def today_vs_yesterday(
 async def peak_hours(
     date_from: date = Query(...),
     date_to: date = Query(...),
-    branch_id: UUID | None = Query(default=None),
+    branch_id: UUID | None = Depends(scoped_branch_query),
     current_user: User = Depends(require_permission("reports.sales")),
     db=Depends(get_db),
 ):
@@ -361,7 +362,7 @@ async def peak_hours(
 async def peak_days(
     date_from: date = Query(...),
     date_to: date = Query(...),
-    branch_id: UUID | None = Query(default=None),
+    branch_id: UUID | None = Depends(scoped_branch_query),
     current_user: User = Depends(require_permission("reports.sales")),
     db=Depends(get_db),
 ):
@@ -378,7 +379,7 @@ async def peak_days(
 async def product_movement(
     date_from: date = Query(...),
     date_to: date = Query(...),
-    branch_id: UUID | None = Query(default=None),
+    branch_id: UUID | None = Depends(scoped_branch_query),
     dead_stock_days: int = Query(default=30, ge=1),
     current_user: User = Depends(require_permission("reports.inventory")),
     db=Depends(get_db),
@@ -400,7 +401,7 @@ async def product_movement(
 )
 async def dead_stock(
     dead_stock_days: int = Query(default=30, ge=1),
-    branch_id: UUID | None = Query(default=None),
+    branch_id: UUID | None = Depends(scoped_branch_query),
     current_user: User = Depends(require_permission("reports.inventory")),
     db=Depends(get_db),
 ):
@@ -417,7 +418,7 @@ async def dead_stock(
 async def tax_summary(
     date_from: date = Query(...),
     date_to: date = Query(...),
-    branch_id: UUID | None = Query(default=None),
+    branch_id: UUID | None = Depends(scoped_branch_query),
     current_user: User = Depends(require_permission("reports.financial")),
     db=Depends(get_db),
 ):
@@ -432,7 +433,7 @@ async def tax_summary(
     status_code=status.HTTP_200_OK,
 )
 async def recent_transactions(
-    branch_id: UUID | None = Query(default=None),
+    branch_id: UUID | None = Depends(scoped_branch_query),
     limit: int = Query(default=10, ge=1, le=100),
     current_user: User = Depends(require_permission("reports.sales")),
     db=Depends(get_db),
@@ -448,7 +449,7 @@ async def recent_transactions(
     status_code=status.HTTP_200_OK,
 )
 async def cash_in_drawer(
-    branch_id: UUID | None = Query(default=None),
+    branch_id: UUID | None = Depends(scoped_branch_query),
     current_user: User = Depends(require_permission("reports.analytics")),
     db=Depends(get_db),
 ):

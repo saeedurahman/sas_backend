@@ -2,8 +2,10 @@ from uuid import UUID
 
 from fastapi import APIRouter, Depends, Query, status
 
+from app.branch_scope import guard_body_record, guard_record, scoped_branch_query
 from app.database import get_db
 from app.dependencies import (
+    allow_in_grace,
     _user_permission_keys,
     _user_role_names,
     get_current_user,
@@ -33,7 +35,7 @@ router = APIRouter(prefix="/shifts", tags=["Register Shifts"])
 
 @router.get("", response_model=list[RegisterShiftResponse], status_code=status.HTTP_200_OK)
 async def list_shifts(
-    branch_id: UUID | None = Query(default=None),
+    branch_id: UUID | None = Depends(scoped_branch_query),
     register_id: UUID | None = Query(default=None),
     status: str | None = Query(default=None),
     skip: int = Query(default=0, ge=0),
@@ -53,7 +55,9 @@ async def list_shifts(
     return shifts
 
 
-@router.post("/open", response_model=RegisterShiftResponse, status_code=status.HTTP_201_CREATED)
+@router.post("/open", response_model=RegisterShiftResponse, status_code=status.HTTP_201_CREATED,
+    dependencies=[Depends(guard_body_record("cash_register_id", "cash_registers"))],
+)
 async def open_shift_endpoint(
     data: OpenShiftRequest,
     current_user: User = Depends(require_permission("shifts.open")),
@@ -82,6 +86,7 @@ async def my_active_shift(
     "/{shift_id}",
     response_model=RegisterShiftResponse,
     status_code=status.HTTP_200_OK,
+    dependencies=[Depends(guard_record("register_shifts", "shift_id"))],
 )
 async def get_shift(
     shift_id: UUID,
@@ -95,6 +100,8 @@ async def get_shift(
     "/{shift_id}/close",
     response_model=ShiftSummaryResponse,
     status_code=status.HTTP_200_OK,
+    # Closing a shift stays possible during the read-only grace period.
+    dependencies=[Depends(allow_in_grace), Depends(guard_record("register_shifts", "shift_id"))],
 )
 async def close_shift_endpoint(
     shift_id: UUID,
@@ -119,6 +126,7 @@ async def close_shift_endpoint(
     "/{shift_id}/summary",
     response_model=ShiftSummaryResponse,
     status_code=status.HTTP_200_OK,
+    dependencies=[Depends(guard_record("register_shifts", "shift_id"))],
 )
 async def shift_summary(
     shift_id: UUID,
@@ -134,6 +142,7 @@ async def shift_summary(
     "/{shift_id}/cash-movement",
     response_model=RegisterTransactionResponse,
     status_code=status.HTTP_201_CREATED,
+    dependencies=[Depends(guard_record("register_shifts", "shift_id"))],
 )
 async def cash_movement(
     shift_id: UUID,

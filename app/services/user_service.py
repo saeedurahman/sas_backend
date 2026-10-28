@@ -4,15 +4,16 @@ from datetime import datetime, timezone
 from uuid import UUID
 
 from fastapi import HTTPException, status
-from sqlalchemy import select
+from sqlalchemy import select, update
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.orm import selectinload
 
 from app.core import permission_cache
+from app.models.business import Branch
 from app.models.user import Role, User, UserRole
 from app.schemas.user import CreateUserRequest, UpdateUserRequest
-from app.services.audit_helper import log_auth_event
+from app.services.audit_helper import log_audit, log_auth_event
 from app.services.auth_service import hash_password, hash_pin, verify_password, verify_pin
 from app.services.token_service import revoke_all_user_tokens
 
@@ -24,6 +25,22 @@ def _is_owner(user: User) -> bool:
         if user_role.role.deleted_at is None and user_role.role.name.lower() == "owner":
             return True
     return False
+
+
+async def _assert_branch_in_business(
+    db: AsyncSession, branch_id: UUID, business_id: UUID
+) -> None:
+    found = await db.execute(
+        select(Branch.id).where(
+            Branch.id == branch_id,
+            Branch.business_id == business_id,
+            Branch.deleted_at.is_(None),
+        )
+    )
+    if found.scalar_one_or_none() is None:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST, detail="Branch not found in this business"
+        )
 
 
 async def _count_active_owners(db: AsyncSession, business_id: UUID) -> int:
@@ -153,9 +170,23 @@ async def replace_user_roles(
             )
 
     now = datetime.now(timezone.utc)
+    before_roles = sorted(
+        ur.role.name for ur in user.user_roles if ur.deleted_at is None and ur.role is not None
+    )
     await _replace_user_roles(db, user, roles, updated_by=updated_by)
     user.updated_by = updated_by
     user.updated_at = now
+    await log_audit(
+        db,
+        business_id=business_id,
+        user_id=updated_by,
+        branch_id=user.default_branch_id,
+        action="update",
+        table_name="user_roles",
+        record_id=user.id,
+        old_values={"roles": before_roles},
+        new_values={"event": "roles_changed", "roles": sorted(r.name for r in roles)},
+    )
     await db.commit()
     permission_cache.invalidate_all()
     return await get_user_by_id(db, user_id, business_id)
@@ -216,6 +247,9 @@ async def create_tenant_user(
             status_code=status.HTTP_409_CONFLICT,
             detail="Phone number already registered",
         )
+
+    if data.branch_id is not None:
+        await _assert_branch_in_business(db, data.branch_id, business_id)
 
     now = datetime.now(timezone.utc)
     user = User(
@@ -304,15 +338,51 @@ async def update_tenant_user(
     user = await get_user_by_id(db, user_id, business_id)
     now = datetime.now(timezone.utc)
 
+    before = {
+        "full_name": user.full_name,
+        "status": user.status,
+        "branch_id": str(user.default_branch_id) if user.default_branch_id else None,
+    }
     if data.full_name is not None:
         user.full_name = data.full_name
     if data.branch_id is not None:
+        await _assert_branch_in_business(db, data.branch_id, business_id)
         user.default_branch_id = data.branch_id
+        # Branch-scoped role assignments follow the user to the new branch.
+        await db.execute(
+            update(UserRole)
+            .where(
+                UserRole.user_id == user.id,
+                UserRole.deleted_at.is_(None),
+                UserRole.branch_id.is_not(None),
+            )
+            .values(branch_id=data.branch_id)
+        )
     if data.is_active is not None:
         if not data.is_active and user.status == "active":
             user.token_version = (user.token_version or 0) + 1
             await revoke_all_user_tokens(db, user.id)
         user.status = "active" if data.is_active else "inactive"
+    after = {
+        "full_name": user.full_name,
+        "status": user.status,
+        "branch_id": str(user.default_branch_id) if user.default_branch_id else None,
+    }
+    if before != after:
+        event = "profile_updated"
+        if before["status"] != after["status"]:
+            event = "user_deactivated" if after["status"] != "active" else "user_reactivated"
+        await log_audit(
+            db,
+            business_id=business_id,
+            user_id=updated_by,
+            branch_id=user.default_branch_id,
+            action="update",
+            table_name="users",
+            record_id=user.id,
+            old_values=before,
+            new_values={**after, "event": event},
+        )
 
     user.updated_by = updated_by
     user.updated_at = now
@@ -379,6 +449,7 @@ async def set_user_pin(
         user_id=requesting_user.id,
         event="pin_changed" if is_self else "pin_reset",
         record_id=target.id,
+        branch_id=target.default_branch_id,
     )
     await db.commit()
 
@@ -451,6 +522,8 @@ async def reset_user_password(
         user_id=requesting_user.id,
         event="password_reset",
         record_id=target.id,
+        branch_id=target.default_branch_id,
+        extra={"target_user_id": str(target.id)},
     )
     await db.commit()
 
@@ -482,5 +555,16 @@ async def soft_delete_tenant_user(
     user.token_version = (user.token_version or 0) + 1
     user.updated_at = now
     await revoke_all_user_tokens(db, user_id)
+    await log_audit(
+        db,
+        business_id=business_id,
+        user_id=current_user_id,
+        branch_id=user.default_branch_id,
+        action="delete",
+        table_name="users",
+        record_id=user.id,
+        old_values={"status": "active", "full_name": user.full_name},
+        new_values={"event": "user_deleted"},
+    )
     await db.commit()
     permission_cache.invalidate_all()

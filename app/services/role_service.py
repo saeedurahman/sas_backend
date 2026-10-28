@@ -9,6 +9,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.orm import selectinload
 
 from app.core import permission_cache
+from app.services.audit_helper import log_audit
 from app.models.user import Permission, Role, RolePermission, UserRole
 from app.schemas.role import (
     AssignPermissionsRequest,
@@ -220,7 +221,8 @@ async def _replace_role_permissions(
     permission_keys: list[str],
     *,
     created_by: UUID,
-) -> None:
+) -> tuple[list[str], list[str]]:
+    """Replace the role's permissions; returns (keys_before, keys_after), both sorted."""
     if role.is_system and role.name.lower() == "owner":
         required_keys = await _required_owner_permission_keys(db)
         new_keys = set(permission_keys)
@@ -262,6 +264,7 @@ async def _replace_role_permissions(
         )
 
     await db.flush()
+    return sorted(current_by_key), sorted(new_key_set)
 
 
 async def create_role(
@@ -294,6 +297,16 @@ async def create_role(
             created_by=created_by,
         )
 
+    await log_audit(
+        db,
+        business_id=business_id,
+        user_id=created_by,
+        branch_id=None,  # roles are business-wide
+        action="create",
+        table_name="roles",
+        record_id=role.id,
+        new_values={"name": role.name, "permission_keys": sorted(data.permission_keys or [])},
+    )
     await db.commit()
     permission_cache.invalidate_all()
     return await get_role_response(db, role.id, business_id)
@@ -308,6 +321,7 @@ async def update_role(
 ) -> RoleResponse:
     role = await get_role_by_id(db, role_id, business_id)
     now = _now()
+    before = {"name": role.name, "description": role.description}
 
     if data.name is not None and data.name.strip().lower() != role.name.lower():
         if role.is_system:
@@ -329,6 +343,17 @@ async def update_role(
 
     role.updated_by = updated_by
     role.updated_at = now
+    await log_audit(
+        db,
+        business_id=business_id,
+        user_id=updated_by,
+        branch_id=None,
+        action="update",
+        table_name="roles",
+        record_id=role.id,
+        old_values=before,
+        new_values={"name": role.name, "description": role.description},
+    )
     await db.commit()
     permission_cache.invalidate_all()
     return await get_role_response(db, role_id, business_id)
@@ -374,6 +399,16 @@ async def delete_role(
     role.deleted_by = deleted_by
     role.updated_at = now
     role.updated_by = deleted_by
+    await log_audit(
+        db,
+        business_id=business_id,
+        user_id=deleted_by,
+        branch_id=None,
+        action="delete",
+        table_name="roles",
+        record_id=role.id,
+        old_values={"name": role.name},
+    )
     await db.commit()
     permission_cache.invalidate_all()
 
@@ -386,7 +421,7 @@ async def replace_role_permissions(
     updated_by: UUID,
 ) -> RoleResponse:
     role = await get_role_by_id(db, role_id, business_id)
-    await _replace_role_permissions(
+    before_keys, after_keys = await _replace_role_permissions(
         db,
         role,
         data.permission_keys,
@@ -394,6 +429,22 @@ async def replace_role_permissions(
     )
     role.updated_by = updated_by
     role.updated_at = _now()
+    await log_audit(
+        db,
+        business_id=business_id,
+        user_id=updated_by,
+        branch_id=None,
+        action="update",
+        table_name="role_permissions",
+        record_id=role.id,
+        old_values={"role": role.name, "permission_keys": before_keys},
+        new_values={
+            "role": role.name,
+            "permission_keys": after_keys,
+            "added": sorted(set(after_keys) - set(before_keys)),
+            "removed": sorted(set(before_keys) - set(after_keys)),
+        },
+    )
     await db.commit()
     permission_cache.invalidate_all()
     return await get_role_response(db, role_id, business_id)

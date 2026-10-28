@@ -41,6 +41,12 @@ uvicorn main:app --reload --port 8000
 | `LOG_LEVEL` | `INFO` | JSON logs to stdout; bodies, headers, query strings and secrets are never logged |
 | `REGISTRATION_CAPTCHA_ENABLED` | `false` | Require `captcha_token` on `/auth/register` |
 | `CAPTCHA_VERIFY_URL` / `CAPTCHA_SECRET` | Turnstile URL / empty | Any Turnstile, hCaptcha or reCAPTCHA `siteverify` endpoint |
+| `TRIAL_DAYS` / `GRACE_DAYS` | `14` / `3` | Trial length for new businesses; read-only days after a paid period ends |
+| `PLATFORM_JWT_SECRET` | empty (API disabled) | Signs platform admin tokens; 32+ chars and different from the tenant secrets in production |
+| `PLATFORM_TOKEN_EXPIRE_MINUTES` | `60` | Admin token lifetime |
+| `PLATFORM_MAX_LOGIN_ATTEMPTS` / `PLATFORM_LOCKOUT_MINUTES` | `5` / `30` | Persisted admin lockout |
+| `PLATFORM_ADMIN_RATE_LIMITS` | defaults below | `login_ip=10/minute,login_account=5/minute,api=300/minute` overrides |
+| `LICENSE_SIGNING_PRIVATE_KEY` / `LICENSE_PUBLIC_KEY` | empty | Ed25519 key pair (`scripts/generate_license_keypair.py`); set both or neither |
 
 Rate limits use the format `<count>/<second|minute|hour|day>`. Exceeding one returns `429` with a
 `Retry-After` header. The limiter is **in-process**: with several workers or instances each keeps its own
@@ -84,3 +90,83 @@ pytest tests/security                      # the security suite directly
 The security suite starts its own uvicorn processes (random ports, custom limits) via
 `tests/helpers/server.py`, so it does not need or disturb a server you already have running.
 It creates throw-away tenants in the configured database; use a development database.
+
+## Subscription, platform admin and licenses (Phase 3)
+
+Every business gets every feature with no limits. A **plan** is only a price tier stored as
+data (`plans`); nothing in the app is gated by plan. Only time and status gate access.
+
+### Subscription states
+
+| State | When | API behaviour |
+|---|---|---|
+| `trial` | `status=trial` and `trial_ends_at` in the future (`TRIAL_DAYS`, default 14) | full access |
+| `active` | paid period running (`subscription_ends_at` in the future) | full access |
+| `grace` | up to `GRACE_DAYS` (default 3) after `subscription_ends_at` | GET only; POST/PUT/PATCH/DELETE -> 402 `subscription_grace_readonly` |
+| `expired` | trial over, or grace over | every call -> 402 `subscription_expired` |
+| `suspended` / `cancelled` | set by an admin | every call -> 402 `subscription_suspended` / `subscription_cancelled` |
+
+The check lives in `get_current_user` and reuses the business row it already loaded (no extra
+query). Data is never deleted. Routes that must keep working are whitelisted with the
+`subscription_exempt` dependency: `/auth/me`, `/auth/logout`, `/subscription/*` (login, PIN
+login and refresh do not pass through the gate). Closing a shift stays possible in grace
+(`allow_in_grace`).
+
+402 body (`Content-Type: application/json`):
+
+```json
+{"code":"subscription_expired","message":"Your subscription has expired. Please renew to continue.",
+ "detail":"Your subscription has expired. Please renew to continue.",
+ "expired_at":"2026-10-20T10:00:00+00:00",
+ "contact":{"phone":"0300-1112223","whatsapp":"0300-4445556","email":"help@pakpos.pk"}}
+```
+
+`contact` comes from the editable `platform_settings` table (admin panel -> Settings).
+`GET /api/v1/subscription/status` (any signed-in user) returns plan, state, dates, `days_left`,
+`in_grace`, `contact` and the payment instructions text. Login, PIN login, register and refresh
+responses carry `subscription: {status, days_left}`.
+
+### Platform admin API (`/platform/*`)
+
+For the separate admin web panel. Not under `/api/v1`. Admin JWT only: separate secret
+(`PLATFORM_JWT_SECRET`), `aud=pakpos-platform`, short expiry (`PLATFORM_TOKEN_EXPIRE_MINUTES`,
+default 60; `POST /platform/auth/refresh` swaps a live token for a fresh one). Sign-in is email +
+password + 6-digit TOTP; a code works once; failures lock the account (persisted in the database)
+after `PLATFORM_MAX_LOGIN_ATTEMPTS`; per-IP, per-account and per-admin rate limits come from
+`PLATFORM_ADMIN_RATE_LIMITS`. Every mutation writes `platform_audit_log` with admin, before/after
+and IP. Disabling an admin or resetting 2FA ends their sessions immediately.
+
+Create the first admin (prints the TOTP provisioning URI once):
+
+```bash
+PLATFORM_ADMIN_PASSWORD='a-long-passphrase' python scripts/create_platform_admin.py --email owner@example.pk --name "Owner"
+```
+
+### Licenses (one-time / offline edition)
+
+`/platform/licenses` issues, lists, revokes, transfers and extends licenses. A key is one
+pasteable line, `PPOS-<base64url(canonical JSON payload)>.<base64url(Ed25519 signature)>`; the
+payload is `{v, license_id, edition, customer, machine_id, issued_at, updates_until}`. Sign with
+`LICENSE_SIGNING_PRIVATE_KEY` (server only), verify with `LICENSE_PUBLIC_KEY`
+(`app/licensing/keys.py` is pure and shared with the offline app). `GET /licenses/revocations`
+is a public, signed list of revoked license ids.
+
+```bash
+python scripts/generate_license_keypair.py   # prints both env lines
+```
+
+### Branch isolation
+
+Owners and business-wide staff see every branch. A user with an assigned branch, or with roles
+scoped through `user_roles.branch_id`, only reaches those branches across sales, returns, shifts,
+registers, stock, adjustments, waste, transfers, expenses, purchases and reports; a foreign
+`branch_id` (query, body or record) is 403. `user_roles.branch_id` is honoured. A user scoped to
+several branches must send `branch_id` on list calls (400 otherwise).
+`/auth/me` returns `permissions_version`, a fingerprint of roles + permissions + branch scope that
+changes exactly when the user's access changes.
+
+### CI guard
+
+`python scripts/route_permission_report.py` fails when a non-public route has no permission or
+ownership dependency (allow-lists with reasons are in the script). It runs in
+`python scripts/ci_check.py`.

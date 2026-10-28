@@ -6,13 +6,14 @@ Slug stored in business_configs.config_json (no businesses.slug column in DB).
 import asyncio
 import random
 import re
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from uuid import UUID
 
 from fastapi import HTTPException, status
 from sqlalchemy import func, select, text
 from sqlalchemy.ext.asyncio import AsyncSession
 
+from app.core.config import settings
 from app.models.business import Branch, Business, BusinessConfig, BusinessType
 from app.models.user import Role, User, UserRole
 from app.schemas.auth import RegisterBusinessRequest
@@ -122,6 +123,7 @@ async def register_new_business(
             timezone="Asia/Karachi",
             subscription_plan="trial",
             subscription_status="trial",
+            trial_ends_at=now + timedelta(days=settings.trial_days),
             is_active=True,
             created_at=now,
             updated_at=now,

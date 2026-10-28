@@ -4,6 +4,7 @@ from uuid import UUID
 from fastapi import APIRouter, Depends, Query, Request, status
 
 from app.core.idempotency import run_idempotent
+from app.branch_scope import guard_body_branches, guard_record, scoped_branch_query
 from app.database import get_db
 from app.dependencies import (
     _user_permission_keys,
@@ -41,7 +42,7 @@ from app.services.sale_service import (
     void_sale,
 )
 
-router = APIRouter(prefix="/sales", tags=["Sales"])
+router = APIRouter(prefix="/sales", tags=["Sales"], dependencies=[Depends(guard_body_branches)])
 
 
 @router.get(
@@ -50,7 +51,7 @@ router = APIRouter(prefix="/sales", tags=["Sales"])
     status_code=status.HTTP_200_OK,
 )
 async def list_sales(
-    branch_id: UUID | None = Query(default=None),
+    branch_id: UUID | None = Depends(scoped_branch_query),
     customer_id: UUID | None = Query(default=None),
     sale_status: str | None = Query(default=None, alias="status"),
     sale_type: str | None = Query(default=None),
@@ -150,6 +151,7 @@ async def open_tab_endpoint(
     "/{sale_id}/lines",
     response_model=SaleResponse,
     status_code=status.HTTP_200_OK,
+    dependencies=[Depends(guard_record("sales", "sale_id"))],
 )
 async def add_tab_lines_endpoint(
     sale_id: UUID,
@@ -172,6 +174,7 @@ async def add_tab_lines_endpoint(
     "/{sale_id}/fire",
     response_model=dict,
     status_code=status.HTTP_201_CREATED,
+    dependencies=[Depends(guard_record("sales", "sale_id"))],
 )
 async def fire_tab_endpoint(
     sale_id: UUID,
@@ -204,6 +207,7 @@ async def fire_tab_endpoint(
     "/{sale_id}/request-bill",
     response_model=SaleResponse,
     status_code=status.HTTP_200_OK,
+    dependencies=[Depends(guard_record("sales", "sale_id"))],
 )
 async def request_tab_bill_endpoint(
     sale_id: UUID,
@@ -226,6 +230,7 @@ async def request_tab_bill_endpoint(
     "/{sale_id}/complete",
     response_model=SaleResponse,
     status_code=status.HTTP_200_OK,
+    dependencies=[Depends(guard_record("sales", "sale_id"))],
 )
 async def complete_tab_endpoint(
     request: Request,
@@ -259,6 +264,7 @@ async def complete_tab_endpoint(
     "/{sale_id}",
     response_model=SaleResponse,
     status_code=status.HTTP_200_OK,
+    dependencies=[Depends(guard_record("sales", "sale_id"))],
 )
 async def get_sale(
     sale_id: UUID,
@@ -272,6 +278,7 @@ async def get_sale(
     "/{sale_id}/cancel",
     response_model=SaleResponse,
     status_code=status.HTTP_200_OK,
+    dependencies=[Depends(guard_record("sales", "sale_id"))],
 )
 async def cancel_sale_endpoint(
     sale_id: UUID,
@@ -287,6 +294,7 @@ async def cancel_sale_endpoint(
     "/{sale_id}/void",
     response_model=SaleResponse,
     status_code=status.HTTP_200_OK,
+    dependencies=[Depends(guard_record("sales", "sale_id"))],
 )
 async def void_sale_endpoint(
     sale_id: UUID,
