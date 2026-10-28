@@ -1,9 +1,10 @@
 from decimal import Decimal
 from uuid import UUID
 
-from fastapi import APIRouter, Depends, Query, status
+from fastapi import APIRouter, Depends, Query, Request, status
 from pydantic import BaseModel
 
+from app.core.idempotency import run_idempotent
 from app.database import get_db
 from app.dependencies import require_permission
 from app.models.user import User
@@ -122,15 +123,24 @@ async def get_ledger(
     status_code=status.HTTP_201_CREATED,
 )
 async def record_customer_payment_endpoint(
+    request: Request,
     customer_id: UUID,
     data: CreateCustomerPaymentRequest,
     current_user: User = Depends(require_permission("customers.update")),
     db=Depends(get_db),
 ):
-    return await record_customer_payment(
+    return await run_idempotent(
+        request,
+        business_id=current_user.business_id,
+        user_id=current_user.id,
+        body=data,
+        response_model=CustomerPaymentResponse,
+        success_status=201,
+        handler=lambda: record_customer_payment(
         db,
         current_user.business_id,
         customer_id,
         data,
         current_user.id,
+    ),
     )

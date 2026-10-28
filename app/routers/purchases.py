@@ -1,8 +1,9 @@
 from uuid import UUID
 
-from fastapi import APIRouter, Depends, Query, status
+from fastapi import APIRouter, Depends, Query, Request, status
 from pydantic import BaseModel
 
+from app.core.idempotency import run_idempotent
 from app.database import get_db
 from app.dependencies import require_permission
 from app.models.enums import PurchaseOrderStatusEnum
@@ -113,14 +114,23 @@ async def update_po_status(
     status_code=status.HTTP_201_CREATED,
 )
 async def create_purchase_receipt_endpoint(
+    request: Request,
     data: CreatePurchaseReceiptRequest,
     current_user: User = Depends(
         require_permission("inventory.purchase_orders.receive")
     ),
     db=Depends(get_db),
 ):
-    return await create_purchase_receipt(
+    return await run_idempotent(
+        request,
+        business_id=current_user.business_id,
+        user_id=current_user.id,
+        body=data,
+        response_model=PurchaseReceiptResponse,
+        success_status=201,
+        handler=lambda: create_purchase_receipt(
         db, current_user.business_id, data, current_user.id
+    ),
     )
 
 

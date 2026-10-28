@@ -9,6 +9,7 @@ from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.orm import selectinload
 
+from app.core import permission_cache
 from app.models.user import Role, User, UserRole
 from app.schemas.user import CreateUserRequest, UpdateUserRequest
 from app.services.audit_helper import log_auth_event
@@ -156,6 +157,7 @@ async def replace_user_roles(
     user.updated_by = updated_by
     user.updated_at = now
     await db.commit()
+    permission_cache.invalidate_all()
     return await get_user_by_id(db, user_id, business_id)
 
 
@@ -263,6 +265,7 @@ async def create_tenant_user(
     except IntegrityError:
         await db.rollback()
         raise _phone_conflict() from None
+    permission_cache.invalidate_all()
     return await get_user_by_id(db, user.id, business_id)
 
 
@@ -306,6 +309,9 @@ async def update_tenant_user(
     if data.branch_id is not None:
         user.default_branch_id = data.branch_id
     if data.is_active is not None:
+        if not data.is_active and user.status == "active":
+            user.token_version = (user.token_version or 0) + 1
+            await revoke_all_user_tokens(db, user.id)
         user.status = "active" if data.is_active else "inactive"
 
     user.updated_by = updated_by
@@ -362,6 +368,8 @@ async def set_user_pin(
 
     now = datetime.now(timezone.utc)
     target.pin_hash = hash_pin(pin_code)
+    target.token_version = (target.token_version or 0) + 1
+    target.password_changed_at = now
     target.updated_by = requesting_user.id
     target.updated_at = now
     await revoke_all_user_tokens(db, target.id)
@@ -393,6 +401,8 @@ async def change_own_password(
         )
     now = datetime.now(timezone.utc)
     user.password_hash = hash_password(new_password)
+    user.token_version = (user.token_version or 0) + 1
+    user.password_changed_at = now
     user.updated_by = user.id
     user.updated_at = now
     await revoke_all_user_tokens(db, user.id)
@@ -427,6 +437,8 @@ async def reset_user_password(
         )
     now = datetime.now(timezone.utc)
     target.password_hash = hash_password(new_password)
+    target.token_version = (target.token_version or 0) + 1
+    target.password_changed_at = now
     target.is_locked = False
     target.failed_login_attempts = 0
     target.locked_until = None
@@ -467,6 +479,8 @@ async def soft_delete_tenant_user(
     user.deleted_at = now
     user.deleted_by = current_user_id
     user.status = "inactive"
+    user.token_version = (user.token_version or 0) + 1
     user.updated_at = now
     await revoke_all_user_tokens(db, user_id)
     await db.commit()
+    permission_cache.invalidate_all()

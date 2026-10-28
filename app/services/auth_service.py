@@ -39,12 +39,15 @@ def verify_pin(plain_pin: str, hashed_pin: str) -> bool:
     return pwd_context.verify(plain_pin, hashed_pin)
 
 
-def create_access_token(data: dict[str, Any]) -> str:
+def create_access_token(
+    data: dict[str, Any], *, issued_at: datetime | None = None
+) -> str:
+    """``issued_at`` pins ``exp`` so a rotation can be replayed byte-for-byte."""
     to_encode = data.copy()
-    expire = datetime.now(timezone.utc) + timedelta(
+    expire = (issued_at or datetime.now(timezone.utc)) + timedelta(
         hours=settings.access_token_expire_hours
     )
-    to_encode.update({"exp": expire, "type": "access"})
+    to_encode.update({"exp": int(expire.timestamp()), "type": "access"})
     return jwt.encode(
         to_encode,
         settings.jwt_secret_key,
@@ -65,13 +68,18 @@ def create_pin_access_token(data: dict[str, Any]) -> str:
     )
 
 
-def create_refresh_token(data: dict[str, Any]) -> str:
+def create_refresh_token(
+    data: dict[str, Any],
+    *,
+    issued_at: datetime | None = None,
+    jti: str | None = None,
+) -> str:
     to_encode = data.copy()
-    expire = datetime.now(timezone.utc) + timedelta(
+    expire = (issued_at or datetime.now(timezone.utc)) + timedelta(
         days=settings.refresh_token_expire_days
     )
-    jti = str(uuid.uuid4())
-    to_encode.update({"exp": expire, "type": "refresh", "jti": jti})
+    jti = jti or str(uuid.uuid4())
+    to_encode.update({"exp": int(expire.timestamp()), "type": "refresh", "jti": jti})
     return jwt.encode(
         to_encode,
         settings.jwt_refresh_secret_key,

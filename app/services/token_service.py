@@ -25,6 +25,7 @@ class StoredRefreshToken:
     family_id: UUID | None
     expires_at: datetime
     revoked_at: datetime | None
+    created_at: datetime
 
 
 async def save_refresh_token(
@@ -36,6 +37,7 @@ async def save_refresh_token(
     ip_address: str | None,
     user_agent: str | None,
     family_id: UUID | None = None,
+    created_at: datetime | None = None,
 ) -> RefreshToken:
     if expires_at.tzinfo is None:
         raise ValueError("expires_at must be timezone-aware UTC")
@@ -48,6 +50,7 @@ async def save_refresh_token(
         expires_at=expires_at,
         ip_address=ip_address,
         user_agent=user_agent,
+        **({"created_at": created_at} if created_at is not None else {}),
     )
     db.add(token)
     await db.flush()
@@ -63,12 +66,41 @@ async def get_refresh_token(db: AsyncSession, jti: str) -> StoredRefreshToken | 
             RefreshToken.family_id,
             RefreshToken.expires_at,
             RefreshToken.revoked_at,
+            RefreshToken.created_at,
         ).where(RefreshToken.jti == jti)
     )
     row = result.first()
     if row is None:
         return None
     return StoredRefreshToken(*row)
+
+
+async def get_family_successor(
+    db: AsyncSession, token: StoredRefreshToken
+) -> StoredRefreshToken | None:
+    """The token minted by rotating ``token`` (next in its family), live or not."""
+    if token.family_id is None:
+        return None
+    result = await db.execute(
+        select(
+            RefreshToken.jti,
+            RefreshToken.user_id,
+            RefreshToken.business_id,
+            RefreshToken.family_id,
+            RefreshToken.expires_at,
+            RefreshToken.revoked_at,
+            RefreshToken.created_at,
+        )
+        .where(
+            RefreshToken.user_id == token.user_id,
+            RefreshToken.family_id == token.family_id,
+            RefreshToken.created_at > token.created_at,
+        )
+        .order_by(RefreshToken.created_at.asc())
+        .limit(1)
+    )
+    row = result.first()
+    return StoredRefreshToken(*row) if row is not None else None
 
 
 async def revoke_refresh_token(db: AsyncSession, jti: str) -> bool:

@@ -122,7 +122,7 @@ def _setup_tenant(client: httpx.Client, api_base: str, suffix: int) -> dict:
     if scheme.status_code != 201:
         raise RuntimeError(f"scheme failed: {scheme.status_code}")
 
-    return {
+    ctx = {
         "branch_id": branch_id,
         "product_id": product_id,
         "catalog_price": "25.00",
@@ -135,6 +135,10 @@ def _setup_tenant(client: httpx.Client, api_base: str, suffix: int) -> dict:
             client, api_base, cashier_phone, password, label=f"login {cashier_phone}"
         ),
     }
+    # each seller rings up on their own shift
+    for who in ("owner_headers", "manager_headers", "cashier_headers"):
+        _open_shift(client, api_base, owner_headers, branch_id, ctx[who])
+    return ctx
 
 
 def _post_sale(client: httpx.Client, api_base: str, headers: dict, body: dict) -> httpx.Response:
@@ -295,3 +299,18 @@ def test_sale_pricing_permissions(
         None,
         label="POST /sales owner manual discount allowed",
     )
+
+
+def _open_shift(client, api_base, owner_headers, branch_id, who_headers):
+    reg = client.post(
+        f"{api_base}/registers",
+        headers=owner_headers,
+        json={"name": "R" + who_headers["Authorization"][-6:], "branch_id": branch_id},
+    )
+    assert reg.status_code == 201, reg.text
+    shift = client.post(
+        f"{api_base}/shifts/open",
+        headers=who_headers,
+        json={"cash_register_id": reg.json()["id"], "opening_float": "0"},
+    )
+    assert shift.status_code == 201, shift.text

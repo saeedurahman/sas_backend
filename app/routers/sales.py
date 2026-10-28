@@ -1,8 +1,9 @@
 from datetime import datetime
 from uuid import UUID
 
-from fastapi import APIRouter, Depends, Query, status
+from fastapi import APIRouter, Depends, Query, Request, status
 
+from app.core.idempotency import run_idempotent
 from app.database import get_db
 from app.dependencies import (
     _user_permission_keys,
@@ -84,16 +85,25 @@ async def list_sales(
 
 @router.post("", response_model=SaleResponse, status_code=status.HTTP_201_CREATED)
 async def create_sale_endpoint(
+    request: Request,
     data: CreateSaleRequest,
     current_user: User = Depends(require_permission("sales.create")),
     db=Depends(get_db),
 ):
-    return await create_sale(
+    return await run_idempotent(
+        request,
+        business_id=current_user.business_id,
+        user_id=current_user.id,
+        body=data,
+        response_model=SaleResponse,
+        success_status=201,
+        handler=lambda: create_sale(
         db,
         current_user.business_id,
         data,
         current_user.id,
         _user_permission_keys(current_user),
+    ),
     )
 
 
@@ -218,6 +228,7 @@ async def request_tab_bill_endpoint(
     status_code=status.HTTP_200_OK,
 )
 async def complete_tab_endpoint(
+    request: Request,
     sale_id: UUID,
     data: CompleteTabRequest,
     current_user: User = Depends(require_permission("sales.create")),
@@ -226,13 +237,21 @@ async def complete_tab_endpoint(
     ),
     db=Depends(get_db),
 ):
-    return await complete_tab(
+    return await run_idempotent(
+        request,
+        business_id=current_user.business_id,
+        user_id=current_user.id,
+        body=data,
+        response_model=SaleResponse,
+        success_status=200,
+        handler=lambda: complete_tab(
         db,
         current_user.business_id,
         sale_id,
         data,
         current_user.id,
         _user_permission_keys(current_user),
+    ),
     )
 
 
@@ -271,7 +290,7 @@ async def cancel_sale_endpoint(
 )
 async def void_sale_endpoint(
     sale_id: UUID,
-    current_user: User = Depends(require_permission("sales.cancel")),
+    current_user: User = Depends(require_permission("sales.void")),
     db=Depends(get_db),
 ):
     return await void_sale(

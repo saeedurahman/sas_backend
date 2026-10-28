@@ -1,7 +1,8 @@
 from uuid import UUID
 
-from fastapi import APIRouter, Depends, Query, status
+from fastapi import APIRouter, Depends, Query, Request, status
 
+from app.core.idempotency import run_idempotent
 from app.database import get_db
 from app.dependencies import require_permission
 from app.models.user import User
@@ -39,12 +40,21 @@ async def list_waste_entries(
     status_code=status.HTTP_201_CREATED,
 )
 async def create_waste(
+    request: Request,
     data: CreateWasteEntryRequest,
     current_user: User = Depends(require_permission("inventory.waste.create")),
     db=Depends(get_db),
 ):
-    return await create_waste_entry(
+    return await run_idempotent(
+        request,
+        business_id=current_user.business_id,
+        user_id=current_user.id,
+        body=data,
+        response_model=WasteEntryResponse,
+        success_status=201,
+        handler=lambda: create_waste_entry(
         db, current_user.business_id, data, current_user.id
+    ),
     )
 
 

@@ -72,6 +72,11 @@ def test_self_pin_change_requires_current_secret(client, sec_api, tenant):
     )
     assert ok.status_code == 200
 
+    # The change invalidated the old access token; sign in again.
+    assert client.put(url, headers=headers, json={"pin_code": "x"}).status_code == 401
+    body = _login_body(client, sec_api, tenant.cashier_phone, tenant.password)
+    headers = _bearer(body["access_token"])
+
     # A PIN exists now, so it can authorise the next change.
     bad_pin = client.put(
         url, headers=headers, json={"pin_code": "693827", "current_pin": "000000"}

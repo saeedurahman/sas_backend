@@ -3,10 +3,11 @@ from uuid import UUID
 
 from fastapi import Depends, HTTPException, status
 from fastapi.security import OAuth2PasswordBearer
-from sqlalchemy import select
+from sqlalchemy import select, text
 from sqlalchemy.ext.asyncio import AsyncSession
-from sqlalchemy.orm import selectinload
+from sqlalchemy.orm import noload, selectinload
 
+from app.core import permission_cache
 from app.core.config import settings
 from app.database import get_db
 from app.models.business import BusinessConfig
@@ -35,6 +36,16 @@ async def get_current_user(
 
     from app.models.business import Business
 
+    cached_keys = permission_cache.get(user_id)
+    roles_load = selectinload(User.user_roles).selectinload(UserRole.role)
+    if cached_keys is None:
+        roles_load = roles_load.selectinload(Role.role_permissions).selectinload(
+            RolePermission.permission
+        )
+    else:
+        # Permissions are known; skip the two heaviest queries.
+        roles_load = roles_load.options(noload(Role.role_permissions))
+
     stmt = (
         select(User)
         .where(User.id == user_id)
@@ -44,10 +55,7 @@ async def get_current_user(
                 selectinload(Business.config),
             ),
             selectinload(User.default_branch),
-            selectinload(User.user_roles)
-            .selectinload(UserRole.role)
-            .selectinload(Role.role_permissions)
-            .selectinload(RolePermission.permission),
+            roles_load,
         )
     )
     result = await db.execute(stmt)
@@ -90,6 +98,21 @@ async def get_current_user(
             detail="Business account is inactive",
         )
 
+    # Password/PIN change, reset and deactivation bump token_version; tokens
+    # minted before that (older "tv", or none = 0) are no longer accepted.
+    if int(payload.get("tv", 0)) != int(user.token_version or 0):
+        raise HTTPException(
+            status_code=status.HTTP_401_UNAUTHORIZED,
+            detail="Token is no longer valid",
+            headers={"WWW-Authenticate": "Bearer"},
+        )
+
+    if cached_keys is not None:
+        user._permission_keys = cached_keys
+    else:
+        user._permission_keys = frozenset(_compute_permission_keys(user))
+        permission_cache.put(user.id, user._permission_keys)
+
     return user
 
 
@@ -127,6 +150,13 @@ async def require_manager(
 
 
 def _user_permission_keys(user: User) -> set[str]:
+    cached = getattr(user, "_permission_keys", None)
+    if cached is not None:
+        return set(cached)
+    return _compute_permission_keys(user)
+
+
+def _compute_permission_keys(user: User) -> set[str]:
     keys: set[str] = set()
     business_id = user.business_id
     for user_role in user.user_roles:
@@ -143,6 +173,22 @@ def _user_permission_keys(user: User) -> set[str]:
             if role_perm.permission is not None:
                 keys.add(role_perm.permission.permission_key)
     return keys
+
+
+def user_can_access_branch(user: User, branch_id: UUID) -> bool:
+    """True for owners, users with an unscoped role, or staff assigned to the branch."""
+    if user.default_branch_id == branch_id:
+        return True
+    for user_role in user.user_roles:
+        if user_role.deleted_at is not None or user_role.role is None:
+            continue
+        if user_role.role.deleted_at is not None:
+            continue
+        if user_role.role.name.lower() == "owner":
+            return True
+        if user_role.branch_id is None or user_role.branch_id == branch_id:
+            return True
+    return False
 
 
 def user_roles_for_response(user: User) -> list[str]:
@@ -249,3 +295,21 @@ def require_feature_flag(flag_key: str) -> Callable[..., BusinessConfig]:
         return config
 
     return _checker
+
+
+async def apply_business_timezone(
+    current_user: User = Depends(get_current_user),
+    db: AsyncSession = Depends(get_db),
+) -> None:
+    """Make date casts and CURRENT_DATE in this request follow the business timezone.
+
+    Router-level dependency for reporting endpoints: ``sold_at::date`` and
+    "today" must mean the business's day (default Asia/Karachi), not the
+    server's. ``set_config(..., true)`` lasts for the request's transaction.
+    """
+    from app.services.business_time import get_business_tz
+
+    zone = await get_business_tz(db, current_user.business_id)
+    await db.execute(
+        text("SELECT set_config('TimeZone', :tz, true)"), {"tz": zone.key}
+    )

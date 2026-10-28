@@ -229,7 +229,9 @@ def open_register_shift(
     assert_status(reg_resp, 201, label="create register")
     register_id = reg_resp.json()["id"]
 
-    shift_headers = headers or tenant.manager_headers or tenant.owner_headers
+    # Sales post against the caller's own shift, so the owner (who rings up most
+    # test sales) opens it unless a test passes someone else's headers.
+    shift_headers = headers or tenant.owner_headers
     shift_resp = client.post(
         tenant.url("/shifts/open"),
         headers=shift_headers,
@@ -352,7 +354,7 @@ def build_void_race_tenant(
 
     create_unit(client, tenant)
     create_product(client, tenant, name=f"Race Product {suffix}")
-    open_register_shift(client, tenant)
+    open_register_shift(client, tenant, headers=tenant.manager_headers)
     add_stock_adjustment(
         client,
         tenant,
@@ -419,7 +421,7 @@ def build_cancel_race_tenant(
 
     create_unit(client, tenant)
     create_product(client, tenant, name=f"Cancel Race Product {suffix}")
-    open_register_shift(client, tenant)
+    open_register_shift(client, tenant, headers=tenant.manager_headers)
     add_stock_adjustment(
         client,
         tenant,
@@ -462,4 +464,5 @@ def build_fifo_tenant(
     create_unit(client, tenant)
     create_product(client, tenant, name=f"FIFO Product {suffix}")
     create_supplier(client, tenant)
+    open_register_shift(client, tenant)
     return tenant

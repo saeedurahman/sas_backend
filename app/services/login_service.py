@@ -1,5 +1,6 @@
 """Authentication flows: password login, PIN login, token refresh/rotation."""
 
+import asyncio
 import logging
 import uuid
 from datetime import datetime, timedelta, timezone
@@ -36,6 +37,8 @@ from app.services.registration_service import (
     register_new_business,
 )
 from app.services.token_service import (
+    StoredRefreshToken,
+    get_family_successor,
     get_refresh_token,
     purge_stale_tokens,
     revoke_all_user_tokens,
@@ -49,11 +52,12 @@ logger = logging.getLogger("app.auth")
 _REVOKED_DETAIL = "Token revoked or expired"
 
 
-def _build_token_payload(user: User) -> dict[str, str | None]:
+def _build_token_payload(user: User) -> dict[str, str | int | None]:
     return {
         "sub": str(user.id),
         "business_id": str(user.business_id),
         "branch_id": str(user.default_branch_id) if user.default_branch_id else None,
+        "tv": user.token_version,
     }
 
 
@@ -63,13 +67,17 @@ async def _issue_refresh_token(
     ip_address: str | None,
     user_agent: str | None,
     family_id: UUID | None = None,
+    issued_at: datetime | None = None,
 ) -> str:
     """Create + persist a refresh token; a new login starts a new family."""
     family_id = family_id or uuid.uuid4()
+    issued_at = issued_at or datetime.now(timezone.utc)
     refresh_token = create_refresh_token(
-        {**_build_token_payload(user), "fid": str(family_id)}
+        {**_build_token_payload(user), "fid": str(family_id)}, issued_at=issued_at
     )
-    await _save_refresh_from_token(db, user, refresh_token, ip_address, user_agent)
+    await _save_refresh_from_token(
+        db, user, refresh_token, ip_address, user_agent, created_at=issued_at
+    )
     return refresh_token
 
 
@@ -79,6 +87,7 @@ async def _save_refresh_from_token(
     refresh_token: str,
     ip_address: str | None,
     user_agent: str | None,
+    created_at: datetime | None = None,
 ) -> None:
     """Persist an already-minted refresh token."""
     payload = decode_refresh_token(refresh_token)
@@ -99,6 +108,7 @@ async def _save_refresh_from_token(
         ip_address=ip_address,
         user_agent=user_agent,
         family_id=UUID(str(fid)) if fid else None,
+        created_at=created_at,
     )
 
 
@@ -268,7 +278,7 @@ async def login_with_password(
             detail="Business account suspended",
         )
 
-    if not verify_password(password, user.password_hash):
+    if not await asyncio.to_thread(verify_password, password, user.password_hash):
         await _record_failed_login(
             user, ip_address=ip_address, user_agent=user_agent, pin=False
         )
@@ -357,7 +367,7 @@ async def login_with_pin(
 
     _ensure_not_locked(user)
 
-    if not verify_pin(pin_code, user.pin_hash):
+    if not await asyncio.to_thread(verify_pin, pin_code, user.pin_hash):
         await _record_failed_login(
             user, ip_address=ip_address, user_agent=user_agent, pin=True
         )
@@ -414,6 +424,58 @@ async def _reject_refresh(
     )
 
 
+async def _replay_recent_rotation(
+    db: AsyncSession, old: StoredRefreshToken
+) -> tuple[str, str] | None:
+    """Return the pair minted when ``old`` was rotated, if that was moments ago.
+
+    Both tokens are rebuilt from the successor row (same claims, same
+    ``issued_at``), so the replay is byte-identical to the original response.
+    Returns ``None`` when the rotation is outside the grace window, when the
+    successor has itself been used/revoked, or for legacy tokens without a family.
+    """
+    grace = settings.refresh_grace_seconds
+    if grace <= 0 or old.revoked_at is None:
+        return None
+    revoked_at = old.revoked_at
+    if revoked_at.tzinfo is None:
+        revoked_at = revoked_at.replace(tzinfo=timezone.utc)
+    if datetime.now(timezone.utc) - revoked_at > timedelta(seconds=grace):
+        return None
+
+    successor = await get_family_successor(db, old)
+    if (
+        successor is None
+        or successor.revoked_at is not None
+        or successor.expires_at <= datetime.now(timezone.utc)
+        # the successor must be the rotation of ``old`` (minted when old was revoked)
+        or abs((successor.created_at - revoked_at).total_seconds()) > grace
+    ):
+        return None
+
+    result = await db.execute(
+        select(User).where(
+            User.id == old.user_id,
+            User.business_id == old.business_id,
+            User.deleted_at.is_(None),
+            User.status == "active",
+        )
+    )
+    user = result.scalar_one_or_none()
+    if user is None or user.is_locked:
+        return None
+
+    issued_at = successor.created_at
+    refresh = create_refresh_token(
+        {**_build_token_payload(user), "fid": str(old.family_id)},
+        issued_at=issued_at,
+        jti=successor.jti,
+    )
+    access = create_access_token(_build_token_payload(user), issued_at=issued_at)
+    logger.info("refresh rotation replayed", extra={"user_id": str(user.id)})
+    return access, refresh
+
+
 async def refresh_tokens(
     db: AsyncSession,
     refresh_token: str,
@@ -461,6 +523,9 @@ async def refresh_tokens(
     }
 
     if stored.revoked_at is not None:
+        replay = await _replay_recent_rotation(db, stored)
+        if replay is not None:
+            return replay
         logger.warning("refresh token reuse detected", extra={"user_id": str(user_id)})
         raise await _reject_refresh(
             db, **ctx, revoke=True, event="refresh_reuse_detected"
@@ -470,6 +535,13 @@ async def refresh_tokens(
 
     # Atomic consume: of two concurrent presentations only one wins.
     if not await revoke_refresh_token(db, jti):
+        # The loser of a double submit: the winner has committed by now, so its
+        # new pair can be handed back rather than treating this as theft.
+        fresh = await get_refresh_token(db, jti)
+        if fresh is not None:
+            replay = await _replay_recent_rotation(db, fresh)
+            if replay is not None:
+                return replay
         raise await _reject_refresh(
             db, **ctx, revoke=True, event="refresh_reuse_detected"
         )
@@ -495,10 +567,16 @@ async def refresh_tokens(
     ):
         raise await _reject_refresh(db, **ctx, revoke=True)
 
+    issued_at = datetime.now(timezone.utc)
     new_refresh = await _issue_refresh_token(
-        db, user, ip_address, user_agent, family_id=stored.family_id
+        db,
+        user,
+        ip_address,
+        user_agent,
+        family_id=stored.family_id,
+        issued_at=issued_at,
     )
-    new_access = create_access_token(_build_token_payload(user))
+    new_access = create_access_token(_build_token_payload(user), issued_at=issued_at)
     await log_auth_event(
         db,
         business_id=user.business_id,
@@ -590,8 +668,7 @@ async def register_business_and_authenticate(
     loaded = await load_user_for_response(db, user.id)
     payload = _build_token_payload(loaded)
     access_token = create_access_token(payload)
-    refresh_token = create_refresh_token(payload)
-    await _save_refresh_from_token(db, loaded, refresh_token, ip_address, user_agent)
+    refresh_token = await _issue_refresh_token(db, loaded, ip_address, user_agent)
     await log_auth_event(
         db,
         business_id=loaded.business_id,

@@ -59,6 +59,8 @@ def determine_sale_status(
     total_amount: Decimal,
     total_paid: Decimal,
 ) -> SaleStatusEnum:
+    if total_amount == 0:
+        return SaleStatusEnum.completed
     if total_paid == 0:
         return SaleStatusEnum.draft
     if total_paid < total_amount:

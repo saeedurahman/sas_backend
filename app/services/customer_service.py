@@ -68,6 +68,62 @@ async def get_customer_by_id(
     return customer
 
 
+async def lock_customer(
+    db: AsyncSession,
+    customer_id: UUID,
+    business_id: UUID,
+) -> Customer:
+    """Like get_customer_by_id but takes a row lock (held to commit/rollback)."""
+    result = await db.execute(
+        select(Customer)
+        .where(
+            Customer.id == customer_id,
+            Customer.business_id == business_id,
+            Customer.deleted_at.is_(None),
+        )
+        .with_for_update()
+        .execution_options(populate_existing=True)
+    )
+    customer = result.scalar_one_or_none()
+    if customer is None:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail="Customer not found",
+        )
+    return customer
+
+
+async def assert_credit_available(
+    db: AsyncSession,
+    business_id: UUID,
+    customer_id: UUID,
+    credit_amount: Decimal,
+) -> None:
+    """Lock the customer, then enforce the credit limit for ``credit_amount``.
+
+    A limit of 0 means no limit is configured. The lock makes check + ledger
+    write atomic per customer.
+    """
+    customer = await lock_customer(db, customer_id, business_id)
+    if credit_amount <= Decimal("0") or customer.credit_limit <= Decimal("0"):
+        return
+    current_balance = await get_customer_balance(db, customer_id, business_id)
+    projected_balance = current_balance - credit_amount
+    if projected_balance < Decimal("0") and abs(projected_balance) > customer.credit_limit:
+        if current_balance < Decimal("0"):
+            available = customer.credit_limit - abs(current_balance)
+        else:
+            available = customer.credit_limit
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail=(
+                "Credit limit exceeded. Customer's available "
+                f"credit is Rs. {available}, but this sale "
+                f"requires Rs. {credit_amount} on credit."
+            ),
+        )
+
+
 async def create_customer(
     db: AsyncSession,
     business_id: UUID,

@@ -43,7 +43,9 @@ from app.services.fifo_service import (
 )
 from app.services.invoice_service import _round2
 from app.services.pricing_engine import calculate_line_total, determine_sale_status
-from app.services.register_service import verify_open_register_shift
+from app.services.customer_service import assert_credit_available
+from app.services.register_service import require_caller_shift, verify_open_register_shift
+from app.services.settlement import settle_payments
 from app.services.restaurant_modifier_service import validate_line_modifiers
 from app.services.restaurant_table_service import (
     get_dining_table_by_id,
@@ -52,6 +54,7 @@ from app.services.restaurant_table_service import (
 from app.services.stock_service import (
     _now,
     check_sufficient_stock,
+    lock_stock_positions,
     generate_document_number,
     get_allow_negative_stock,
     verify_branch,
@@ -223,8 +226,9 @@ async def _prepare_tab_line_pricing(
     *,
     price_list_id: UUID | None,
     permission_keys: set[str],
-) -> tuple[Decimal, Decimal, Decimal, str | None, list[dict[str, Any]]]:
+) -> tuple[Decimal, Decimal, Decimal, str | None, list[dict[str, Any]], Decimal]:
     from app.services.sale_service import _enforce_sale_pricing_permissions
+    from app.services.tax_service import resolve_line_tax_rates
 
     modifier_snapshots = await validate_line_modifiers(
         db,
@@ -267,12 +271,15 @@ async def _prepare_tab_line_pricing(
     )
 
     discount_pct, discount_amount = merge_line_discount_inputs(line_data, None)
+    (effective_tax_rate,) = await resolve_line_tax_rates(
+        db, business_id, [line_data], permission_keys
+    )
     amounts = calculate_line_total(
         qty=line_data.qty,
         unit_price=effective_unit_price,
         discount_pct=discount_pct,
         discount_amount=discount_amount,
-        tax_rate=line_data.tax_rate,
+        tax_rate=effective_tax_rate,
     )
     encoded_notes = _encode_sale_line_notes(line_data.notes, modifier_snapshots)
     return (
@@ -281,6 +288,7 @@ async def _prepare_tab_line_pricing(
         amounts["tax_amount"],
         encoded_notes,
         modifier_snapshots,
+        effective_tax_rate,
     )
 
 
@@ -392,6 +400,7 @@ async def add_lines_to_tab(
                 tax_amount,
                 encoded_notes,
                 _modifiers,
+                effective_tax_rate,
             ) = await _prepare_tab_line_pricing(
                 db,
                 business_id,
@@ -410,7 +419,7 @@ async def add_lines_to_tab(
                 unit_price=effective_unit_price,
                 discount_pct=line_data.discount_pct,
                 discount_amount=effective_discount,
-                tax_rate=line_data.tax_rate,
+                tax_rate=effective_tax_rate,
                 tax_amount=tax_amount,
                 cost_per_unit=Decimal("0"),
                 notes=encoded_notes,
@@ -624,61 +633,59 @@ async def complete_tab(
                 detail="Tab has no lines to complete",
             )
 
-        register_shift_id = data.register_shift_id or sale.register_shift_id
-        if register_shift_id is not None:
-            await verify_open_register_shift(
-                db,
-                register_shift_id,
-                business_id,
-                closed_detail="Cannot complete tab — shift is not open",
-            )
-            sale.register_shift_id = register_shift_id
-
-        if not allow_negative:
-            for line in active_lines:
-                sufficient = await check_sufficient_stock(
-                    db,
-                    business_id,
-                    sale.branch_id,
-                    line.product_id,
-                    line.variation_id,
-                    line.qty,
-                )
-                if not sufficient:
-                    product = await verify_product(
-                        db, line.product_id, business_id
-                    )
-                    raise HTTPException(
-                        status_code=status.HTTP_400_BAD_REQUEST,
-                        detail=f"Insufficient stock for {product.name}",
-                    )
+        # Same lock order as create_sale: shift -> customer -> stock -> layers.
+        shift = await require_caller_shift(
+            db,
+            business_id,
+            completed_by,
+            branch_id=sale.branch_id,
+            requested_shift_id=data.register_shift_id,
+            action="complete this tab",
+        )
+        sale.register_shift_id = shift.id
 
         total_amount = _tab_invoice_total(sale)
-        total_paid = sum((p.amount for p in data.payments), Decimal("0"))
-        if total_paid < total_amount:
+        settlement = settle_payments(total_amount, data.payments)
+        if settlement.total_applied < total_amount:
             raise HTTPException(
                 status_code=status.HTTP_400_BAD_REQUEST,
                 detail="Payments do not cover tab total",
             )
 
-        credit_payments = [
-            p for p in data.payments if p.payment_method == PaymentMethodEnum.credit
-        ]
-        if credit_payments and sale.customer_id is None:
-            raise HTTPException(
-                status_code=status.HTTP_400_BAD_REQUEST,
-                detail="customer_id is required for credit payments",
+        if settlement.credit_amount > Decimal("0"):
+            if sale.customer_id is None:
+                raise HTTPException(
+                    status_code=status.HTTP_400_BAD_REQUEST,
+                    detail="customer_id is required for credit payments",
+                )
+            await assert_credit_available(
+                db, business_id, sale.customer_id, settlement.credit_amount
+            )
+
+        await lock_stock_positions(
+            db,
+            business_id,
+            sale.branch_id,
+            [(line.product_id, line.variation_id) for line in active_lines],
+        )
+        if not allow_negative:
+            from app.services.sale_service import _assert_stock_available
+
+            await _assert_stock_available(
+                db, business_id, sale.branch_id, active_lines
             )
 
         for line in active_lines:
             cost_per_unit, consumptions, short_qty = await allocate_sale_line_fifo(
                 db,
                 business_id,
+                sale.branch_id,
                 line.product_id,
                 line.variation_id,
                 line.qty,
             )
             line.cost_per_unit = cost_per_unit
+            line.cost_estimated = short_qty > Decimal("0")
             line.updated_at = now
             consumed_from_layers = line.qty - short_qty
             await create_sale_line_stock_movements(
@@ -715,52 +722,52 @@ async def complete_tab(
                     created_by=completed_by,
                 )
 
-        for payment_data in data.payments:
-            paid_at = payment_data.paid_at or now
+        for applied in settlement.payments:
+            paid_at = applied.paid_at or now
             payment = SalePayment(
                 business_id=business_id,
                 sale_id=sale.id,
-                payment_method=payment_data.payment_method.value,
-                amount=payment_data.amount,
+                payment_method=applied.method.value,
+                amount=applied.amount,
+                tendered_amount=applied.tendered,
+                change_given=applied.change,
                 status="completed",
-                reference_no=payment_data.reference_no,
+                reference_no=applied.reference_no,
                 paid_at=paid_at,
                 created_by=completed_by,
                 created_at=now,
                 updated_at=now,
             )
             db.add(payment)
-            if register_shift_id is not None:
-                db.add(
-                    RegisterTransaction(
-                        business_id=business_id,
-                        register_shift_id=register_shift_id,
-                        tx_type=RegisterTxTypeEnum.sale.value,
-                        payment_method=payment.payment_method,
-                        amount=payment.amount,
-                        reference_type=ReferenceTypeEnum.sale.value,
-                        reference_id=sale.id,
-                        transacted_at=paid_at,
-                        created_by=completed_by,
-                        created_at=now,
-                        updated_at=now,
-                    )
+            db.add(
+                RegisterTransaction(
+                    business_id=business_id,
+                    register_shift_id=shift.id,
+                    tx_type=RegisterTxTypeEnum.sale.value,
+                    payment_method=payment.payment_method,
+                    amount=applied.amount,
+                    reference_type=ReferenceTypeEnum.sale.value,
+                    reference_id=sale.id,
+                    transacted_at=paid_at,
+                    created_by=completed_by,
+                    created_at=now,
+                    updated_at=now,
                 )
+            )
 
-        if sale.customer_id is not None and credit_payments:
-            credit_amount = sum((p.amount for p in credit_payments), Decimal("0"))
+        if sale.customer_id is not None and settlement.credit_amount > Decimal("0"):
             await create_ledger_entry(
                 db=db,
                 business_id=business_id,
                 customer_id=sale.customer_id,
                 entry_type=LedgerEntryTypeEnum.sale,
-                amount=-credit_amount,
+                amount=-settlement.credit_amount,
                 created_by=completed_by,
                 reference_type=ReferenceTypeEnum.sale,
                 reference_id=sale.id,
             )
 
-        sale.status = determine_sale_status(total_amount, total_paid).value
+        sale.status = determine_sale_status(total_amount, settlement.total_applied).value
         sale.sold_at = sold_at
         sale.updated_by = completed_by
         sale.updated_at = now

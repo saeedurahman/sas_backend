@@ -3,7 +3,12 @@ from uuid import UUID
 from fastapi import APIRouter, Depends, Query, status
 
 from app.database import get_db
-from app.dependencies import get_current_user, require_permission
+from app.dependencies import (
+    _user_permission_keys,
+    _user_role_names,
+    get_current_user,
+    require_permission,
+)
 from app.models.user import User
 from app.schemas.register import (
     CloseShiftRequest,
@@ -97,8 +102,16 @@ async def close_shift_endpoint(
     current_user: User = Depends(require_permission("shifts.close")),
     db=Depends(get_db),
 ):
+    can_manage = "shifts.manage" in _user_permission_keys(current_user) or (
+        "owner" in _user_role_names(current_user)
+    )
     return await close_shift(
-        db, current_user.business_id, shift_id, data, current_user.id
+        db,
+        current_user.business_id,
+        shift_id,
+        data,
+        current_user.id,
+        can_manage_shifts=can_manage,
     )
 
 

@@ -6,7 +6,7 @@ from fastapi import APIRouter, Depends, HTTPException, Query, status
 from fastapi.responses import StreamingResponse
 
 from app.database import get_db
-from app.dependencies import require_permission
+from app.dependencies import apply_business_timezone, require_permission
 from app.models.user import User
 from app.schemas.invoice import InvoiceData, ThermalReceiptData
 from app.services.export_service import (
@@ -20,7 +20,11 @@ from app.services.invoice_service import (
     get_thermal_receipt_data,
 )
 
-router = APIRouter(prefix="/invoice", tags=["Invoice & Export"])
+router = APIRouter(
+    prefix="/invoice",
+    tags=["Invoice & Export"],
+    dependencies=[Depends(apply_business_timezone)],
+)
 
 _EXCEL_MEDIA_TYPE = (
     "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"

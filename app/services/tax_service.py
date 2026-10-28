@@ -1,12 +1,14 @@
 """Tax rate management services."""
 
 from datetime import datetime, timezone
+from decimal import Decimal
 from uuid import UUID
 
 from fastapi import HTTPException, status
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
+from app.models.product import Product
 from app.models.sales import TaxRate
 from app.schemas.sales import CreateTaxRateRequest, UpdateTaxRateRequest
 
@@ -96,3 +98,57 @@ async def update_tax_rate(
     await db.commit()
     await db.refresh(tax_rate)
     return tax_rate
+
+
+OVERRIDE_TAX_PERMISSION = "sales.override_tax"
+
+
+async def resolve_product_tax_rates(
+    db: AsyncSession,
+    business_id: UUID,
+    product_ids: list[UUID],
+) -> dict[UUID, Decimal]:
+    """Tax rate (percent) per product from its tax_rate_id; 0 when untaxed/inactive."""
+    if not product_ids:
+        return {}
+    result = await db.execute(
+        select(Product.id, TaxRate.rate)
+        .outerjoin(
+            TaxRate,
+            (TaxRate.id == Product.tax_rate_id)
+            & (TaxRate.business_id == business_id)
+            & (TaxRate.is_active.is_(True))
+            & (TaxRate.deleted_at.is_(None)),
+        )
+        .where(Product.id.in_(set(product_ids)), Product.business_id == business_id)
+    )
+    return {
+        product_id: Decimal(str(rate)) if rate is not None else Decimal("0")
+        for product_id, rate in result.all()
+    }
+
+
+async def resolve_line_tax_rates(
+    db: AsyncSession,
+    business_id: UUID,
+    lines: list,
+    permission_keys: set[str],
+) -> list[Decimal]:
+    """Server-side tax rate for each line (``lines[i].product_id`` / ``.tax_rate``).
+
+    A client-supplied ``tax_rate`` is honoured only for users holding
+    ``sales.override_tax``; otherwise it is ignored in favour of the product's
+    configured rate.
+    """
+    server = await resolve_product_tax_rates(
+        db, business_id, [line.product_id for line in lines]
+    )
+    may_override = OVERRIDE_TAX_PERMISSION in permission_keys
+    rates: list[Decimal] = []
+    for line in lines:
+        requested = getattr(line, "tax_rate", None)
+        if may_override and requested is not None:
+            rates.append(Decimal(str(requested)))
+        else:
+            rates.append(server.get(line.product_id, Decimal("0")))
+    return rates

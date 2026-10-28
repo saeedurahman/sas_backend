@@ -9,7 +9,10 @@ import httpx
 import pytest
 from fastapi import HTTPException
 
-from app.database import AsyncSessionLocal
+from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker, create_async_engine
+from sqlalchemy.pool import NullPool
+
+from app.core.config import settings
 from app.schemas.accounting import UpdateChartOfAccountRequest
 from app.services.accounting_coa_service import update_chart_of_account
 from tests.helpers.assertions import assert_status
@@ -117,7 +120,15 @@ def test_coa_parent_cycle_rejected(
     owner_id = UUID(me.json()["id"])
 
     async def attempt_cycle_update() -> HTTPException | None:
-        async with AsyncSessionLocal() as db:
+        # Own engine: the app engine's pool is bound to a different event loop.
+        engine = create_async_engine(settings.database_url, poolclass=NullPool)
+        try:
+            return await _attempt(engine)
+        finally:
+            await engine.dispose()
+
+    async def _attempt(engine) -> HTTPException | None:
+        async with async_sessionmaker(engine, class_=AsyncSession, expire_on_commit=False)() as db:
             try:
                 await update_chart_of_account(
                     db,

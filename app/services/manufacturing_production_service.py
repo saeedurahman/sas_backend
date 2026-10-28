@@ -377,8 +377,13 @@ async def _consume_ingredient_fifo(
 ) -> tuple[Decimal, Decimal]:
     from app.models.enums import ReferenceTypeEnum, StockMovementTypeEnum
     from app.services.fifo_service import allocate_sale_line_fifo
-    from app.services.stock_service import check_sufficient_stock, create_stock_movement
+    from app.services.stock_service import (
+        check_sufficient_stock,
+        create_stock_movement,
+        lock_stock_positions,
+    )
 
+    await lock_stock_positions(db, business_id, branch_id, [(product_id, variation_id)])
     if not allow_negative:
         sufficient = await check_sufficient_stock(
             db,
@@ -397,6 +402,7 @@ async def _consume_ingredient_fifo(
     weighted_cost, consumptions, _short_qty = await allocate_sale_line_fifo(
         db,
         business_id,
+        branch_id,
         product_id,
         variation_id,
         qty,
@@ -436,7 +442,7 @@ async def complete_production_order(
 ) -> ProductionOrderResponse:
     from app.models.enums import ReferenceTypeEnum, StockMovementTypeEnum
     from app.models.inventory import PurchaseLine
-    from app.services.invoice_service import _round2
+    from app.services.fifo_service import _round4
     from app.services.stock_service import create_stock_movement
 
     order = await _get_production_order(db, order_id, business_id)
@@ -506,12 +512,14 @@ async def complete_production_order(
             production_line.cost_per_unit = weighted_cost
             total_ingredient_cost += line_total_cost
 
-        finished_unit_cost = _round2(total_ingredient_cost / data.qty_produced)
+        finished_unit_cost = _round4(total_ingredient_cost / data.qty_produced)
 
         finished_layer = PurchaseLine(
             business_id=business_id,
             purchase_order_id=None,
             production_order_id=order.id,
+            branch_id=order.branch_id,
+            layer_source="production",
             product_id=bom.product_id,
             variation_id=bom.variation_id,
             ordered_qty=data.qty_produced,

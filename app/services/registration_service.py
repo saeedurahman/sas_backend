@@ -3,6 +3,7 @@ Async business registration — single atomic transaction.
 Slug stored in business_configs.config_json (no businesses.slug column in DB).
 """
 
+import asyncio
 import random
 import re
 from datetime import datetime, timezone
@@ -77,6 +78,11 @@ async def register_new_business(
     db: AsyncSession,
     data: RegisterBusinessRequest,
 ) -> tuple[User, Business]:
+    # bcrypt is CPU-bound: run it in a worker thread and *before* a connection
+    # is held, otherwise concurrent registrations pin pooled connections while
+    # queueing behind each other's hashing (pool exhaustion -> 500s).
+    password_hash = await asyncio.to_thread(hash_password, data.owner_password)
+
     async with db.begin():
         result = await db.execute(
             select(BusinessType).where(
@@ -169,7 +175,7 @@ async def register_new_business(
             default_branch_id=branch.id,
             full_name=data.owner_name,
             phone=data.owner_phone,
-            password_hash=hash_password(data.owner_password),
+            password_hash=password_hash,
             status="active",
             is_locked=False,
             failed_login_attempts=0,

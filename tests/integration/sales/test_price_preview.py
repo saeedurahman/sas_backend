@@ -93,6 +93,8 @@ def _setup_tenant(client: httpx.Client, api_base: str, suffix: int) -> dict:
             },
         )
 
+    _open_shift(client, api_base, headers, branch_id, headers)
+
     return {
         "headers": headers,
         "branch_id": branch_id,
@@ -338,3 +340,19 @@ def test_sale_price_preview(
         all_ok and unchanged,
         f"before={counts_before}, after={counts_after}",
     )
+
+
+def _open_shift(client, api_base, owner_headers, branch_id, who_headers):
+    """Sales post to the caller's own open shift; give ``who_headers`` one."""
+    reg = client.post(
+        f"{api_base}/registers",
+        headers=owner_headers,
+        json={"name": "R" + branch_id[:6], "branch_id": branch_id},
+    )
+    assert reg.status_code == 201, reg.text
+    shift = client.post(
+        f"{api_base}/shifts/open",
+        headers=who_headers,
+        json={"cash_register_id": reg.json()["id"], "opening_float": "0"},
+    )
+    assert shift.status_code == 201, shift.text

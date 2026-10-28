@@ -150,7 +150,9 @@ class CreateSaleLineRequest(BaseSchema):
     unit_price: Decimal
     discount_pct: Decimal = Decimal("0")
     discount_amount: Decimal = Decimal("0")
-    tax_rate: Decimal = Decimal("0")
+    # Ignored unless the caller holds ``sales.override_tax``: the rate comes from
+    # the product's tax_rate_id. The effective rate is echoed on the response.
+    tax_rate: Decimal | None = None
     notes: str | None = None
     line_order: int = 0
     modifier_ids: list[UUID] = Field(default_factory=list)
@@ -185,9 +187,9 @@ class CreateSaleLineRequest(BaseSchema):
 
     @field_validator("tax_rate")
     @classmethod
-    def validate_tax_rate(cls, value: Decimal) -> Decimal:
-        if value < 0:
-            raise ValueError("tax_rate cannot be negative")
+    def validate_tax_rate(cls, value: Decimal | None) -> Decimal | None:
+        if value is not None and (value < 0 or value > 100):
+            raise ValueError("tax_rate must be between 0 and 100")
         return value
 
 
@@ -263,12 +265,30 @@ class RequestBillRequest(BaseSchema):
 
 
 class CreateReturnLineRequest(BaseSchema):
-    product_id: UUID
+    """A return line.
+
+    With ``sale_line_id`` the product, variation, unit price, discount and tax are
+    all taken from the original sale line; ``product_id`` / ``variation_id`` /
+    ``unit_price`` / ``tax_amount`` may be omitted (a mismatching product is
+    rejected, ``unit_price`` / ``tax_amount`` are ignored). Without it (a return
+    not tied to a sale) ``product_id`` and ``unit_price`` are required.
+    """
+
+    product_id: UUID | None = None
     variation_id: UUID | None = None
     sale_line_id: UUID | None = None
     qty: Decimal
-    unit_price: Decimal
-    tax_amount: Decimal = Decimal("0")
+    unit_price: Decimal | None = None
+    tax_amount: Decimal | None = None
+
+    @model_validator(mode="after")
+    def validate_unlinked_line(self) -> "CreateReturnLineRequest":
+        if self.sale_line_id is None:
+            if self.product_id is None or self.unit_price is None:
+                raise ValueError(
+                    "product_id and unit_price are required when sale_line_id is not given"
+                )
+        return self
 
     @field_validator("qty")
     @classmethod
@@ -279,15 +299,15 @@ class CreateReturnLineRequest(BaseSchema):
 
     @field_validator("unit_price")
     @classmethod
-    def validate_unit_price(cls, value: Decimal) -> Decimal:
-        if value < 0:
+    def validate_unit_price(cls, value: Decimal | None) -> Decimal | None:
+        if value is not None and value < 0:
             raise ValueError("unit_price cannot be negative")
         return value
 
     @field_validator("tax_amount")
     @classmethod
-    def validate_tax_amount(cls, value: Decimal) -> Decimal:
-        if value < 0:
+    def validate_tax_amount(cls, value: Decimal | None) -> Decimal | None:
+        if value is not None and value < 0:
             raise ValueError("tax_amount cannot be negative")
         return value
 
@@ -378,6 +398,8 @@ class SalePaymentResponse(BaseSchema):
     sale_id: UUID
     payment_method: str
     amount: Decimal
+    tendered_amount: Decimal | None = None
+    change_given: Decimal = Decimal("0")
     status: str
     reference_no: str | None
     paid_at: datetime
@@ -420,6 +442,7 @@ class SaleLineResponse(BaseSchema):
     tax_rate: Decimal
     tax_amount: Decimal
     cost_per_unit: Decimal
+    cost_estimated: bool = False
     notes: str | None
     line_order: int
     returned_qty: Decimal = Decimal("0")
@@ -445,6 +468,7 @@ class SaleReturnLineResponse(BaseSchema):
     variation_id: UUID | None
     qty: Decimal
     unit_price: Decimal
+    discount_amount: Decimal = Decimal("0")
     tax_amount: Decimal
 
 
@@ -457,6 +481,8 @@ class SaleReturnResponse(SalesAuditSchema):
     return_number: str
     returned_at: datetime
     reason: str | None
+    total_refund: Decimal = Decimal("0")
+    credit_amount: Decimal = Decimal("0")
     lines: list[SaleReturnLineResponse] = Field(default_factory=list)
     payments: list[SaleReturnPaymentResponse] = Field(default_factory=list)
 
@@ -472,6 +498,7 @@ class SaleResponse(SalesAuditSchema):
     status: str
     sold_at: datetime
     notes: str | None
+    change_given: Decimal = Decimal("0")
     lines: list[SaleLineResponse] = Field(default_factory=list)
     payments: list[SalePaymentResponse] = Field(default_factory=list)
 

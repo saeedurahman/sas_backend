@@ -1,8 +1,9 @@
 from datetime import date
 from uuid import UUID
 
-from fastapi import APIRouter, Depends, Query, status
+from fastapi import APIRouter, Depends, Query, Request, status
 
+from app.core.idempotency import run_idempotent
 from app.database import get_db
 from app.dependencies import require_permission
 from app.models.user import User
@@ -143,12 +144,21 @@ async def list_expenses(
 
 @router.post("", response_model=ExpenseResponse, status_code=status.HTTP_201_CREATED)
 async def create_expense_endpoint(
+    request: Request,
     data: CreateExpenseRequest,
     current_user: User = Depends(require_permission("expenses.create")),
     db=Depends(get_db),
 ):
-    return await create_expense(
+    return await run_idempotent(
+        request,
+        business_id=current_user.business_id,
+        user_id=current_user.id,
+        body=data,
+        response_model=ExpenseResponse,
+        success_status=201,
+        handler=lambda: create_expense(
         db, current_user.business_id, data, current_user.id
+    ),
     )
 
 
@@ -158,17 +168,26 @@ async def create_expense_endpoint(
     status_code=status.HTTP_201_CREATED,
 )
 async def add_expense_payment_endpoint(
+    request: Request,
     expense_id: UUID,
     data: CreateExpensePaymentRequest,
     current_user: User = Depends(require_permission("expenses.update")),
     db=Depends(get_db),
 ):
-    return await add_expense_payment(
+    return await run_idempotent(
+        request,
+        business_id=current_user.business_id,
+        user_id=current_user.id,
+        body=data,
+        response_model=ExpensePaymentResponse,
+        success_status=201,
+        handler=lambda: add_expense_payment(
         db,
         current_user.business_id,
         expense_id,
         data,
         current_user.id,
+    ),
     )
 
 

@@ -1,4 +1,5 @@
 from app.models.audit import AuditLog
+from app.models.idempotency import IdempotencyKey
 from app.models.business import (
     Branch,
     Business,

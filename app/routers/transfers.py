@@ -1,7 +1,8 @@
 from uuid import UUID
 
-from fastapi import APIRouter, Depends, Query, status
+from fastapi import APIRouter, Depends, Query, Request, status
 
+from app.core.idempotency import run_idempotent
 from app.database import get_db
 from app.dependencies import require_permission
 from app.models.user import User
@@ -44,14 +45,23 @@ async def list_transfers(
     status_code=status.HTTP_201_CREATED,
 )
 async def create_transfer(
+    request: Request,
     data: CreateStockTransferRequest,
     current_user: User = Depends(
         require_permission("inventory.transfers.create")
     ),
     db=Depends(get_db),
 ):
-    return await create_stock_transfer(
+    return await run_idempotent(
+        request,
+        business_id=current_user.business_id,
+        user_id=current_user.id,
+        body=data,
+        response_model=StockTransferResponse,
+        success_status=201,
+        handler=lambda: create_stock_transfer(
         db, current_user.business_id, data, current_user.id
+    ),
     )
 
 
@@ -76,12 +86,25 @@ async def get_transfer(
     status_code=status.HTTP_200_OK,
 )
 async def receive_transfer(
+    request: Request,
     transfer_id: UUID,
     current_user: User = Depends(
         require_permission("inventory.transfers.receive")
     ),
     db=Depends(get_db),
 ):
-    return await receive_stock_transfer(
-        db, transfer_id, current_user.business_id, current_user.id
+    return await run_idempotent(
+        request,
+        business_id=current_user.business_id,
+        user_id=current_user.id,
+        body={"transfer_id": str(transfer_id)},
+        response_model=StockTransferResponse,
+        success_status=200,
+        handler=lambda: receive_stock_transfer(
+            db,
+            transfer_id,
+            current_user.business_id,
+            current_user.id,
+            receiver=current_user,
+        ),
     )

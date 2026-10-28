@@ -115,7 +115,7 @@ def test_tab_full_flow_stock_deferred_and_kot_linkage(
     _enable_restaurant_flags(http_client, api_base, tenant.owner_headers)
     assert tenant.product_id is not None
     assert tenant.shift_id is not None
-    assert tenant.manager_headers is not None
+    assert tenant.owner_headers is not None
 
     stock_before = _sale_stock_qty(http_client, tenant, tenant.product_id)
     table_id, modifier_id, _ = _setup_table_and_modifiers(
@@ -124,7 +124,7 @@ def test_tab_full_flow_stock_deferred_and_kot_linkage(
 
     open_resp = http_client.post(
         f"{api_base}/sales/open-tab",
-        headers=tenant.manager_headers,
+        headers=tenant.owner_headers,
         json={
             "branch_id": tenant.branch_id,
             "table_id": table_id,
@@ -141,7 +141,7 @@ def test_tab_full_flow_stock_deferred_and_kot_linkage(
 
     add_resp = http_client.post(
         f"{api_base}/sales/{sale_id}/lines",
-        headers=tenant.manager_headers,
+        headers=tenant.owner_headers,
         json={
             "lines": [
                 {
@@ -162,7 +162,7 @@ def test_tab_full_flow_stock_deferred_and_kot_linkage(
 
     fire_resp = http_client.post(
         f"{api_base}/sales/{sale_id}/fire",
-        headers=tenant.manager_headers,
+        headers=tenant.owner_headers,
         json={},
     )
     assert_status(fire_resp, 201, label="POST /sales/{id}/fire")
@@ -186,7 +186,7 @@ def test_tab_full_flow_stock_deferred_and_kot_linkage(
 
     complete_resp = http_client.post(
         f"{api_base}/sales/{sale_id}/complete",
-        headers=tenant.manager_headers,
+        headers=tenant.owner_headers,
         json={
             "payments": [{"payment_method": "cash", "amount": "210.00"}],
         },
@@ -346,7 +346,7 @@ def test_non_restaurant_sale_unchanged(
     pos_tenant,
 ) -> None:
     tenant = pos_tenant
-    assert tenant.manager_headers is not None
+    assert tenant.owner_headers is not None
     assert tenant.product_id is not None
     assert tenant.shift_id is not None
 
@@ -354,7 +354,7 @@ def test_non_restaurant_sale_unchanged(
 
     sale = http_client.post(
         f"{api_base}/sales",
-        headers=tenant.manager_headers,
+        headers=tenant.owner_headers,
         json=create_sale_payload(
             branch_id=tenant.branch_id,
             product_id=tenant.product_id,

@@ -148,8 +148,18 @@ class PurchaseLine(Base, SoftDeleteMixin, SyncMixin):
     qty_remaining: Mapped[Decimal] = mapped_column(
         Numeric(15, 4), nullable=False, default=0
     )
-    cost_per_unit: Mapped[Decimal] = mapped_column(Numeric(15, 2), nullable=False)
-    tax_rate: Mapped[Decimal] = mapped_column(Numeric(5, 2), nullable=False, default=0)
+    cost_per_unit: Mapped[Decimal] = mapped_column(Numeric(15, 4), nullable=False)
+    tax_rate: Mapped[Decimal] = mapped_column(Numeric(6, 3), nullable=False, default=0)
+    # FIFO layers are per branch: stock (and therefore cost) lives where it was received.
+    branch_id: Mapped[uuid.UUID | None] = mapped_column(
+        Uuid(as_uuid=True),
+        ForeignKey("branches.id", ondelete="RESTRICT"),
+        nullable=True,
+    )
+    # purchase | receipt | production | adjustment | transfer
+    layer_source: Mapped[str] = mapped_column(
+        String(20), nullable=False, default="purchase", server_default="purchase"
+    )
     batch_number: Mapped[str | None] = mapped_column(String(100), nullable=True)
     expiry_date: Mapped[date | None] = mapped_column(Date, nullable=True)
     sync_status: Mapped[str] = mapped_column(
@@ -282,7 +292,7 @@ class PurchaseReceiptLine(Base, SoftDeleteMixin, SyncMixin):
         nullable=True,
     )
     qty_received: Mapped[Decimal] = mapped_column(Numeric(15, 4), nullable=False)
-    cost_per_unit: Mapped[Decimal] = mapped_column(Numeric(15, 2), nullable=False)
+    cost_per_unit: Mapped[Decimal] = mapped_column(Numeric(15, 4), nullable=False)
     batch_number: Mapped[str | None] = mapped_column(String(100), nullable=True)
     expiry_date: Mapped[date | None] = mapped_column(Date, nullable=True)
     sync_status: Mapped[str] = mapped_column(
@@ -338,7 +348,7 @@ class StockMovement(Base, SoftDeleteMixin, SyncMixin):
         stock_movement_type_enum, nullable=False
     )
     qty: Mapped[Decimal] = mapped_column(Numeric(15, 4), nullable=False)
-    cost_per_unit: Mapped[Decimal] = mapped_column(Numeric(15, 2), nullable=False)
+    cost_per_unit: Mapped[Decimal] = mapped_column(Numeric(15, 4), nullable=False)
     reference_type: Mapped[str] = mapped_column(reference_type_enum, nullable=False)
     reference_id: Mapped[uuid.UUID] = mapped_column(Uuid(as_uuid=True), nullable=False)
     purchase_line_id: Mapped[uuid.UUID | None] = mapped_column(
@@ -443,7 +453,7 @@ class StockAdjustmentLine(Base, SoftDeleteMixin, SyncMixin):
         nullable=True,
     )
     qty_delta: Mapped[Decimal] = mapped_column(Numeric(15, 4), nullable=False)
-    cost_per_unit: Mapped[Decimal] = mapped_column(Numeric(15, 2), nullable=False)
+    cost_per_unit: Mapped[Decimal] = mapped_column(Numeric(15, 4), nullable=False)
     notes: Mapped[str | None] = mapped_column(Text, nullable=True)
     sync_status: Mapped[str] = mapped_column(
         sync_status_enum, nullable=False, default="pending"
@@ -546,7 +556,7 @@ class StockTransferLine(Base, SoftDeleteMixin, SyncMixin):
         nullable=True,
     )
     qty: Mapped[Decimal] = mapped_column(Numeric(15, 4), nullable=False)
-    cost_per_unit: Mapped[Decimal] = mapped_column(Numeric(15, 2), nullable=False)
+    cost_per_unit: Mapped[Decimal] = mapped_column(Numeric(15, 4), nullable=False)
     qty_received: Mapped[Decimal] = mapped_column(
         Numeric(15, 4), nullable=False, default=0
     )
@@ -648,7 +658,7 @@ class WasteEntryLine(Base, SoftDeleteMixin, SyncMixin):
         nullable=True,
     )
     qty: Mapped[Decimal] = mapped_column(Numeric(15, 4), nullable=False)
-    cost_per_unit: Mapped[Decimal] = mapped_column(Numeric(15, 2), nullable=False)
+    cost_per_unit: Mapped[Decimal] = mapped_column(Numeric(15, 4), nullable=False)
     batch_number: Mapped[str | None] = mapped_column(String(100), nullable=True)
     expiry_date: Mapped[date | None] = mapped_column(Date, nullable=True)
     sync_status: Mapped[str] = mapped_column(

@@ -38,9 +38,10 @@ from app.schemas.sales import (
 )
 from app.services.invoice_service import _round2
 from app.services.customer_service import (
+    assert_credit_available,
     create_ledger_entry,
-    get_customer_balance,
     get_customer_by_id,
+    lock_customer,
 )
 from app.services.discount_engine import (
     apply_discount_scheme,
@@ -54,7 +55,12 @@ from app.services.fifo_service import (
     maybe_notify_fifo_shortfall,
     restore_sale_line_inventory,
 )
-from app.services.register_service import verify_open_register_shift
+from app.services.register_service import (
+    require_caller_shift,
+    verify_open_register_shift,
+)
+from app.services.settlement import settle_payments
+from app.services.tax_service import resolve_line_tax_rates
 from app.services.pricing_engine import (
     calculate_line_total,
     calculate_sale_totals,
@@ -66,6 +72,7 @@ from app.services.stock_service import (
     check_sufficient_stock,
     generate_document_number,
     get_allow_negative_stock,
+    lock_stock_positions,
     verify_branch,
     verify_product,
     verify_variation,
@@ -385,6 +392,12 @@ async def compute_sale_pricing(
                 db, line.variation_id, line.product_id, business_id
             )
 
+    # Tax comes from the product's tax_rate_id; a client rate only counts for
+    # users holding sales.override_tax.
+    tax_rates = await resolve_line_tax_rates(
+        db, business_id, list(data.lines), permission_keys
+    )
+
     preview_lines: list[SalePricePreviewLineResponse] = []
     computed_lines: list[dict] = []
 
@@ -403,7 +416,7 @@ async def compute_sale_pricing(
             unit_price=line_data.unit_price,
             discount_pct=discount_pct,
             discount_amount=discount_amount,
-            tax_rate=line_data.tax_rate,
+            tax_rate=tax_rates[line_index],
         )
         computed_lines.append(amounts)
         preview_lines.append(
@@ -416,7 +429,7 @@ async def compute_sale_pricing(
                 line_subtotal=amounts["line_subtotal"],
                 discount_pct=line_data.discount_pct,
                 discount_amount=amounts["effective_discount"],
-                tax_rate=line_data.tax_rate,
+                tax_rate=tax_rates[line_index],
                 tax_amount=amounts["tax_amount"],
                 line_total=amounts["line_total"],
             )
@@ -433,6 +446,28 @@ async def compute_sale_pricing(
     )
 
 
+async def _assert_stock_available(
+    db: AsyncSession,
+    business_id: UUID,
+    branch_id: UUID,
+    lines: list,
+) -> None:
+    """Combined demand per (product, variation) must fit the branch balance."""
+    demand: dict[tuple[UUID, UUID | None], Decimal] = {}
+    for line in lines:
+        key = (line.product_id, line.variation_id)
+        demand[key] = demand.get(key, _ZERO) + line.qty
+    for (product_id, variation_id), qty in demand.items():
+        if not await check_sufficient_stock(
+            db, business_id, branch_id, product_id, variation_id, qty
+        ):
+            product = await verify_product(db, product_id, business_id)
+            raise HTTPException(
+                status_code=status.HTTP_400_BAD_REQUEST,
+                detail=f"Insufficient stock for {product.name}",
+            )
+
+
 async def create_sale(
     db: AsyncSession,
     business_id: UUID,
@@ -445,6 +480,16 @@ async def create_sale(
     allow_negative = await get_allow_negative_stock(db, business_id)
 
     try:
+        # Lock order everywhere: shift -> customer -> stock positions -> layers.
+        shift = await require_caller_shift(
+            db,
+            business_id,
+            created_by,
+            branch_id=data.branch_id,
+            requested_shift_id=data.register_shift_id,
+            action="record a sale",
+        )
+
         if data.customer_id is not None:
             await get_customer_by_id(db, data.customer_id, business_id)
 
@@ -452,71 +497,28 @@ async def create_sale(
             db, business_id, data, permission_keys
         )
 
-        if data.register_shift_id is not None:
-            await verify_open_register_shift(
-                db,
-                data.register_shift_id,
-                business_id,
-                closed_detail="Cannot record sale — shift is not open",
-            )
+        settlement = settle_payments(pricing.total_amount, data.payments)
 
-        credit_payments = [
-            p for p in data.payments
-            if p.payment_method == PaymentMethodEnum.credit
-        ]
-        if credit_payments:
+        if settlement.credit_amount > _ZERO:
             if data.customer_id is None:
                 raise HTTPException(
                     status_code=status.HTTP_400_BAD_REQUEST,
                     detail="customer_id is required for credit payments",
                 )
-            customer = await get_customer_by_id(
-                db, data.customer_id, business_id
+            # Row-locks the customer so two concurrent credit sales cannot both
+            # pass the limit check.
+            await assert_credit_available(
+                db, business_id, data.customer_id, settlement.credit_amount
             )
-            credit_amount_this_sale = sum(
-                (p.amount for p in credit_payments),
-                Decimal("0"),
-            )
-            if customer.credit_limit > Decimal("0"):
-                current_balance = await get_customer_balance(
-                    db, data.customer_id, business_id
-                )
-                projected_balance = current_balance - credit_amount_this_sale
-                if (
-                    projected_balance < Decimal("0")
-                    and abs(projected_balance) > customer.credit_limit
-                ):
-                    if current_balance < Decimal("0"):
-                        available = customer.credit_limit - abs(current_balance)
-                    else:
-                        available = customer.credit_limit
-                    raise HTTPException(
-                        status_code=status.HTTP_400_BAD_REQUEST,
-                        detail=(
-                            "Credit limit exceeded. Customer's available "
-                            f"credit is Rs. {available}, but this sale "
-                            f"requires Rs. {credit_amount_this_sale} on credit."
-                        ),
-                    )
 
+        await lock_stock_positions(
+            db,
+            business_id,
+            data.branch_id,
+            [(line.product_id, line.variation_id) for line in data.lines],
+        )
         if not allow_negative:
-            for line_data in data.lines:
-                sufficient = await check_sufficient_stock(
-                    db,
-                    business_id,
-                    data.branch_id,
-                    line_data.product_id,
-                    line_data.variation_id,
-                    line_data.qty,
-                )
-                if not sufficient:
-                    product = await verify_product(
-                        db, line_data.product_id, business_id
-                    )
-                    raise HTTPException(
-                        status_code=status.HTTP_400_BAD_REQUEST,
-                        detail=f"Insufficient stock for {product.name}",
-                    )
+            await _assert_stock_available(db, business_id, data.branch_id, data.lines)
 
         sale_number = await generate_document_number(
             db, business_id, "INV", Sale, Sale.sale_number
@@ -529,6 +531,7 @@ async def create_sale(
             cost_per_unit, consumptions, short_qty = await allocate_sale_line_fifo(
                 db,
                 business_id,
+                data.branch_id,
                 line_data.product_id,
                 line_data.variation_id,
                 line_data.qty,
@@ -542,22 +545,19 @@ async def create_sale(
                     "short_qty": short_qty,
                     "consumed_from_layers_qty": consumed_from_layers,
                     "effective_discount": preview_line.discount_amount,
+                    "tax_rate": preview_line.tax_rate,
                     "tax_amount": preview_line.tax_amount,
                 }
             )
 
         total_amount = pricing.total_amount
-
-        total_paid = sum(
-            (p.amount for p in data.payments),
-            Decimal("0"),
-        )
-        sale_status = determine_sale_status(total_amount, total_paid)
+        sale_status = determine_sale_status(total_amount, settlement.total_applied)
 
         sale = Sale(
             business_id=business_id,
             branch_id=data.branch_id,
             customer_id=data.customer_id,
+            register_shift_id=shift.id,
             price_list_id=data.price_list_id,
             sale_number=sale_number,
             sale_type=data.sale_type.value,
@@ -572,9 +572,6 @@ async def create_sale(
         db.add(sale)
         await db.flush()
 
-        if data.register_shift_id is not None:
-            sale.register_shift_id = data.register_shift_id
-
         created_lines: list[SaleLine] = []
         for snapshot in line_snapshots:
             line_data = snapshot["line_data"]
@@ -587,9 +584,10 @@ async def create_sale(
                 unit_price=line_data.unit_price,
                 discount_pct=line_data.discount_pct,
                 discount_amount=snapshot["effective_discount"],
-                tax_rate=line_data.tax_rate,
+                tax_rate=snapshot["tax_rate"],
                 tax_amount=snapshot["tax_amount"],
                 cost_per_unit=snapshot["cost_per_unit"],
+                cost_estimated=snapshot["short_qty"] > _ZERO,
                 notes=line_data.notes,
                 line_order=line_data.line_order,
                 created_by=created_by,
@@ -600,15 +598,17 @@ async def create_sale(
             await db.flush()
             created_lines.append(sale_line)
 
-        for payment_data in data.payments:
-            paid_at = payment_data.paid_at or now
+        for applied in settlement.payments:
+            paid_at = applied.paid_at or now
             payment = SalePayment(
                 business_id=business_id,
                 sale_id=sale.id,
-                payment_method=payment_data.payment_method.value,
-                amount=payment_data.amount,
+                payment_method=applied.method.value,
+                amount=applied.amount,
+                tendered_amount=applied.tendered,
+                change_given=applied.change,
                 status="completed",
-                reference_no=payment_data.reference_no,
+                reference_no=applied.reference_no,
                 paid_at=paid_at,
                 created_by=created_by,
                 created_at=now,
@@ -616,16 +616,14 @@ async def create_sale(
             )
             db.add(payment)
 
-            if (
-                data.register_shift_id is not None
-                and payment.status == "completed"
-            ):
-                register_tx = RegisterTransaction(
+            # Net of change: the till only ever sees what stayed in the drawer.
+            db.add(
+                RegisterTransaction(
                     business_id=business_id,
-                    register_shift_id=data.register_shift_id,
+                    register_shift_id=shift.id,
                     tx_type=RegisterTxTypeEnum.sale.value,
                     payment_method=payment.payment_method,
-                    amount=payment.amount,
+                    amount=applied.amount,
                     reference_type=ReferenceTypeEnum.sale.value,
                     reference_id=sale.id,
                     transacted_at=paid_at,
@@ -633,7 +631,7 @@ async def create_sale(
                     created_at=now,
                     updated_at=now,
                 )
-                db.add(register_tx)
+            )
 
         for sale_line, snapshot in zip(created_lines, line_snapshots, strict=True):
             await create_sale_line_stock_movements(
@@ -648,14 +646,14 @@ async def create_sale(
                 movement_at=sold_at,
             )
             short_qty = snapshot["short_qty"]
-            if short_qty > Decimal("0"):
+            if short_qty > _ZERO:
                 fallback_cost = next(
                     (
                         c.cost_per_unit
                         for c in reversed(snapshot["consumptions"])
                         if c.purchase_line_id is None
                     ),
-                    Decimal("0"),
+                    _ZERO,
                 )
                 await maybe_notify_fifo_shortfall(
                     db,
@@ -671,16 +669,14 @@ async def create_sale(
                     created_by=created_by,
                 )
 
-        has_credit = any(
-            p.payment_method == PaymentMethodEnum.credit for p in data.payments
-        )
-        if data.customer_id is not None and has_credit:
+        # Only the part of the bill actually put on account is owed.
+        if data.customer_id is not None and settlement.credit_amount > _ZERO:
             await create_ledger_entry(
                 db=db,
                 business_id=business_id,
                 customer_id=data.customer_id,
                 entry_type=LedgerEntryTypeEnum.sale,
-                amount=-total_amount,
+                amount=-settlement.credit_amount,
                 created_by=created_by,
                 reference_type=ReferenceTypeEnum.sale,
                 reference_id=sale.id,
@@ -814,8 +810,7 @@ async def _reverse_completed_sale_settlements(
     transacted_at: datetime,
 ) -> None:
     """Refund completed payments, reverse register txs, undo credit ledger."""
-    invoice_total = _sale_invoice_total(sale)
-    reversed_any_payment = False
+    reversed_credit = _ZERO
 
     for payment in sale.payments:
         if payment.deleted_at is not None:
@@ -825,7 +820,8 @@ async def _reverse_completed_sale_settlements(
 
         payment.status = PaymentStatusEnum.refunded.value
         payment.updated_at = transacted_at
-        reversed_any_payment = True
+        if payment.payment_method == PaymentMethodEnum.credit.value:
+            reversed_credit += payment.amount
 
         if sale.register_shift_id is not None:
             register_tx = RegisterTransaction(
@@ -843,17 +839,13 @@ async def _reverse_completed_sale_settlements(
             )
             db.add(register_tx)
 
-    if (
-        reversed_any_payment
-        and sale.customer_id is not None
-        and _sale_has_credit_payment(sale)
-    ):
+    if sale.customer_id is not None and reversed_credit > _ZERO:
         await create_ledger_entry(
             db=db,
             business_id=business_id,
             customer_id=sale.customer_id,
             entry_type=LedgerEntryTypeEnum.refund,
-            amount=invoice_total,
+            amount=reversed_credit,
             created_by=reversed_by,
             reference_type=ReferenceTypeEnum.sale,
             reference_id=sale.id,

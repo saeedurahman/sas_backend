@@ -261,7 +261,7 @@ def test_production_complete_fifo_in_out_full_batch(
     assert completed["completed_at"] is not None
     assert len(completed["lines"]) == 1
     assert completed["lines"][0]["qty_consumed"] == "20.0000"
-    assert completed["lines"][0]["cost_per_unit"] == "5.00"
+    assert Decimal(completed["lines"][0]["cost_per_unit"]) == Decimal("5.00")
 
     assert _stock_qty(tenant.business_id, tenant.branch_id, flour_id) == Decimal("80")
     assert _stock_qty(tenant.business_id, tenant.branch_id, bread_id) == Decimal("10")

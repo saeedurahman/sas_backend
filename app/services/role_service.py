@@ -8,6 +8,7 @@ from sqlalchemy import func, select
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.orm import selectinload
 
+from app.core import permission_cache
 from app.models.user import Permission, Role, RolePermission, UserRole
 from app.schemas.role import (
     AssignPermissionsRequest,
@@ -294,6 +295,7 @@ async def create_role(
         )
 
     await db.commit()
+    permission_cache.invalidate_all()
     return await get_role_response(db, role.id, business_id)
 
 
@@ -328,6 +330,7 @@ async def update_role(
     role.updated_by = updated_by
     role.updated_at = now
     await db.commit()
+    permission_cache.invalidate_all()
     return await get_role_response(db, role_id, business_id)
 
 
@@ -372,6 +375,7 @@ async def delete_role(
     role.updated_at = now
     role.updated_by = deleted_by
     await db.commit()
+    permission_cache.invalidate_all()
 
 
 async def replace_role_permissions(
@@ -391,4 +395,5 @@ async def replace_role_permissions(
     role.updated_by = updated_by
     role.updated_at = _now()
     await db.commit()
+    permission_cache.invalidate_all()
     return await get_role_response(db, role_id, business_id)

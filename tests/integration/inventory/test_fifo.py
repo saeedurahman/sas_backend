@@ -10,9 +10,9 @@ from uuid import UUID
 import httpx
 import pytest
 
-from tests.helpers.db import db_rows, db_scalar
+from tests.helpers.db import db_execute, db_rows, db_scalar
 from tests.helpers.records import assert_ok
-from tests.helpers.tenants import TenantContext, add_stock_adjustment, build_fifo_tenant
+from tests.helpers.tenants import TenantContext, build_fifo_tenant
 
 pytestmark = pytest.mark.integration
 
@@ -146,11 +146,35 @@ def _qty_remaining_for_cost(ctx: dict, cost: str) -> Decimal:
     return Decimal(str(val))
 
 
+def _legacy_stock(ctx: dict, qty: str) -> None:
+    """Untraced stock: a movement with no FIFO layer (pre-phase-2 data)."""
+    db_execute(
+        """
+        INSERT INTO stock_movements (
+            id, business_id, branch_id, product_id, movement_type, qty,
+            cost_per_unit, reference_type, reference_id, movement_at,
+            created_at, updated_at, created_by
+        )
+        SELECT gen_random_uuid(), :business_id, :branch_id, :product_id,
+               'adjustment_in', :qty, 50, 'stock_adjustment', gen_random_uuid(),
+               NOW(), NOW(), NOW(), u.id
+        FROM users u WHERE u.business_id = :business_id LIMIT 1
+        """,
+        {
+            "business_id": ctx["business_id"],
+            "branch_id": ctx["branch_id"],
+            "product_id": ctx["product_id"],
+            "qty": qty,
+        },
+    )
+
+
 def _fifo_cost_sql(ctx: dict, qty: str) -> Decimal | None:
     val = db_scalar(
-        "SELECT get_fifo_cost(:bid, :pid, NULL::uuid, :qty)",
+        "SELECT get_fifo_cost(:bid, :brid, :pid, NULL::uuid, :qty)",
         {
             "bid": ctx["business_id"],
+            "brid": ctx["branch_id"],
             "pid": ctx["product_id"],
             "qty": qty,
         },
@@ -165,7 +189,6 @@ def test_single_layer_sale(
 ) -> None:
     tenant = build_fifo_tenant(http_client, api_base, unique_suffix)
     ctx = _fifo_ctx(tenant)
-    add_stock_adjustment(http_client, tenant, qty_delta="20")
     plines = _create_po_with_lines(http_client, api_base, ctx, [("10", "100.00")])
     pl_id = plines[0]["id"]
 
@@ -207,7 +230,6 @@ def test_multi_layer_sale(
 ) -> None:
     tenant = build_fifo_tenant(http_client, api_base, unique_suffix + 1)
     ctx = _fifo_ctx(tenant)
-    add_stock_adjustment(http_client, tenant, qty_delta="20")
     _create_po_with_lines(http_client, api_base, ctx, [("5", "100.00"), ("3", "120.00")])
     expected_cost = _fifo_cost_sql(ctx, "8")
     sale = _create_sale(http_client, api_base, ctx, "8")
@@ -235,7 +257,7 @@ def test_insufficient_layers(
 ) -> None:
     tenant = build_fifo_tenant(http_client, api_base, unique_suffix + 2)
     ctx = _fifo_ctx(tenant)
-    add_stock_adjustment(http_client, tenant, qty_delta="20")
+    _legacy_stock(ctx, "20")
     _create_po_with_lines(http_client, api_base, ctx, [("2", "100.00")])
 
     sale = _create_sale(http_client, api_base, ctx, "5")
@@ -269,7 +291,6 @@ def test_full_cancel_multi_layer(
 ) -> None:
     tenant = build_fifo_tenant(http_client, api_base, unique_suffix + 3)
     ctx = _fifo_ctx(tenant)
-    add_stock_adjustment(http_client, tenant, qty_delta="20")
     _create_po_with_lines(http_client, api_base, ctx, [("5", "100.00"), ("3", "120.00")])
     draft = http_client.post(
         f"{api_base}/sales",
@@ -283,7 +304,7 @@ def test_full_cancel_multi_layer(
                     "unit_price": "100.00",
                 }
             ],
-            "payments": [],
+            "payments": [{"payment_method": "cash", "amount": "100.00"}],
         },
     )
     assert_ok("multi-layer draft sale", draft.status_code == 201, str(draft.status_code))
@@ -311,7 +332,6 @@ def test_partial_return_multi_layer(
 ) -> None:
     tenant = build_fifo_tenant(http_client, api_base, unique_suffix + 4)
     ctx = _fifo_ctx(tenant)
-    add_stock_adjustment(http_client, tenant, qty_delta="20")
     _create_po_with_lines(http_client, api_base, ctx, [("5", "100.00"), ("3", "120.00")])
     sale = _create_sale(http_client, api_base, ctx, "8")
     if sale.status_code != 201:
@@ -355,7 +375,7 @@ def test_partial_return_multi_layer(
         sequences = [m["movement_sequence"] for m in sale_moves]
         assert_ok(
             "partial return sale movement FIFO order",
-            traced_order == ["100.00", "120.00"] and sequences == [0, 1],
+            traced_order == ["100.0000", "120.0000"] and sequences == [0, 1],
             f"order={traced_order} sequences={sequences}",
         )
     rem_100 = _qty_remaining_for_cost(ctx, "100.00")
@@ -374,7 +394,7 @@ def test_legacy_return_no_layer_restore(
 ) -> None:
     tenant = build_fifo_tenant(http_client, api_base, unique_suffix + 5)
     ctx = _fifo_ctx(tenant)
-    add_stock_adjustment(http_client, tenant, qty_delta="10")
+    _legacy_stock(ctx, "10")
     sale = _create_sale(http_client, api_base, ctx, "2")
     assert_ok("legacy setup sale", sale.status_code == 201, str(sale.status_code))
     if sale.status_code != 201:
@@ -426,7 +446,7 @@ def test_mixed_traced_untraced_partial_return(
 ) -> None:
     tenant = build_fifo_tenant(http_client, api_base, unique_suffix + 7)
     ctx = _fifo_ctx(tenant)
-    add_stock_adjustment(http_client, tenant, qty_delta="20")
+    _legacy_stock(ctx, "20")
     _create_po_with_lines(http_client, api_base, ctx, [("2", "100.00")])
 
     sale = _create_sale(http_client, api_base, ctx, "5")
@@ -509,23 +529,23 @@ def test_mixed_traced_untraced_partial_return(
         """,
         {"return_line_id": return_line_id},
     )
+    original_layer = db_scalar(
+        """
+        SELECT id FROM purchase_lines
+        WHERE business_id = :b AND product_id = :p AND layer_source = 'purchase'
+        """,
+        {"b": ctx["business_id"], "p": ctx["product_id"]},
+    )
     traced_return_qty = sum(
         (
             Decimal(str(m["qty"]))
             for m in return_moves
-            if m["purchase_line_id"] is not None
+            if str(m["purchase_line_id"]) == str(original_layer)
         ),
         Decimal("0"),
     )
-    legacy_return_qty = sum(
-        (
-            Decimal(str(m["qty"]))
-            for m in return_moves
-            if m["purchase_line_id"] is None
-        ),
-        Decimal("0"),
-    )
-    total_return_qty = traced_return_qty + legacy_return_qty
+    total_return_qty = sum((Decimal(str(m["qty"])) for m in return_moves), Decimal("0"))
+    legacy_return_qty = total_return_qty - traced_return_qty
     assert_ok(
         "mixed partial traced return qty",
         traced_return_qty == Decimal("2"),
@@ -548,23 +568,33 @@ def test_concurrent_sales(
     api_base: str,
     unique_suffix: int,
 ) -> None:
-    from app.database import AsyncSessionLocal
+    from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker, create_async_engine
+    from sqlalchemy.pool import NullPool
+
+    from app.core.config import settings
     from app.services.fifo_service import consume_fifo_layers
 
     tenant = build_fifo_tenant(http_client, api_base, unique_suffix + 6)
     ctx = _fifo_ctx(tenant)
-    add_stock_adjustment(http_client, tenant, qty_delta="20")
     _create_po_with_lines(http_client, api_base, ctx, [("5", "100.00")])
     business_id = UUID(str(ctx["business_id"]))
     product_id = UUID(str(ctx["product_id"]))
     outcomes: list[tuple[list, Decimal]] = []
 
+    # The app-wide engine pools asyncpg connections bound to one event loop;
+    # asyncio.run() starts a fresh loop per call, so reusing it across tests
+    # raised "attached to a different loop". Each run gets its own engine.
+    engine = create_async_engine(settings.database_url, poolclass=NullPool)
+    SessionLocal = async_sessionmaker(engine, class_=AsyncSession, expire_on_commit=False)
+    branch_id = UUID(str(ctx["branch_id"]))
+
     async def consume_three() -> None:
-        async with AsyncSessionLocal() as db:
+        async with SessionLocal() as db:
             async with db.begin():
                 consumptions, shortfall = await consume_fifo_layers(
                     db,
                     business_id,
+                    branch_id,
                     product_id,
                     None,
                     Decimal("3"),
@@ -572,7 +602,10 @@ def test_concurrent_sales(
                 outcomes.append((consumptions, shortfall))
 
     async def run_parallel() -> None:
-        await asyncio.gather(consume_three(), consume_three())
+        try:
+            await asyncio.gather(consume_three(), consume_three())
+        finally:
+            await engine.dispose()
 
     asyncio.run(run_parallel())
 

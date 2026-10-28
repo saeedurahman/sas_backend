@@ -11,12 +11,19 @@ from sqlalchemy.orm import selectinload
 from app.models.enums import ReferenceTypeEnum, StockMovementTypeEnum
 from app.models.inventory import StockAdjustment, StockAdjustmentLine
 from app.schemas.inventory import CreateStockAdjustmentRequest
+from app.models.enums import AdjustmentReasonEnum
+from app.services.fifo_service import (
+    consume_to_movements,
+    create_fifo_layer,
+    get_fallback_cost_per_unit,
+)
 from app.services.stock_service import (
     _now,
     check_sufficient_stock,
     create_stock_movement,
     generate_document_number,
     get_allow_negative_stock,
+    lock_stock_positions,
     verify_branch,
     verify_product,
     verify_variation,
@@ -82,6 +89,13 @@ async def create_stock_adjustment(
     data: CreateStockAdjustmentRequest,
     created_by: UUID,
 ) -> StockAdjustment:
+    """Stock in creates a cost layer, stock out consumes layers (FIFO).
+
+    Costs are server-derived. The one exception is an ``opening_balance``
+    adjustment, where there is no history to derive a cost from, so the
+    client-supplied ``cost_per_unit`` is honoured; it is ignored for every other
+    reason and for stock-out lines.
+    """
     now = _now()
     adjusted_at = data.adjusted_at or now
     allow_negative = await get_allow_negative_stock(db, business_id)
@@ -90,21 +104,32 @@ async def create_stock_adjustment(
         await verify_branch(db, data.branch_id, business_id)
 
         for line in data.lines:
-            product = await verify_product(db, line.product_id, business_id)
+            await verify_product(db, line.product_id, business_id)
             if line.variation_id is not None:
                 await verify_variation(
                     db, line.variation_id, line.product_id, business_id
                 )
-            if line.qty_delta < 0 and not allow_negative:
-                sufficient = await check_sufficient_stock(
-                    db,
-                    business_id,
-                    data.branch_id,
-                    line.product_id,
-                    line.variation_id,
-                    abs(line.qty_delta),
-                )
-                if not sufficient:
+
+        await lock_stock_positions(
+            db,
+            business_id,
+            data.branch_id,
+            [(l.product_id, l.variation_id) for l in data.lines],
+        )
+
+        if not allow_negative:
+            out_demand: dict[tuple[UUID, UUID | None], Decimal] = {}
+            for line in data.lines:
+                if line.qty_delta < 0:
+                    key = (line.product_id, line.variation_id)
+                    out_demand[key] = out_demand.get(key, Decimal("0")) + abs(
+                        line.qty_delta
+                    )
+            for (product_id, variation_id), qty in out_demand.items():
+                if not await check_sufficient_stock(
+                    db, business_id, data.branch_id, product_id, variation_id, qty
+                ):
+                    product = await verify_product(db, product_id, business_id)
                     raise HTTPException(
                         status_code=status.HTTP_400_BAD_REQUEST,
                         detail=f"Insufficient stock for {product.name}",
@@ -139,7 +164,7 @@ async def create_stock_adjustment(
                 product_id=line_data.product_id,
                 variation_id=line_data.variation_id,
                 qty_delta=line_data.qty_delta,
-                cost_per_unit=line_data.cost_per_unit,
+                cost_per_unit=Decimal("0"),
                 notes=line_data.notes,
                 created_by=created_by,
                 created_at=now,
@@ -148,26 +173,61 @@ async def create_stock_adjustment(
             db.add(adj_line)
             await db.flush()
 
-            movement_type = (
-                StockMovementTypeEnum.adjustment_in
-                if line_data.qty_delta > 0
-                else StockMovementTypeEnum.adjustment_out
-            )
-            await create_stock_movement(
-                db=db,
-                business_id=business_id,
-                branch_id=data.branch_id,
-                product_id=line_data.product_id,
-                variation_id=line_data.variation_id,
-                movement_type=movement_type,
-                qty=line_data.qty_delta,
-                cost_per_unit=line_data.cost_per_unit,
-                reference_type=ReferenceTypeEnum.stock_adjustment_line,
-                reference_id=adj_line.id,
-                created_by=created_by,
-                notes=line_data.notes,
-                movement_at=adjusted_at,
-            )
+            if line_data.qty_delta > 0:
+                if (
+                    data.reason == AdjustmentReasonEnum.opening_balance
+                    and line_data.cost_per_unit is not None
+                ):
+                    unit_cost = line_data.cost_per_unit
+                else:
+                    unit_cost = await get_fallback_cost_per_unit(
+                        db, business_id, line_data.product_id, line_data.variation_id
+                    )
+                layer = await create_fifo_layer(
+                    db,
+                    business_id=business_id,
+                    branch_id=data.branch_id,
+                    product_id=line_data.product_id,
+                    variation_id=line_data.variation_id,
+                    qty=line_data.qty_delta,
+                    cost_per_unit=unit_cost,
+                    created_by=created_by,
+                    source="adjustment",
+                    created_at=adjusted_at,
+                )
+                adj_line.cost_per_unit = layer.cost_per_unit
+                await create_stock_movement(
+                    db=db,
+                    business_id=business_id,
+                    branch_id=data.branch_id,
+                    product_id=line_data.product_id,
+                    variation_id=line_data.variation_id,
+                    movement_type=StockMovementTypeEnum.adjustment_in,
+                    qty=line_data.qty_delta,
+                    cost_per_unit=layer.cost_per_unit,
+                    reference_type=ReferenceTypeEnum.stock_adjustment_line,
+                    reference_id=adj_line.id,
+                    created_by=created_by,
+                    purchase_line_id=layer.id,
+                    notes=line_data.notes,
+                    movement_at=adjusted_at,
+                )
+            else:
+                weighted, _slices, _short = await consume_to_movements(
+                    db,
+                    business_id=business_id,
+                    branch_id=data.branch_id,
+                    product_id=line_data.product_id,
+                    variation_id=line_data.variation_id,
+                    qty=abs(line_data.qty_delta),
+                    movement_type=StockMovementTypeEnum.adjustment_out,
+                    reference_type=ReferenceTypeEnum.stock_adjustment_line,
+                    reference_id=adj_line.id,
+                    created_by=created_by,
+                    movement_at=adjusted_at,
+                    notes=line_data.notes,
+                )
+                adj_line.cost_per_unit = weighted
 
         await db.commit()
     except HTTPException:

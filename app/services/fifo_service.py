@@ -4,7 +4,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
-from decimal import Decimal
+from decimal import ROUND_HALF_UP, Decimal
 from uuid import UUID
 
 from sqlalchemy import select, text
@@ -18,12 +18,17 @@ from app.models.enums import (
 )
 from app.models.inventory import PurchaseLine, StockMovement
 from app.models.product import Product
-from app.services.invoice_service import _round2
 from app.services.notification_service import create_notification
 from app.services.stock_service import create_stock_movement, verify_product
 
 _ZERO = Decimal("0")
+_FOUR_DP = Decimal("0.0001")
 _ALERT_LOOKBACK = timedelta(hours=24)
+
+
+def _round4(value: Decimal) -> Decimal:
+    """Unit costs carry 4 decimals everywhere (Python, columns, get_fifo_cost())."""
+    return value.quantize(_FOUR_DP, rounding=ROUND_HALF_UP)
 
 
 @dataclass(frozen=True)
@@ -40,7 +45,7 @@ def compute_weighted_cost_per_unit(
     if total_qty <= _ZERO:
         return _ZERO
     total_cost = sum((s.qty * s.cost_per_unit for s in slices), _ZERO)
-    return _round2(total_cost / total_qty)
+    return _round4(total_cost / total_qty)
 
 
 async def get_fallback_cost_per_unit(
@@ -49,40 +54,66 @@ async def get_fallback_cost_per_unit(
     product_id: UUID,
     variation_id: UUID | None,
 ) -> Decimal:
-    stmt = (
+    """Last known cost of the product, used when no FIFO layer can supply a unit.
+
+    There is no stored product cost price, so it is derived from history: the
+    newest positive-cost layer (purchase, receipt, production, adjustment), then
+    the newest positive-cost stock movement. Zero only when the product has never
+    had a cost; callers flag such lines ``cost_estimated`` either way.
+    """
+    layer_stmt = (
         select(PurchaseLine.cost_per_unit)
         .where(
             PurchaseLine.business_id == business_id,
             PurchaseLine.product_id == product_id,
             PurchaseLine.deleted_at.is_(None),
+            PurchaseLine.cost_per_unit > _ZERO,
+            PurchaseLine.received_qty > _ZERO,
         )
-        .order_by(PurchaseLine.created_at.desc())
+        .order_by(PurchaseLine.created_at.desc(), PurchaseLine.id.desc())
+        .limit(1)
+    )
+    movement_stmt = (
+        select(StockMovement.cost_per_unit)
+        .where(
+            StockMovement.business_id == business_id,
+            StockMovement.product_id == product_id,
+            StockMovement.deleted_at.is_(None),
+            StockMovement.qty > _ZERO,
+            StockMovement.cost_per_unit > _ZERO,
+        )
+        .order_by(StockMovement.movement_at.desc(), StockMovement.id.desc())
         .limit(1)
     )
     if variation_id is None:
-        stmt = stmt.where(PurchaseLine.variation_id.is_(None))
+        layer_stmt = layer_stmt.where(PurchaseLine.variation_id.is_(None))
+        movement_stmt = movement_stmt.where(StockMovement.variation_id.is_(None))
     else:
-        stmt = stmt.where(PurchaseLine.variation_id == variation_id)
+        layer_stmt = layer_stmt.where(PurchaseLine.variation_id == variation_id)
+        movement_stmt = movement_stmt.where(StockMovement.variation_id == variation_id)
 
-    last_cost = (await db.execute(stmt)).scalar_one_or_none()
-    if last_cost is not None:
-        return Decimal(str(last_cost))
+    for stmt in (layer_stmt, movement_stmt):
+        cost = (await db.execute(stmt)).scalar_one_or_none()
+        if cost is not None:
+            return _round4(Decimal(str(cost)))
     return _ZERO
 
 
 async def consume_fifo_layers(
     db: AsyncSession,
     business_id: UUID,
+    branch_id: UUID,
     product_id: UUID,
     variation_id: UUID | None,
     qty: Decimal,
 ) -> tuple[list[FifoLayerConsumption], Decimal]:
-    """Consume oldest layers first; return layer slices and any uncovered shortfall."""
+    """Consume the branch's oldest layers first; return slices and any uncovered shortfall."""
     if qty <= _ZERO:
         return [], _ZERO
 
     filters = [
         PurchaseLine.business_id == business_id,
+        PurchaseLine.branch_id == branch_id,
         PurchaseLine.product_id == product_id,
         PurchaseLine.deleted_at.is_(None),
         PurchaseLine.qty_remaining > _ZERO,
@@ -95,11 +126,9 @@ async def consume_fifo_layers(
     result = await db.execute(
         select(PurchaseLine)
         .where(*filters)
-        .order_by(
-            PurchaseLine.updated_at.asc(),
-            PurchaseLine.created_at.asc(),
-            PurchaseLine.id.asc(),
-        )
+        # Age only: ordering by updated_at let a partial consumption push a layer
+        # behind newer ones.
+        .order_by(PurchaseLine.created_at.asc(), PurchaseLine.id.asc())
         .with_for_update()
     )
     layers = list(result.scalars().all())
@@ -257,13 +286,19 @@ def plan_lifo_restoration(
 async def allocate_sale_line_fifo(
     db: AsyncSession,
     business_id: UUID,
+    branch_id: UUID,
     product_id: UUID,
     variation_id: UUID | None,
     qty: Decimal,
 ) -> tuple[Decimal, list[FifoLayerConsumption], Decimal]:
-    """Layer consumption + optional fallback slice; returns weighted unit cost."""
+    """Layer consumption + fallback slice for any shortfall; returns weighted unit cost.
+
+    The third value is the quantity no layer could cover. Its cost is the
+    product's last known cost, never zero by default; callers flag the line
+    ``cost_estimated`` whenever it is positive.
+    """
     layer_consumptions, short_qty = await consume_fifo_layers(
-        db, business_id, product_id, variation_id, qty
+        db, business_id, branch_id, product_id, variation_id, qty
     )
     slices = list(layer_consumptions)
     if short_qty > _ZERO:
@@ -278,6 +313,94 @@ async def allocate_sale_line_fifo(
             )
         )
     weighted = compute_weighted_cost_per_unit(qty, slices)
+    return weighted, slices, short_qty
+
+
+async def create_fifo_layer(
+    db: AsyncSession,
+    *,
+    business_id: UUID,
+    branch_id: UUID,
+    product_id: UUID,
+    variation_id: UUID | None,
+    qty: Decimal,
+    cost_per_unit: Decimal,
+    created_by: UUID,
+    source: str,
+    created_at: datetime | None = None,
+    batch_number: str | None = None,
+    expiry_date=None,
+) -> PurchaseLine:
+    """Open a new cost layer at ``branch_id`` holding ``qty`` units."""
+    now = created_at or datetime.now(timezone.utc)
+    layer = PurchaseLine(
+        business_id=business_id,
+        purchase_order_id=None,
+        product_id=product_id,
+        variation_id=variation_id,
+        branch_id=branch_id,
+        layer_source=source,
+        ordered_qty=qty,
+        received_qty=qty,
+        qty_remaining=qty,
+        cost_per_unit=_round4(cost_per_unit),
+        tax_rate=_ZERO,
+        batch_number=batch_number,
+        expiry_date=expiry_date,
+        created_at=now,
+        updated_at=now,
+        created_by=created_by,
+    )
+    db.add(layer)
+    await db.flush()
+    return layer
+
+
+async def consume_to_movements(
+    db: AsyncSession,
+    *,
+    business_id: UUID,
+    branch_id: UUID,
+    product_id: UUID,
+    variation_id: UUID | None,
+    qty: Decimal,
+    movement_type: StockMovementTypeEnum,
+    reference_type: ReferenceTypeEnum,
+    reference_id: UUID,
+    created_by: UUID,
+    movement_at: datetime,
+    batch_number: str | None = None,
+    expiry_date=None,
+    notes: str | None = None,
+) -> tuple[Decimal, list[FifoLayerConsumption], Decimal]:
+    """Take ``qty`` out of the branch layers, one outgoing movement per slice.
+
+    Used by adjustments, waste and transfers so cost is always server-derived.
+    Returns (weighted unit cost, slices, uncovered qty).
+    """
+    weighted, slices, short_qty = await allocate_sale_line_fifo(
+        db, business_id, branch_id, product_id, variation_id, qty
+    )
+    for index, piece in enumerate(slices):
+        await create_stock_movement(
+            db=db,
+            business_id=business_id,
+            branch_id=branch_id,
+            product_id=product_id,
+            variation_id=variation_id,
+            movement_type=movement_type,
+            qty=-piece.qty,
+            cost_per_unit=piece.cost_per_unit,
+            reference_type=reference_type,
+            reference_id=reference_id,
+            created_by=created_by,
+            purchase_line_id=piece.purchase_line_id,
+            batch_number=batch_number,
+            expiry_date=expiry_date,
+            notes=notes,
+            movement_at=movement_at,
+            movement_sequence=index,
+        )
     return weighted, slices, short_qty
 
 
@@ -312,6 +435,55 @@ async def create_sale_line_stock_movements(
         )
 
 
+async def _restore_untraced(
+    db: AsyncSession,
+    *,
+    business_id: UUID,
+    branch_id: UUID,
+    product_id: UUID,
+    variation_id: UUID | None,
+    qty: Decimal,
+    cost_per_unit: Decimal,
+    movement_type: StockMovementTypeEnum,
+    reference_type: ReferenceTypeEnum,
+    reference_id: UUID,
+    created_by: UUID,
+    movement_at: datetime,
+) -> None:
+    """Put back units that were sold without a layer (or whose layer is gone).
+
+    A fresh layer at the original sale cost keeps stock balance and layer
+    quantity in step.
+    """
+    layer = await create_fifo_layer(
+        db,
+        business_id=business_id,
+        branch_id=branch_id,
+        product_id=product_id,
+        variation_id=variation_id,
+        qty=qty,
+        cost_per_unit=cost_per_unit,
+        created_by=created_by,
+        source="return",
+        created_at=movement_at,
+    )
+    await create_stock_movement(
+        db=db,
+        business_id=business_id,
+        branch_id=branch_id,
+        product_id=product_id,
+        variation_id=variation_id,
+        movement_type=movement_type,
+        qty=qty,
+        cost_per_unit=cost_per_unit,
+        reference_type=reference_type,
+        reference_id=reference_id,
+        created_by=created_by,
+        purchase_line_id=layer.id,
+        movement_at=movement_at,
+    )
+
+
 async def restore_sale_line_inventory(
     db: AsyncSession,
     *,
@@ -333,15 +505,15 @@ async def restore_sale_line_inventory(
         db, business_id, sale_line_id
     )
     if not traced:
-        await create_stock_movement(
-            db=db,
+        await _restore_untraced(
+            db,
             business_id=business_id,
             branch_id=branch_id,
             product_id=product_id,
             variation_id=variation_id,
-            movement_type=movement_type,
             qty=qty_to_restore,
             cost_per_unit=sale_line_cost_per_unit,
+            movement_type=movement_type,
             reference_type=reference_type,
             reference_id=reference_id,
             created_by=created_by,
@@ -382,15 +554,15 @@ async def restore_sale_line_inventory(
 
     if remaining > _ZERO and untraced_total > _ZERO:
         legacy_qty = min(remaining, untraced_total)
-        await create_stock_movement(
-            db=db,
+        await _restore_untraced(
+            db,
             business_id=business_id,
             branch_id=branch_id,
             product_id=product_id,
             variation_id=variation_id,
-            movement_type=movement_type,
             qty=legacy_qty,
             cost_per_unit=sale_line_cost_per_unit,
+            movement_type=movement_type,
             reference_type=reference_type,
             reference_id=reference_id,
             created_by=created_by,
@@ -487,19 +659,19 @@ async def maybe_notify_fifo_shortfall(
 async def get_fifo_cost_from_db(
     db: AsyncSession,
     business_id: UUID,
+    branch_id: UUID | None,
     product_id: UUID,
     variation_id: UUID | None,
     qty: Decimal,
 ) -> Decimal | None:
-    """Read-only weighted FIFO cost via existing SQL function (for tests/comparison)."""
-    from sqlalchemy import text
-
+    """Read-only weighted FIFO cost via the SQL function (for tests/comparison)."""
     try:
         async with db.begin_nested():
             result = await db.execute(
-                text("SELECT get_fifo_cost(:bid, :pid, :vid, :qty)"),
+                text("SELECT get_fifo_cost(:bid, :brid, :pid, :vid, :qty)"),
                 {
                     "bid": business_id,
+                    "brid": branch_id,
                     "pid": product_id,
                     "vid": variation_id,
                     "qty": qty,

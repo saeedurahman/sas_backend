@@ -5,6 +5,7 @@ import logging
 from fastapi import FastAPI
 from fastapi.responses import JSONResponse
 from sqlalchemy import text
+from sqlalchemy.exc import TimeoutError as SATimeoutError
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.openapi.utils import get_openapi
 from fastapi.security import HTTPBearer  # noqa: F401 — BearerAuth scheme for Swagger
@@ -80,6 +81,17 @@ app = FastAPI(
     lifespan=lifespan,
     swagger_ui_parameters={"persistAuthorization": True},
 )
+
+
+@app.exception_handler(SATimeoutError)
+async def _pool_exhausted_handler(request, exc):
+    """Pool saturation is overload, not a bug: tell clients to retry."""
+    logging.getLogger("app").warning("db pool exhausted: %s", request.url.path)
+    return JSONResponse(
+        status_code=503,
+        content={"detail": "Server is busy, retry shortly"},
+        headers={"Retry-After": "1"},
+    )
 
 
 def custom_openapi():

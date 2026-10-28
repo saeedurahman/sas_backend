@@ -45,6 +45,11 @@ class Settings(BaseSettings):
     refresh_token_expire_days: int = Field(
         default=30, validation_alias="REFRESH_TOKEN_EXPIRE_DAYS"
     )
+    # A retry with the token that was *just* rotated out (lost response, double
+    # submit) gets the same new pair back instead of revoking the whole family.
+    refresh_grace_seconds: int = Field(
+        default=30, validation_alias="REFRESH_GRACE_SECONDS"
+    )
     pin_token_expire_hours: int = Field(
         default=12, validation_alias="PIN_TOKEN_EXPIRE_HOURS"
     )
@@ -66,6 +71,9 @@ class Settings(BaseSettings):
     trust_forwarded_for: bool = Field(
         default=False, validation_alias="TRUST_FORWARDED_FOR"
     )
+    db_pool_size: int = Field(default=10, validation_alias="DB_POOL_SIZE")
+    db_max_overflow: int = Field(default=20, validation_alias="DB_MAX_OVERFLOW")
+    db_pool_timeout: int = Field(default=10, validation_alias="DB_POOL_TIMEOUT")
     log_level: str = Field(default="INFO", validation_alias="LOG_LEVEL")
 
     # Rate limiting ("<count>/<second|minute|hour|day>"); disable with RATE_LIMIT_ENABLED=false.

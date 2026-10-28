@@ -20,13 +20,13 @@ def test_void_completed_cash_sale(
     pos_tenant,
 ) -> None:
     tenant = pos_tenant
-    assert tenant.manager_headers is not None
+    assert tenant.owner_headers is not None
     assert tenant.product_id is not None
     assert tenant.shift_id is not None
 
     sale = http_client.post(
         f"{api_base}/sales",
-        headers=tenant.manager_headers,
+        headers=tenant.owner_headers,
         json=create_sale_payload(
             branch_id=tenant.branch_id,
             product_id=tenant.product_id,
@@ -44,7 +44,7 @@ def test_void_completed_cash_sale(
 
     void = http_client.post(
         f"{api_base}/sales/{sale_id}/void",
-        headers=tenant.manager_headers,
+        headers=tenant.owner_headers,
     )
     assert_status(void, 200, label="void cash sale HTTP 200")
     assert void.json()["status"] == "voided"
@@ -87,7 +87,7 @@ def test_void_blocked_when_shift_closed(
     ).json()["id"]
     shift2_resp = http_client.post(
         f"{api_base}/shifts/open",
-        headers=tenant.owner_headers,
+        headers=tenant.manager_headers,
         json={"cash_register_id": reg2, "opening_float": "100.00"},
     )
     assert_status(shift2_resp, 201, label="closed shift setup open")
@@ -122,13 +122,13 @@ def test_partially_paid_cancel_reversal(
     pos_tenant,
 ) -> None:
     tenant = pos_tenant
-    assert tenant.manager_headers is not None
+    assert tenant.owner_headers is not None
     assert tenant.product_id is not None
     assert tenant.shift_id is not None
 
     sale = http_client.post(
         f"{api_base}/sales",
-        headers=tenant.manager_headers,
+        headers=tenant.owner_headers,
         json=create_sale_payload(
             branch_id=tenant.branch_id,
             product_id=tenant.product_id,
@@ -149,7 +149,7 @@ def test_partially_paid_cancel_reversal(
 
     cancel = http_client.put(
         f"{api_base}/sales/{body['id']}/cancel",
-        headers=tenant.manager_headers,
+        headers=tenant.owner_headers,
     )
     assert_status(cancel, 200, label="partially paid cancel HTTP 200")
 

@@ -2,7 +2,7 @@ import uuid
 from datetime import datetime
 from typing import TYPE_CHECKING
 
-from sqlalchemy import Boolean, DateTime, ForeignKey, SmallInteger, String, Text, Uuid
+from sqlalchemy import Boolean, DateTime, ForeignKey, Integer, SmallInteger, String, Text, Uuid
 from sqlalchemy.orm import Mapped, mapped_column, relationship
 
 from app.models.base import (
@@ -49,6 +49,11 @@ class User(Base, AuditMixin, SoftDeleteMixin, SyncMixin):
     )
     password_changed_at: Mapped[datetime | None] = mapped_column(
         DateTime(timezone=True), nullable=True
+    )
+    # Bumped on password/PIN change, reset and deactivation; access tokens carry
+    # the value they were issued under ("tv") and are rejected on mismatch.
+    token_version: Mapped[int] = mapped_column(
+        Integer, nullable=False, default=0, server_default="0"
     )
     status: Mapped[str] = mapped_column(
         user_status_enum, nullable=False, default="active"
@@ -102,9 +107,11 @@ class Role(Base, AuditMixin, SoftDeleteMixin, SyncMixin):
         back_populates="role",
         lazy="selectin",
     )
+    # Reverse side only; auto-loading it pulled every holder of the role (and
+    # their roles) into each authenticated request.
     user_roles: Mapped[list["UserRole"]] = relationship(
         back_populates="role",
-        lazy="selectin",
+        lazy="noload",
     )
 
 
@@ -118,9 +125,11 @@ class Permission(Base, TimestampMixin):
     module: Mapped[str] = mapped_column(String(50), nullable=False)
     description: Mapped[str | None] = mapped_column(Text, nullable=True)
 
+    # Reverse side only. A permission is shared by every tenant, so eager
+    # loading this fetched all role_permissions rows of all businesses per request.
     role_permissions: Mapped[list["RolePermission"]] = relationship(
         back_populates="permission",
-        lazy="selectin",
+        lazy="noload",
     )
 
 

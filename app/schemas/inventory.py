@@ -116,7 +116,8 @@ class CreateAdjustmentLineRequest(BaseSchema):
     product_id: UUID
     variation_id: UUID | None = None
     qty_delta: Decimal
-    cost_per_unit: Decimal
+    # Ignored: cost is derived from FIFO layers (opening_balance adjustments excepted).
+    cost_per_unit: Decimal | None = None
     notes: str | None = None
 
     @field_validator("qty_delta")
@@ -128,8 +129,8 @@ class CreateAdjustmentLineRequest(BaseSchema):
 
     @field_validator("cost_per_unit")
     @classmethod
-    def validate_cost(cls, value: Decimal) -> Decimal:
-        if value < 0:
+    def validate_cost(cls, value: Decimal | None) -> Decimal | None:
+        if value is not None and value < 0:
             raise ValueError("cost_per_unit cannot be negative")
         return value
 
@@ -152,7 +153,8 @@ class CreateTransferLineRequest(BaseSchema):
     product_id: UUID
     variation_id: UUID | None = None
     qty: Decimal
-    cost_per_unit: Decimal
+    # Ignored: cost is derived from FIFO layers.
+    cost_per_unit: Decimal | None = None
 
     @field_validator("qty")
     @classmethod
@@ -163,8 +165,8 @@ class CreateTransferLineRequest(BaseSchema):
 
     @field_validator("cost_per_unit")
     @classmethod
-    def validate_cost(cls, value: Decimal) -> Decimal:
-        if value < 0:
+    def validate_cost(cls, value: Decimal | None) -> Decimal | None:
+        if value is not None and value < 0:
             raise ValueError("cost_per_unit cannot be negative")
         return value
 
@@ -188,7 +190,8 @@ class CreateWasteLineRequest(BaseSchema):
     product_id: UUID
     variation_id: UUID | None = None
     qty: Decimal
-    cost_per_unit: Decimal
+    # Ignored: cost is derived from FIFO layers.
+    cost_per_unit: Decimal | None = None
     batch_number: str | None = None
     expiry_date: date | None = None
 
@@ -201,8 +204,8 @@ class CreateWasteLineRequest(BaseSchema):
 
     @field_validator("cost_per_unit")
     @classmethod
-    def validate_cost(cls, value: Decimal) -> Decimal:
-        if value < 0:
+    def validate_cost(cls, value: Decimal | None) -> Decimal | None:
+        if value is not None and value < 0:
             raise ValueError("cost_per_unit cannot be negative")
         return value
 

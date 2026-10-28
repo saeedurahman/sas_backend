@@ -1,5 +1,6 @@
 """Waste entry services."""
 
+from decimal import Decimal
 from uuid import UUID
 
 from fastapi import HTTPException, status
@@ -10,7 +11,9 @@ from sqlalchemy.orm import selectinload
 from app.models.enums import ReferenceTypeEnum, StockMovementTypeEnum
 from app.models.inventory import WasteEntry, WasteEntryLine
 from app.schemas.inventory import CreateWasteEntryRequest
+from app.services.fifo_service import consume_to_movements
 from app.services.stock_service import (
+    lock_stock_positions,
     _now,
     check_sufficient_stock,
     create_stock_movement,
@@ -81,6 +84,7 @@ async def create_waste_entry(
     data: CreateWasteEntryRequest,
     created_by: UUID,
 ) -> WasteEntry:
+    """Waste consumes the branch's FIFO layers; the line cost is derived, not sent."""
     now = _now()
     wasted_at = data.wasted_at or now
     allow_negative = await get_allow_negative_stock(db, business_id)
@@ -89,21 +93,29 @@ async def create_waste_entry(
         await verify_branch(db, data.branch_id, business_id)
 
         for line in data.lines:
-            product = await verify_product(db, line.product_id, business_id)
+            await verify_product(db, line.product_id, business_id)
             if line.variation_id is not None:
                 await verify_variation(
                     db, line.variation_id, line.product_id, business_id
                 )
-            if not allow_negative:
-                sufficient = await check_sufficient_stock(
-                    db,
-                    business_id,
-                    data.branch_id,
-                    line.product_id,
-                    line.variation_id,
-                    line.qty,
-                )
-                if not sufficient:
+
+        await lock_stock_positions(
+            db,
+            business_id,
+            data.branch_id,
+            [(l.product_id, l.variation_id) for l in data.lines],
+        )
+
+        if not allow_negative:
+            demand: dict[tuple[UUID, UUID | None], Decimal] = {}
+            for line in data.lines:
+                key = (line.product_id, line.variation_id)
+                demand[key] = demand.get(key, Decimal("0")) + line.qty
+            for (product_id, variation_id), qty in demand.items():
+                if not await check_sufficient_stock(
+                    db, business_id, data.branch_id, product_id, variation_id, qty
+                ):
+                    product = await verify_product(db, product_id, business_id)
                     raise HTTPException(
                         status_code=status.HTTP_400_BAD_REQUEST,
                         detail=f"Insufficient stock for {product.name}",
@@ -138,7 +150,7 @@ async def create_waste_entry(
                 product_id=line_data.product_id,
                 variation_id=line_data.variation_id,
                 qty=line_data.qty,
-                cost_per_unit=line_data.cost_per_unit,
+                cost_per_unit=Decimal("0"),
                 batch_number=line_data.batch_number,
                 expiry_date=line_data.expiry_date,
                 created_by=created_by,
@@ -148,22 +160,22 @@ async def create_waste_entry(
             db.add(waste_line)
             await db.flush()
 
-            await create_stock_movement(
-                db=db,
+            weighted, _slices, _short = await consume_to_movements(
+                db,
                 business_id=business_id,
                 branch_id=data.branch_id,
                 product_id=line_data.product_id,
                 variation_id=line_data.variation_id,
+                qty=line_data.qty,
                 movement_type=StockMovementTypeEnum.waste,
-                qty=-line_data.qty,
-                cost_per_unit=line_data.cost_per_unit,
                 reference_type=ReferenceTypeEnum.waste_entry_line,
                 reference_id=waste_line.id,
                 created_by=created_by,
+                movement_at=wasted_at,
                 batch_number=line_data.batch_number,
                 expiry_date=line_data.expiry_date,
-                movement_at=wasted_at,
             )
+            waste_line.cost_per_unit = weighted
 
         await db.commit()
     except HTTPException:

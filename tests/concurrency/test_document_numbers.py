@@ -75,6 +75,17 @@ def _setup_tenant(client: httpx.Client, api_base: str, suffix: int) -> dict:
         },
     )
 
+    register = client.post(
+        f"{api_base}/registers",
+        headers=headers,
+        json={"name": f"Reg {suffix}", "branch_id": branch_id},
+    )
+    client.post(
+        f"{api_base}/shifts/open",
+        headers=headers,
+        json={"cash_register_id": register.json()["id"], "opening_float": "0"},
+    )
+
     return {
         "headers": headers,
         "branch_id": branch_id,
@@ -85,7 +96,10 @@ def _setup_tenant(client: httpx.Client, api_base: str, suffix: int) -> dict:
 
 
 def _today_key() -> str:
-    return datetime.now(timezone.utc).strftime("%Y%m%d")
+    # Document numbers follow the business timezone (default Asia/Karachi).
+    from zoneinfo import ZoneInfo
+
+    return datetime.now(ZoneInfo("Asia/Karachi")).strftime("%Y%m%d")
 
 
 def _create_sale(client: httpx.Client, api_base: str, ctx: dict) -> httpx.Response:

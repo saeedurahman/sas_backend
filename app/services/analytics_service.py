@@ -49,8 +49,9 @@ _DAY_NAMES = [
 ]
 
 
-def _today() -> date:
-    return datetime.now(timezone.utc).date()
+async def _today(db: AsyncSession) -> date:
+    """Today in the business timezone (the request sets the session TimeZone)."""
+    return (await db.execute(text("SELECT CURRENT_DATE"))).scalar_one()
 
 
 def _dec(value) -> Decimal:
@@ -163,7 +164,7 @@ async def get_dashboard_summary(
     business_id: UUID,
     branch_id: UUID | None = None,
 ) -> DashboardSummaryResponse:
-    today = _today()
+    today = await _today(db)
     branch_sql = _branch_clause(branch_id, "s")
     params: dict = {"business_id": business_id, "today": today}
 
@@ -1400,7 +1401,7 @@ async def get_today_vs_yesterday(
     business_id: UUID,
     branch_id: UUID | None = None,
 ) -> TodayVsYesterdayResponse:
-    today = _today()
+    today = await _today(db)
     yesterday = today - timedelta(days=1)
 
     (
@@ -1451,7 +1452,7 @@ async def get_peak_hours(
 
     sql = f"""
         SELECT
-            EXTRACT(HOUR FROM s.sold_at AT TIME ZONE 'Asia/Karachi')::int AS hour,
+            EXTRACT(HOUR FROM s.sold_at AT TIME ZONE current_setting('TimeZone'))::int AS hour,
             COALESCE(SUM({_line_revenue_expr()}), 0) AS total_revenue,
             COUNT(DISTINCT s.id) AS transaction_count
         {_base_sale_joins()}
@@ -1499,7 +1500,7 @@ async def get_peak_days(
 
     sql = f"""
         SELECT
-            EXTRACT(DOW FROM s.sold_at AT TIME ZONE 'Asia/Karachi')::int AS day_of_week,
+            EXTRACT(DOW FROM s.sold_at AT TIME ZONE current_setting('TimeZone'))::int AS day_of_week,
             COALESCE(SUM({_line_revenue_expr()}), 0) AS total_revenue,
             COUNT(DISTINCT s.id) AS transaction_count
         {_base_sale_joins()}
@@ -1540,7 +1541,7 @@ async def get_product_movement(
     branch_id: UUID | None = None,
     dead_stock_days: int = 30,
 ) -> list[ProductMovementItem]:
-    today = _today()
+    today = await _today(db)
     params: dict = {
         "business_id": business_id,
         "date_from": date_from,
@@ -1633,7 +1634,7 @@ async def get_dead_stock(
     dead_stock_days: int = 30,
     branch_id: UUID | None = None,
 ) -> list[DeadStockItem]:
-    today = _today()
+    today = await _today(db)
     cutoff = today - timedelta(days=dead_stock_days)
     params: dict = {
         "business_id": business_id,
@@ -1982,7 +1983,7 @@ async def get_enhanced_dashboard(
     business_id: UUID,
     branch_id: UUID | None = None,
 ) -> EnhancedDashboardResponse:
-    today = _today()
+    today = await _today(db)
     yesterday = today - timedelta(days=1)
     month_start = today.replace(day=1)
     branch_sql = _branch_clause(branch_id, "s")

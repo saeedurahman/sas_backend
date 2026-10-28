@@ -4,7 +4,7 @@ from uuid import UUID
 from fastapi import APIRouter, Depends, Query, status
 
 from app.database import get_db
-from app.dependencies import require_permission
+from app.dependencies import apply_business_timezone, require_permission
 from app.models.user import User
 from app.schemas.analytics import (
     BranchComparisonItem,
@@ -57,7 +57,11 @@ from app.services.analytics_service import (
     get_top_products,
 )
 
-router = APIRouter(prefix="/analytics", tags=["Analytics"])
+router = APIRouter(
+    prefix="/analytics",
+    tags=["Analytics"],
+    dependencies=[Depends(apply_business_timezone)],
+)
 
 
 @router.get(

@@ -126,6 +126,11 @@ def test_sales_module_permissions(
         "lines": [{"product_id": product_id, "qty": "1", "unit_price": "25.00"}],
         "payments": [{"payment_method": "cash", "amount": "25.00"}],
     }
+    # sales post to the caller's own open shift
+    from tests.helpers.phase2 import open_shift_for
+
+    open_shift_for(http_client, tenant, manager_headers)
+    open_shift_for(http_client, tenant, cashier_headers)
     sale_mgr = http_client.post(f"{api_base}/sales", headers=manager_headers, json=sale_body)
     assert_status(sale_mgr, 201, label="POST /sales (manager)")
     sale_id = sale_mgr.json()["id"]

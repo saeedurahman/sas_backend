@@ -9,7 +9,12 @@ from sqlalchemy import func, select
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.orm import selectinload
 
-from app.models.enums import PurchaseOrderStatusEnum, ReferenceTypeEnum, StockMovementTypeEnum
+from app.models.enums import (
+    LedgerEntryTypeEnum,
+    PurchaseOrderStatusEnum,
+    ReferenceTypeEnum,
+    StockMovementTypeEnum,
+)
 from app.models.inventory import (
     PurchaseLine,
     PurchaseOrder,
@@ -24,7 +29,9 @@ from app.services.stock_service import (
     verify_product,
     verify_variation,
 )
+from app.services.fifo_service import _round4, create_fifo_layer
 from app.services.stock_service import create_stock_movement
+from app.services.supplier_ledger_service import create_supplier_ledger_entry
 from app.services.supplier_service import get_supplier_by_id
 
 
@@ -146,6 +153,8 @@ async def create_purchase_order(
                 purchase_order_id=po.id,
                 product_id=line_data.product_id,
                 variation_id=line_data.variation_id,
+                branch_id=data.branch_id,
+                layer_source="purchase",
                 ordered_qty=line_data.ordered_qty,
                 received_qty=Decimal("0"),
                 qty_remaining=Decimal("0"),
@@ -242,6 +251,10 @@ async def _update_po_status_from_receipt(
     po.updated_at = now
 
 
+def _bad_request(detail: str) -> HTTPException:
+    return HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail=detail)
+
+
 async def create_purchase_receipt(
     db: AsyncSession,
     business_id: UUID,
@@ -257,20 +270,81 @@ async def create_purchase_receipt(
 
         po: PurchaseOrder | None = None
         if data.purchase_order_id is not None:
+            # Serialize receipts against one PO: status roll-up and over-receipt
+            # caps are computed from rows this transaction now owns.
+            await db.execute(
+                select(PurchaseOrder.id)
+                .where(
+                    PurchaseOrder.id == data.purchase_order_id,
+                    PurchaseOrder.business_id == business_id,
+                )
+                .with_for_update()
+            )
             po = await get_purchase_order_by_id(
                 db, data.purchase_order_id, business_id
             )
             if po.status == "cancelled":
-                raise HTTPException(
-                    status_code=status.HTTP_400_BAD_REQUEST,
-                    detail="Cannot receive goods against a cancelled purchase order",
+                raise _bad_request(
+                    "Cannot receive goods against a cancelled purchase order"
+                )
+            if po.supplier_id != data.supplier_id:
+                raise _bad_request("supplier_id does not match the purchase order")
+            if po.branch_id != data.branch_id:
+                raise _bad_request("branch_id does not match the purchase order")
+
+        # Lock referenced PO lines in id order (no deadlocks between receipts).
+        po_lines: dict[UUID, PurchaseLine] = {}
+        line_ids = sorted(
+            {l.purchase_line_id for l in data.lines if l.purchase_line_id is not None}
+        )
+        if line_ids:
+            if po is None:
+                raise _bad_request(
+                    "purchase_order_id is required when purchase_line_id is given"
+                )
+            locked = await db.execute(
+                select(PurchaseLine)
+                .where(
+                    PurchaseLine.id.in_(line_ids),
+                    PurchaseLine.business_id == business_id,
+                    PurchaseLine.purchase_order_id == po.id,
+                    PurchaseLine.deleted_at.is_(None),
+                )
+                .order_by(PurchaseLine.id)
+                .with_for_update()
+                .execution_options(populate_existing=True)
+            )
+            po_lines = {l.id: l for l in locked.scalars().all()}
+            if any(i not in po_lines for i in line_ids):
+                raise _bad_request(
+                    "Purchase line does not belong to this purchase order"
                 )
 
+        pending_by_line: dict[UUID, Decimal] = {}
         for line in data.lines:
             await verify_product(db, line.product_id, business_id)
             if line.variation_id is not None:
                 await verify_variation(
                     db, line.variation_id, line.product_id, business_id
+                )
+            if line.purchase_line_id is not None:
+                pl = po_lines[line.purchase_line_id]
+                if pl.product_id != line.product_id or pl.variation_id != line.variation_id:
+                    raise _bad_request(
+                        "Receipt line product/variation does not match the purchase line"
+                    )
+                total_in = (
+                    pl.received_qty
+                    + pending_by_line.get(pl.id, Decimal("0"))
+                    + line.qty_received
+                )
+                if total_in > pl.ordered_qty:
+                    raise _bad_request(
+                        f"Over-receipt: ordered {pl.ordered_qty}, already received "
+                        f"{pl.received_qty}, this receipt adds {line.qty_received}"
+                    )
+                pending_by_line[pl.id] = (
+                    pending_by_line.get(pl.id, Decimal("0")) + line.qty_received
                 )
 
         receipt_number = await generate_document_number(
@@ -315,25 +389,42 @@ async def create_purchase_receipt(
             db.add(receipt_line)
             await db.flush()
 
-            purchase_line_id = line_data.purchase_line_id
-            if purchase_line_id is not None:
-                pl_result = await db.execute(
-                    select(PurchaseLine).where(
-                        PurchaseLine.id == purchase_line_id,
-                        PurchaseLine.business_id == business_id,
-                        PurchaseLine.deleted_at.is_(None),
-                    )
-                )
-                purchase_line = pl_result.scalar_one_or_none()
-                if purchase_line is None:
-                    raise HTTPException(
-                        status_code=status.HTTP_400_BAD_REQUEST,
-                        detail="Purchase line not found",
-                    )
+            cost = _round4(line_data.cost_per_unit)
+            layer: PurchaseLine | None = None
+            if line_data.purchase_line_id is not None:
+                purchase_line = po_lines[line_data.purchase_line_id]
+                first_receipt = purchase_line.received_qty == 0
                 purchase_line.received_qty += line_data.qty_received
-                purchase_line.qty_remaining += line_data.qty_received
                 purchase_line.updated_by = created_by
                 purchase_line.updated_at = now
+                # The PO line doubles as the cost layer while the receipt is at
+                # its cost; a different invoiced cost needs a layer of its own.
+                if _round4(purchase_line.cost_per_unit) == cost:
+                    layer = purchase_line
+                    layer.qty_remaining += line_data.qty_received
+                    layer.branch_id = data.branch_id
+                    if first_receipt:
+                        # Layer age is when the goods arrived, not when the PO was typed.
+                        layer.created_at = received_at
+                    if line_data.batch_number is not None:
+                        layer.batch_number = line_data.batch_number
+                    if line_data.expiry_date is not None:
+                        layer.expiry_date = line_data.expiry_date
+            if layer is None:
+                layer = await create_fifo_layer(
+                    db,
+                    business_id=business_id,
+                    branch_id=data.branch_id,
+                    product_id=line_data.product_id,
+                    variation_id=line_data.variation_id,
+                    qty=line_data.qty_received,
+                    cost_per_unit=cost,
+                    created_by=created_by,
+                    source="receipt",
+                    created_at=received_at,
+                    batch_number=line_data.batch_number,
+                    expiry_date=line_data.expiry_date,
+                )
 
             await create_stock_movement(
                 db=db,
@@ -343,15 +434,30 @@ async def create_purchase_receipt(
                 variation_id=line_data.variation_id,
                 movement_type=StockMovementTypeEnum.purchase,
                 qty=line_data.qty_received,
-                cost_per_unit=line_data.cost_per_unit,
+                cost_per_unit=cost,
                 reference_type=ReferenceTypeEnum.purchase_receipt_line,
                 reference_id=receipt_line.id,
                 created_by=created_by,
-                purchase_line_id=purchase_line_id,
+                purchase_line_id=layer.id,
                 batch_number=line_data.batch_number,
                 expiry_date=line_data.expiry_date,
                 movement_at=received_at,
             )
+
+            # We now owe the supplier for what arrived (negative = payable).
+            value = (line_data.qty_received * cost).quantize(Decimal("0.01"))
+            if value > 0:
+                await create_supplier_ledger_entry(
+                    db,
+                    business_id,
+                    data.supplier_id,
+                    LedgerEntryTypeEnum.sale,
+                    -value,
+                    reference_type=ReferenceTypeEnum.purchase_receipt_line.value,
+                    reference_id=receipt_line.id,
+                    notes=f"Goods receipt {receipt_number}",
+                    created_by=created_by,
+                )
 
         if po is not None:
             await _update_po_status_from_receipt(db, po, created_by)

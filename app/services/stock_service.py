@@ -17,6 +17,7 @@ from app.models.enums import ReferenceTypeEnum, StockMovementTypeEnum
 from app.models.inventory import StockMovement
 from app.models.product import Product, ProductVariation
 from app.schemas.inventory import StockBalanceResponse
+from app.services.business_time import get_business_tz, local_date_key
 
 
 def _now() -> datetime:
@@ -30,14 +31,15 @@ async def generate_document_number(
     model: type,
     number_column: InstrumentedAttribute,
 ) -> str:
-    """Return the next `{prefix}-YYYYMMDD-####` for this business and day.
+    """Return the next `{prefix}-YYYYMMDD-####` for this business and its local day.
 
     Uses document_number_counters with INSERT ... ON CONFLICT DO UPDATE for
     atomic increment under concurrency. ``model`` and ``number_column`` are
     retained for call-site compatibility only.
     """
     del model, number_column
-    date_str = _now().strftime("%Y%m%d")
+    zone = await get_business_tz(db, business_id)
+    date_str = local_date_key(zone)
     result = await db.execute(
         text(
             """
@@ -328,3 +330,28 @@ async def check_sufficient_stock(
         db, business_id, branch_id, product_id, variation_id
     )
     return balance >= required_qty
+
+
+async def lock_stock_positions(
+    db: AsyncSession,
+    business_id: UUID,
+    branch_id: UUID,
+    positions: "list[tuple[UUID, UUID | None]]",
+) -> None:
+    """Serialize stock check + consumption per (product, variation, branch).
+
+    Transaction-scoped advisory locks, taken in sorted key order so two requests
+    touching the same products cannot deadlock. Released on commit/rollback.
+    Without this two concurrent sales both see the same balance and oversell.
+    """
+    keys = sorted(
+        {
+            f"stock:{business_id}:{branch_id}:{product_id}:{variation_id or ''}"
+            for product_id, variation_id in positions
+        }
+    )
+    for key in keys:
+        await db.execute(
+            text("SELECT pg_advisory_xact_lock(hashtextextended(:key, 0))"),
+            {"key": key},
+        )

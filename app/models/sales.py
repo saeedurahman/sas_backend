@@ -130,7 +130,7 @@ class TaxRate(Base, AuditMixin, SoftDeleteMixin, SyncMixin):
         nullable=False,
     )
     name: Mapped[str] = mapped_column(String(100), nullable=False)
-    rate: Mapped[Decimal] = mapped_column(Numeric(5, 2), nullable=False)
+    rate: Mapped[Decimal] = mapped_column(Numeric(6, 3), nullable=False)
     is_compound: Mapped[bool] = mapped_column(Boolean, nullable=False, default=False)
     is_active: Mapped[bool] = mapped_column(Boolean, nullable=False, default=True)
     sync_status: Mapped[str] = mapped_column(
@@ -257,6 +257,17 @@ class Sale(Base, AuditMixin, SoftDeleteMixin, SyncMixin):
         lazy="selectin",
     )
 
+    @property
+    def change_given(self) -> Decimal:
+        return sum(
+            (
+                Decimal(str(p.change_given or 0))
+                for p in self.payments
+                if p.deleted_at is None and p.status == "completed"
+            ),
+            Decimal("0"),
+        )
+
 
 class SaleLine(Base, SoftDeleteMixin, SyncMixin):
     __tablename__ = "sale_lines"
@@ -292,12 +303,16 @@ class SaleLine(Base, SoftDeleteMixin, SyncMixin):
     discount_amount: Mapped[Decimal] = mapped_column(
         Numeric(15, 2), nullable=False, default=0
     )
-    tax_rate: Mapped[Decimal] = mapped_column(Numeric(5, 2), nullable=False, default=0)
+    tax_rate: Mapped[Decimal] = mapped_column(Numeric(6, 3), nullable=False, default=0)
     tax_amount: Mapped[Decimal] = mapped_column(
         Numeric(15, 2), nullable=False, default=0
     )
     cost_per_unit: Mapped[Decimal] = mapped_column(
-        Numeric(15, 2), nullable=False, default=0
+        Numeric(15, 4), nullable=False, default=0
+    )
+    # True when FIFO layers could not cover the qty and the cost is a fallback.
+    cost_estimated: Mapped[bool] = mapped_column(
+        Boolean, nullable=False, default=False, server_default="false"
     )
     notes: Mapped[str | None] = mapped_column(Text, nullable=True)
     line_order: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
@@ -339,7 +354,15 @@ class SalePayment(Base, SoftDeleteMixin, SyncMixin):
     payment_method: Mapped[str] = mapped_column(
         payment_method_enum, nullable=False
     )
+    # Amount applied to the sale (net of change handed back).
     amount: Mapped[Decimal] = mapped_column(Numeric(15, 2), nullable=False)
+    # What the customer handed over; only differs from ``amount`` for cash.
+    tendered_amount: Mapped[Decimal | None] = mapped_column(
+        Numeric(15, 2), nullable=True
+    )
+    change_given: Mapped[Decimal] = mapped_column(
+        Numeric(15, 2), nullable=False, default=0, server_default="0"
+    )
     status: Mapped[str] = mapped_column(
         payment_status_enum, nullable=False, default="completed"
     )
@@ -429,6 +452,27 @@ class SaleReturn(Base, SoftDeleteMixin, SyncMixin):
         lazy="selectin",
     )
 
+    @property
+    def total_refund(self) -> Decimal:
+        return sum(
+            (l.line_refund for l in self.lines if l.deleted_at is None), Decimal("0")
+        )
+
+    @property
+    def credit_amount(self) -> Decimal:
+        """Part of the refund settled on the customer account, not paid out."""
+        paid_out = sum(
+            (
+                Decimal(str(p.amount))
+                for p in self.payments
+                if p.deleted_at is None
+                and p.status == "completed"
+                and p.payment_method != "credit"
+            ),
+            Decimal("0"),
+        )
+        return max(self.total_refund - paid_out, Decimal("0"))
+
 
 class SaleReturnLine(Base, SoftDeleteMixin, SyncMixin):
     __tablename__ = "sale_return_lines"
@@ -463,6 +507,10 @@ class SaleReturnLine(Base, SoftDeleteMixin, SyncMixin):
     )
     qty: Mapped[Decimal] = mapped_column(Numeric(15, 4), nullable=False)
     unit_price: Mapped[Decimal] = mapped_column(Numeric(15, 2), nullable=False)
+    # Share of the original line discount that belongs to the returned qty.
+    discount_amount: Mapped[Decimal] = mapped_column(
+        Numeric(15, 2), nullable=False, default=0, server_default="0"
+    )
     tax_amount: Mapped[Decimal] = mapped_column(
         Numeric(15, 2), nullable=False, default=0
     )
@@ -479,6 +527,14 @@ class SaleReturnLine(Base, SoftDeleteMixin, SyncMixin):
         DateTime(timezone=True), nullable=True
     )
     created_by: Mapped[uuid.UUID] = mapped_column(Uuid(as_uuid=True), nullable=False)
+
+    @property
+    def line_refund(self) -> Decimal:
+        return (
+            Decimal(str(self.qty)) * Decimal(str(self.unit_price))
+            - Decimal(str(self.discount_amount or 0))
+            + Decimal(str(self.tax_amount or 0))
+        ).quantize(Decimal("0.01"))
 
     sale_return: Mapped["SaleReturn"] = relationship(
         back_populates="lines",

@@ -123,6 +123,12 @@ def test_users_module_permissions(
             200,
             label="PUT /users/{id}/pin self (cashier)",
         )
+        # a PIN change invalidates the cashier's access tokens: sign in again
+        from tests.helpers.tenants import login as _login
+
+        cashier_headers = _login(
+            http_client, api_base, tenant.cashier_phone, password, label="re-login cashier"
+        )
 
     role_create = http_client.post(
         f"{api_base}/roles",

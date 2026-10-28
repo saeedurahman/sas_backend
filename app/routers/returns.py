@@ -1,7 +1,8 @@
 from uuid import UUID
 
-from fastapi import APIRouter, Depends, Query, status
+from fastapi import APIRouter, Depends, Query, Request, status
 
+from app.core.idempotency import run_idempotent
 from app.database import get_db
 from app.dependencies import require_permission
 from app.models.user import User
@@ -39,12 +40,21 @@ async def list_returns(
     status_code=status.HTTP_201_CREATED,
 )
 async def create_return(
+    request: Request,
     data: CreateSaleReturnRequest,
     current_user: User = Depends(require_permission("sales.returns.create")),
     db=Depends(get_db),
 ):
-    return await create_sale_return(
+    return await run_idempotent(
+        request,
+        business_id=current_user.business_id,
+        user_id=current_user.id,
+        body=data,
+        response_model=SaleReturnResponse,
+        success_status=201,
+        handler=lambda: create_sale_return(
         db, current_user.business_id, data, current_user.id
+    ),
     )
 
 

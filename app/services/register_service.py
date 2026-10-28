@@ -7,6 +7,7 @@ from uuid import UUID
 
 from fastapi import HTTPException, status
 from sqlalchemy import func, select, text
+from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.orm import selectinload
 
@@ -401,7 +402,16 @@ async def open_shift(
         updated_at=now,
     )
     db.add(shift)
-    await db.flush()
+    try:
+        await db.flush()
+    except IntegrityError:
+        # uq_register_shifts_open_register / uq_register_shifts_open_opener:
+        # lost a race with another open-shift request.
+        await db.rollback()
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="A shift is already open for this register or user",
+        ) from None
 
     if data.opening_float > _ZERO:
         opening_tx = RegisterTransaction(
@@ -440,6 +450,8 @@ async def close_shift(
     shift_id: UUID,
     data: CloseShiftRequest,
     closed_by: UUID,
+    *,
+    can_manage_shifts: bool = False,
 ) -> ShiftSummaryResponse:
     result = await db.execute(
         select(RegisterShift)
@@ -460,6 +472,12 @@ async def close_shift(
         raise HTTPException(
             status_code=status.HTTP_400_BAD_REQUEST,
             detail="Shift is already closed",
+        )
+    if shift.opened_by != closed_by and not can_manage_shifts:
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail="Only the user who opened this shift, an owner, or a user with "
+            "shifts.manage can close it",
         )
 
     transactions = await _load_shift_transactions(db, shift_id, business_id)
@@ -520,24 +538,13 @@ async def add_cash_movement(
     data: CreateRegisterTransactionRequest,
     created_by: UUID,
 ) -> RegisterTransaction:
-    result = await db.execute(
-        select(RegisterShift).where(
-            RegisterShift.id == shift_id,
-            RegisterShift.business_id == business_id,
-            RegisterShift.deleted_at.is_(None),
-        )
+    shift = await require_caller_shift(
+        db,
+        business_id,
+        created_by,
+        requested_shift_id=shift_id,
+        action="record a cash movement",
     )
-    shift = result.scalar_one_or_none()
-    if shift is None:
-        raise HTTPException(
-            status_code=status.HTTP_404_NOT_FOUND,
-            detail="Shift not found",
-        )
-    if shift.status != ShiftStatusEnum.open.value:
-        raise HTTPException(
-            status_code=status.HTTP_400_BAD_REQUEST,
-            detail="Shift is not open",
-        )
 
     if data.tx_type not in (
         RegisterTxTypeEnum.cash_in,
@@ -551,7 +558,7 @@ async def add_cash_movement(
     now = _now()
     tx = RegisterTransaction(
         business_id=business_id,
-        register_shift_id=shift_id,
+        register_shift_id=shift.id,
         tx_type=data.tx_type.value,
         payment_method=PaymentMethodEnum.cash.value,
         amount=data.amount,
@@ -630,6 +637,89 @@ async def get_shifts(
     for shift in shifts:
         _attach_shift_user_names(shift)
     return shifts, total
+
+
+async def require_caller_shift(
+    db: AsyncSession,
+    business_id: UUID,
+    user_id: UUID,
+    *,
+    branch_id: UUID | None = None,
+    requested_shift_id: UUID | None = None,
+    action: str = "record this transaction",
+) -> RegisterShift:
+    """The open shift owned by ``user_id``, row-locked; the server derives it.
+
+    Sales, returns and cash movements post against this shift and nothing else.
+    A client-supplied ``requested_shift_id`` is only a consistency check: it must
+    be that same shift. The ``FOR UPDATE`` lock serializes postings with a
+    concurrent close of the shift.
+    """
+    result = await db.execute(
+        select(RegisterShift)
+        .where(
+            RegisterShift.business_id == business_id,
+            RegisterShift.opened_by == user_id,
+            RegisterShift.status == ShiftStatusEnum.open.value,
+            RegisterShift.deleted_at.is_(None),
+        )
+        # NO KEY UPDATE: still exclusive between sales/returns/close, but does not
+        # block the FK checks (KEY SHARE) of register_transactions inserted by a
+        # concurrent void/cancel, which would deadlock against this lock.
+        .with_for_update(key_share=True)
+    )
+    shift = result.scalars().first()
+
+    if shift is None:
+        if requested_shift_id is not None:
+            other = (
+                await db.execute(
+                    select(RegisterShift).where(
+                        RegisterShift.id == requested_shift_id,
+                        RegisterShift.business_id == business_id,
+                        RegisterShift.deleted_at.is_(None),
+                    )
+                )
+            ).scalar_one_or_none()
+            if other is None:
+                raise HTTPException(
+                    status_code=status.HTTP_404_NOT_FOUND, detail="Shift not found"
+                )
+            if other.opened_by != user_id:
+                raise HTTPException(
+                    status_code=status.HTTP_403_FORBIDDEN,
+                    detail="That shift belongs to another user",
+                )
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail=f"Cannot {action} — no open shift. Open a shift first",
+        )
+
+    if requested_shift_id is not None and requested_shift_id != shift.id:
+        owner = (
+            await db.execute(
+                select(RegisterShift.opened_by).where(
+                    RegisterShift.id == requested_shift_id,
+                    RegisterShift.business_id == business_id,
+                )
+            )
+        ).scalar_one_or_none()
+        if owner is not None and owner != user_id:
+            raise HTTPException(
+                status_code=status.HTTP_403_FORBIDDEN,
+                detail="That shift belongs to another user",
+            )
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="register_shift_id does not match your open shift",
+        )
+
+    if branch_id is not None and shift.branch_id != branch_id:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="Your open shift belongs to a different branch",
+        )
+    return shift
 
 
 async def verify_open_register_shift(

@@ -220,7 +220,7 @@ class ProductionLine(Base, TimestampMixin, SyncMixin):
     )
     qty_consumed: Mapped[Decimal] = mapped_column(Numeric(15, 4), nullable=False)
     cost_per_unit: Mapped[Decimal] = mapped_column(
-        Numeric(15, 2), nullable=False, default=0
+        Numeric(15, 4), nullable=False, default=0
     )
     sync_status: Mapped[str] = mapped_column(
         sync_status_enum, nullable=False, default="pending"

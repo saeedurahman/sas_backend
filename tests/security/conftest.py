@@ -13,8 +13,19 @@ from tests.helpers.tenants import TenantContext, create_rbac_users, register_own
 
 @pytest.fixture(scope="session")
 def sec_api() -> str:
-    """Server with relaxed rate limits and MAX_LOGIN_ATTEMPTS=3."""
-    with managed_server() as api_base:
+    """Server with relaxed rate limits, MAX_LOGIN_ATTEMPTS=3 and no refresh grace.
+
+    Grace is off so the strict reuse-detection tests keep their meaning; the
+    grace window itself is covered with ``grace_api``.
+    """
+    with managed_server({"REFRESH_GRACE_SECONDS": "0"}) as api_base:
+        yield api_base
+
+
+@pytest.fixture(scope="session")
+def grace_api() -> str:
+    """Server with a 4 second refresh grace window."""
+    with managed_server({"REFRESH_GRACE_SECONDS": "4"}) as api_base:
         yield api_base
 
 
