@@ -14,6 +14,8 @@ from passlib.context import CryptContext
 
 from app.core.config import settings
 
+_ACCESS_TOKEN_TYPES = {"access", "pin_access"}
+
 pwd_context = CryptContext(schemes=["bcrypt"], deprecated="auto")
 
 
@@ -87,6 +89,8 @@ def decode_token(token: str) -> dict[str, Any]:
         )
     except InvalidTokenError as exc:
         raise TokenError("Invalid or expired token") from exc
+    if payload.get("type") not in _ACCESS_TOKEN_TYPES:
+        raise TokenError("Not an access token")
     return payload
 
 
@@ -100,6 +104,8 @@ def decode_refresh_token(token: str) -> dict[str, Any]:
         )
     except InvalidTokenError as exc:
         raise TokenError("Invalid or expired token") from exc
+    if payload.get("type") != "refresh":
+        raise TokenError("Not a refresh token")
     return payload
 
 

@@ -4,7 +4,7 @@ from uuid import UUID
 from pydantic import Field, field_validator, model_validator
 
 from app.schemas.base import AuditSchema, BaseSchema
-from app.validators import validate_password, validate_phone, validate_pin
+from app.validators import validate_new_pin, validate_password, validate_phone
 
 
 class PermissionResponse(BaseSchema):
@@ -133,8 +133,21 @@ class AssignUserRolesRequest(BaseSchema):
 
 class SetPinRequest(BaseSchema):
     pin_code: str
+    # Required when changing your own PIN (one of the two); ignored when an
+    # owner sets another user's PIN.
+    current_password: str | None = Field(default=None, min_length=1)
+    current_pin: str | None = Field(default=None, min_length=1, max_length=16)
 
     @field_validator("pin_code")
     @classmethod
     def check_pin(cls, value: str) -> str:
-        return validate_pin(value)
+        return validate_new_pin(value)
+
+
+class ResetUserPasswordRequest(BaseSchema):
+    new_password: str
+
+    @field_validator("new_password")
+    @classmethod
+    def check_new_password(cls, value: str) -> str:
+        return validate_password(value)

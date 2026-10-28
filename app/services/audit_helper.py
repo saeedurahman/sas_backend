@@ -14,6 +14,11 @@ _AUTH_ACTION_MAP = {
     "account_locked": "login",
     "token_refreshed": "login",
     "logout": "logout",
+    "refresh_reuse_detected": "login",
+    "password_changed": "update",
+    "password_reset": "update",
+    "pin_changed": "update",
+    "pin_reset": "update",
 }
 
 

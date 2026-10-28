@@ -14,6 +14,8 @@ class RegisterBusinessRequest(BaseSchema):
     owner_password: str
     branch_name: str = Field(default="Main Branch", min_length=1, max_length=255)
     city: str | None = None
+    # Only read when REGISTRATION_CAPTCHA_ENABLED=true.
+    captcha_token: str | None = Field(default=None, max_length=4096)
 
     @field_validator("owner_phone")
     @classmethod
@@ -29,6 +31,9 @@ class RegisterBusinessRequest(BaseSchema):
 class LoginRequest(BaseSchema):
     phone: str
     password: str
+    # Scopes the phone lookup to one business. Optional unless
+    # LOGIN_REQUIRE_BUSINESS_SLUG=true.
+    business_slug: str | None = Field(default=None, min_length=1, max_length=255)
 
     @field_validator("phone")
     @classmethod
@@ -49,6 +54,22 @@ class PinLoginRequest(BaseSchema):
 
 class RefreshTokenRequest(BaseSchema):
     refresh_token: str = Field(min_length=1)
+
+
+class RefreshTokenResponse(BaseSchema):
+    access_token: str
+    refresh_token: str
+    token_type: str = "bearer"
+
+
+class ChangePasswordRequest(BaseSchema):
+    current_password: str = Field(min_length=1)
+    new_password: str
+
+    @field_validator("new_password")
+    @classmethod
+    def check_new_password(cls, value: str) -> str:
+        return validate_password(value)
 
 
 class UserInfo(BaseSchema):

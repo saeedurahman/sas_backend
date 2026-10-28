@@ -2,6 +2,7 @@
 
 import csv
 import io
+import re
 from datetime import date
 from decimal import Decimal
 from uuid import UUID
@@ -38,6 +39,26 @@ _INVENTORY_HEADERS = [
     "Cost Price",
     "Total Value",
 ]
+
+
+_FORMULA_TRIGGERS = ("=", "+", "-", "@", "\t", "\r")
+_PLAIN_NUMBER = re.compile(r"^[+-]?\d+(\.\d+)?$")
+
+
+def sanitize_cell(value):
+    """Neutralise spreadsheet formula injection in user-controlled text.
+
+    Strings starting with = + - @ (or tab/CR) get a leading single quote so
+    Excel/Sheets treat them as text. Plain numbers such as "-5.00" are left alone.
+    """
+    if isinstance(value, str) and value.startswith(_FORMULA_TRIGGERS):
+        if not _PLAIN_NUMBER.match(value):
+            return "'" + value
+    return value
+
+
+def _safe_row(values: list) -> list:
+    return [sanitize_cell(v) for v in values]
 
 
 def _dec(value) -> Decimal:
@@ -182,7 +203,7 @@ async def export_sales_csv(
     writer = csv.writer(buffer)
     writer.writerow(_SALES_HEADERS)
     for row in rows:
-        writer.writerow(_sales_row_to_list(row))
+        writer.writerow(_safe_row(_sales_row_to_list(row)))
     return buffer.getvalue()
 
 
@@ -207,7 +228,7 @@ async def export_sales_excel(
 
     for row_idx, row in enumerate(rows, start=2):
         for col_idx, value in enumerate(_sales_row_to_list(row), start=1):
-            ws.cell(row=row_idx, column=col_idx, value=value)
+            ws.cell(row=row_idx, column=col_idx, value=sanitize_cell(value))
 
     for col in ws.columns:
         max_length = 0
@@ -315,7 +336,7 @@ async def export_inventory_csv(
     writer = csv.writer(buffer)
     writer.writerow(_INVENTORY_HEADERS)
     for row in rows:
-        writer.writerow(_inventory_row_to_list(row))
+        writer.writerow(_safe_row(_inventory_row_to_list(row)))
     return buffer.getvalue()
 
 
@@ -336,7 +357,7 @@ async def export_inventory_excel(
 
     for row_idx, row in enumerate(rows, start=2):
         for col_idx, value in enumerate(_inventory_row_to_list(row), start=1):
-            ws.cell(row=row_idx, column=col_idx, value=value)
+            ws.cell(row=row_idx, column=col_idx, value=sanitize_cell(value))
 
     for col in ws.columns:
         max_length = 0

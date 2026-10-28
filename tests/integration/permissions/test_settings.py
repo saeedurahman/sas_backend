@@ -185,6 +185,6 @@ def test_settings_module_permissions(
             f"{api_base}/notifications/check-alerts",
             headers=cashier_headers,
         ),
-        200,
-        label="POST /notifications/check-alerts (cashier)",
+        403,
+        label="POST /notifications/check-alerts (cashier, denied: needs notifications.manage)",
     )

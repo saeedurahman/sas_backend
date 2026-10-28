@@ -3,6 +3,8 @@ from uuid import UUID
 from fastapi import APIRouter, Depends, Query, status
 from pydantic import BaseModel
 
+from app.core.config import settings
+from app.core.rate_limit import enforce_rate_limit
 from app.database import get_db
 from app.dependencies import get_current_user, require_permission
 from app.models.user import User
@@ -120,9 +122,12 @@ async def remove_notification(
     status_code=status.HTTP_200_OK,
 )
 async def run_alert_checks(
-    current_user: User = Depends(get_current_user),
+    current_user: User = Depends(require_permission("notifications.manage")),
     db=Depends(get_db),
 ):
+    enforce_rate_limit(
+        "check-alerts", str(current_user.id), settings.rate_limit_check_alerts_user
+    )
     low_stock = await check_low_stock_alerts(db, current_user.business_id)
     expiry = await check_expiry_alerts(db, current_user.business_id)
     return CheckAlertsResponse(

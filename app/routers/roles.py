@@ -3,7 +3,7 @@ from uuid import UUID
 from fastapi import APIRouter, Depends, status
 
 from app.database import get_db
-from app.dependencies import get_current_user, require_permission
+from app.dependencies import require_permission
 from app.models.user import User
 from app.schemas.auth import MessageResponse
 from app.schemas.role import (
@@ -26,7 +26,7 @@ router = APIRouter(prefix="/roles", tags=["Roles"])
 
 @router.get("", response_model=list[RoleResponse], status_code=status.HTTP_200_OK)
 async def list_roles(
-    current_user: User = Depends(get_current_user),
+    current_user: User = Depends(require_permission("roles.view")),
     db=Depends(get_db),
 ):
     return await list_roles_for_business(db, current_user.business_id)
@@ -50,7 +50,7 @@ async def create_role_endpoint(
 )
 async def get_role(
     role_id: UUID,
-    current_user: User = Depends(get_current_user),
+    current_user: User = Depends(require_permission("roles.view")),
     db=Depends(get_db),
 ):
     return await get_role_response(db, role_id, current_user.business_id)

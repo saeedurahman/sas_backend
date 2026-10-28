@@ -28,7 +28,7 @@ def test_auth_me_business_slug_and_pin(
 ) -> None:
     suffix = unique_suffix
     password = DEFAULT_PASSWORD
-    pin = "1234"
+    pin = "482916"
     owner_phone = f"410{suffix:07d}"
     business_name = f"Slug Test {suffix}"
 
@@ -86,7 +86,7 @@ def test_auth_me_business_slug_and_pin(
     pin_set = http_client.put(
         f"{api_base}/users/{owner_id}/pin",
         headers=owner_headers,
-        json={"pin_code": pin},
+        json={"pin_code": pin, "current_password": password},
     )
     assert_ok(
         "PUT /users/{id}/pin",
@@ -328,7 +328,7 @@ def test_auth_me_roles_and_permissions(
         cashier_headers,
         label="cashier",
         expected_roles=["cashier"],
-        expected_permission_count=16,
+        expected_permission_count=len(expected_cashier),
         expected_permission_keys=set(expected_cashier),
     )
 

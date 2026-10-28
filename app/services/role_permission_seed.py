@@ -143,6 +143,9 @@ ALL_PERMISSION_KEYS: frozenset[str] = frozenset(
         "users.roles.manage",
         "notifications.view",
         "notifications.manage",
+        "roles.view",
+        "permissions.view",
+        "branches.view",
     }
 ) | RESTAURANT_PERMISSION_KEYS | MANUFACTURING_PERMISSION_KEYS | ACCOUNTING_PERMISSION_KEYS
 
@@ -183,6 +186,7 @@ CASHIER_PERMISSION_KEYS: frozenset[str] = frozenset(
         "shifts.close",
         "shifts.cash_movement",
         "notifications.view",
+        "branches.view",
     }
 ) | RESTAURANT_CASHIER_PERMISSION_KEYS
 

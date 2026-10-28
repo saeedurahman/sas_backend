@@ -1,12 +1,21 @@
 from contextlib import asynccontextmanager
-import os
+import asyncio
+import logging
 
 from fastapi import FastAPI
+from fastapi.responses import JSONResponse
+from sqlalchemy import text
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.openapi.utils import get_openapi
 from fastapi.security import HTTPBearer  # noqa: F401 — BearerAuth scheme for Swagger
 
 from app.core.config import settings
+from app.core.logging_config import configure_logging
+from app.core.middleware import (
+    BodySizeLimitMiddleware,
+    RequestContextMiddleware,
+    SecurityHeadersMiddleware,
+)
 from app.database import engine
 from app.routers.accounting import router as accounting_router
 from app.routers.adjustments import router as adjustments_router
@@ -47,19 +56,27 @@ from app.routers.units import router as units_router
 from app.routers.users import router as users_router
 from app.routers.waste import router as waste_router
 
+configure_logging(settings.log_level)
+logger = logging.getLogger("app")
+
+
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    print(f"{settings.app_name} starting...")
+    logger.info("starting", extra={"app_name": settings.app_name, "env": settings.env})
     yield
     await engine.dispose()
-    print("Shutdown complete")
+    logger.info("shutdown complete")
 
+
+_docs_enabled = not settings.is_production
 
 app = FastAPI(
     title=settings.app_name,
     version="1.0.0",
-    docs_url="/docs",
-    redoc_url="/redoc",
+    docs_url="/docs" if _docs_enabled else None,
+    redoc_url="/redoc" if _docs_enabled else None,
+    openapi_url="/openapi.json" if _docs_enabled else None,
+    debug=settings.debug,
     lifespan=lifespan,
     swagger_ui_parameters={"persistAuthorization": True},
 )
@@ -87,20 +104,18 @@ def custom_openapi():
 
 app.openapi = custom_openapi
 
-# Comma-separated origins; default covers local dev. Set ALLOWED_ORIGINS in production
-# (e.g. "https://app.pakpos.com,https://admin.pakpos.com").
-ALLOWED_ORIGINS = os.getenv(
-    "ALLOWED_ORIGINS",
-    "http://localhost:8000,http://localhost:3000",
-).split(",")
-
+# Middleware order: the last one added is outermost.
+app.add_middleware(BodySizeLimitMiddleware, max_bytes=settings.max_request_body_bytes)
+app.add_middleware(SecurityHeadersMiddleware, hsts=settings.is_production)
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=ALLOWED_ORIGINS,
+    allow_origins=settings.cors_origins,
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
+    expose_headers=["X-Request-ID", "Retry-After"],
 )
+app.add_middleware(RequestContextMiddleware)
 
 app.include_router(auth_router, prefix=settings.api_v1_prefix)
 app.include_router(business_router, prefix=settings.api_v1_prefix)
@@ -144,4 +159,14 @@ app.include_router(audit_router, prefix=settings.api_v1_prefix)
 
 @app.get("/health")
 async def health_check():
-    return {"status": "ok", "app": settings.app_name}
+    try:
+        async with asyncio.timeout(3):
+            async with engine.connect() as conn:
+                await conn.execute(text("SELECT 1"))
+    except Exception:
+        logger.exception("health check: database unreachable")
+        return JSONResponse(
+            status_code=503,
+            content={"status": "unavailable", "app": settings.app_name, "db": "down"},
+        )
+    return {"status": "ok", "app": settings.app_name, "db": "up"}

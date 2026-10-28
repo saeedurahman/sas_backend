@@ -35,9 +35,23 @@ def validate_password(value: str) -> str:
     return value
 
 
+MIN_NEW_PIN_LENGTH = 6
+MAX_PIN_LENGTH = 8
+
+
 def validate_pin(value: str) -> str:
-    """Validate POS PIN (4-6 digits)."""
+    """Validate a PIN presented at login (legacy 4-digit PINs still accepted)."""
     cleaned = value.strip()
-    if not re.fullmatch(r"\d{4,6}", cleaned):
-        raise ValueError("PIN must be 4 to 6 digits only")
+    if not re.fullmatch(rf"\d{{4,{MAX_PIN_LENGTH}}}", cleaned):
+        raise ValueError(f"PIN must be 4 to {MAX_PIN_LENGTH} digits only")
+    return cleaned
+
+
+def validate_new_pin(value: str) -> str:
+    """Validate a PIN being set or changed (minimum 6 digits)."""
+    cleaned = value.strip()
+    if not re.fullmatch(rf"\d{{{MIN_NEW_PIN_LENGTH},{MAX_PIN_LENGTH}}}", cleaned):
+        raise ValueError(
+            f"PIN must be {MIN_NEW_PIN_LENGTH} to {MAX_PIN_LENGTH} digits only"
+        )
     return cleaned

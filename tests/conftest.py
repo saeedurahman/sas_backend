@@ -13,7 +13,20 @@ from tests.helpers.tenants import TenantContext, build_pos_tenant, build_rbac_te
 
 @pytest.fixture(scope="session")
 def api_base() -> str:
-    return os.environ.get("API_BASE", "http://127.0.0.1:8000/api/v1")
+    """API under test.
+
+    ``API_BASE`` points at a server you started yourself (it must run with relaxed
+    ``RATE_LIMIT_*`` values, because the suite registers many tenants from one IP).
+    Without it, an isolated server with relaxed limits is started for the session.
+    """
+    explicit = os.environ.get("API_BASE")
+    if explicit:
+        yield explicit
+        return
+    from tests.helpers.server import managed_server
+
+    with managed_server() as base:
+        yield base
 
 
 @pytest.fixture(scope="session")

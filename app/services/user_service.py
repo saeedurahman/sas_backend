@@ -5,12 +5,14 @@ from uuid import UUID
 
 from fastapi import HTTPException, status
 from sqlalchemy import select
+from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.orm import selectinload
 
 from app.models.user import Role, User, UserRole
 from app.schemas.user import CreateUserRequest, UpdateUserRequest
-from app.services.auth_service import hash_password, hash_pin
+from app.services.audit_helper import log_auth_event
+from app.services.auth_service import hash_password, hash_pin, verify_password, verify_pin
 from app.services.token_service import revoke_all_user_tokens
 
 
@@ -191,6 +193,13 @@ async def get_users_for_business(
     return filtered
 
 
+def _phone_conflict() -> HTTPException:
+    return HTTPException(
+        status_code=status.HTTP_409_CONFLICT,
+        detail="Phone number already registered",
+    )
+
+
 async def create_tenant_user(
     db: AsyncSession,
     business_id: UUID,
@@ -221,7 +230,11 @@ async def create_tenant_user(
         updated_at=now,
     )
     db.add(user)
-    await db.flush()
+    try:
+        await db.flush()
+    except IntegrityError:
+        await db.rollback()
+        raise _phone_conflict() from None
 
     if data.role_ids:
         roles_result = await db.execute(
@@ -245,7 +258,11 @@ async def create_tenant_user(
                 )
             )
 
-    await db.commit()
+    try:
+        await db.commit()
+    except IntegrityError:
+        await db.rollback()
+        raise _phone_conflict() from None
     return await get_user_by_id(db, user.id, business_id)
 
 
@@ -297,12 +314,38 @@ async def update_tenant_user(
     return await get_user_by_id(db, user_id, business_id)
 
 
+def _verify_current_secret(
+    user: User,
+    *,
+    current_password: str | None,
+    current_pin: str | None,
+) -> None:
+    """Require proof of a current credential before a self-service change."""
+    if current_password is not None and user.password_hash:
+        if verify_password(current_password, user.password_hash):
+            return
+    elif current_pin is not None and user.pin_hash:
+        if verify_pin(current_pin, user.pin_hash):
+            return
+    elif current_password is None and current_pin is None:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="current_password or current_pin is required",
+        )
+    raise HTTPException(
+        status_code=status.HTTP_403_FORBIDDEN,
+        detail="Current password or PIN is incorrect",
+    )
+
+
 async def set_user_pin(
     db: AsyncSession,
     target_user_id: UUID,
     business_id: UUID,
     pin_code: str,
     requesting_user: User,
+    current_password: str | None = None,
+    current_pin: str | None = None,
 ) -> None:
     target = await get_user_by_id(db, target_user_id, business_id)
 
@@ -312,11 +355,91 @@ async def set_user_pin(
             status_code=status.HTTP_403_FORBIDDEN,
             detail="Not allowed to set PIN for this user",
         )
+    if is_self:
+        _verify_current_secret(
+            target, current_password=current_password, current_pin=current_pin
+        )
 
     now = datetime.now(timezone.utc)
     target.pin_hash = hash_pin(pin_code)
     target.updated_by = requesting_user.id
     target.updated_at = now
+    await revoke_all_user_tokens(db, target.id)
+    await log_auth_event(
+        db,
+        business_id=business_id,
+        user_id=requesting_user.id,
+        event="pin_changed" if is_self else "pin_reset",
+        record_id=target.id,
+    )
+    await db.commit()
+
+
+async def change_own_password(
+    db: AsyncSession,
+    user: User,
+    current_password: str,
+    new_password: str,
+) -> None:
+    if not user.password_hash or not verify_password(current_password, user.password_hash):
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail="Current password is incorrect",
+        )
+    if verify_password(new_password, user.password_hash):
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="New password must differ from the current password",
+        )
+    now = datetime.now(timezone.utc)
+    user.password_hash = hash_password(new_password)
+    user.updated_by = user.id
+    user.updated_at = now
+    await revoke_all_user_tokens(db, user.id)
+    await log_auth_event(
+        db,
+        business_id=user.business_id,
+        user_id=user.id,
+        event="password_changed",
+        record_id=user.id,
+    )
+    await db.commit()
+
+
+async def reset_user_password(
+    db: AsyncSession,
+    target_user_id: UUID,
+    business_id: UUID,
+    new_password: str,
+    requesting_user: User,
+) -> None:
+    """Admin reset of another user's password (the forgot-password path for staff)."""
+    if target_user_id == requesting_user.id:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="Use change-password to change your own password",
+        )
+    target = await get_user_by_id(db, target_user_id, business_id)
+    if _is_owner(target) and not _is_owner(requesting_user):
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail="Only an owner can reset an owner's password",
+        )
+    now = datetime.now(timezone.utc)
+    target.password_hash = hash_password(new_password)
+    target.is_locked = False
+    target.failed_login_attempts = 0
+    target.locked_until = None
+    target.updated_by = requesting_user.id
+    target.updated_at = now
+    await revoke_all_user_tokens(db, target.id)
+    await log_auth_event(
+        db,
+        business_id=business_id,
+        user_id=requesting_user.id,
+        event="password_reset",
+        record_id=target.id,
+    )
     await db.commit()
 
 

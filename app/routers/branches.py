@@ -3,7 +3,7 @@ from uuid import UUID
 from fastapi import APIRouter, Depends, status
 
 from app.database import get_db
-from app.dependencies import get_current_user, require_manager, require_owner
+from app.dependencies import require_manager, require_owner, require_permission
 from app.models.user import User
 from app.schemas.business import BranchResponse, CreateBranchRequest, UpdateBranchRequest
 from app.services.branch_service import (
@@ -18,7 +18,7 @@ router = APIRouter(prefix="/branches", tags=["branches"])
 
 @router.get("", response_model=list[BranchResponse], status_code=status.HTTP_200_OK)
 async def list_branches(
-    current_user: User = Depends(get_current_user),
+    current_user: User = Depends(require_permission("branches.view")),
     db=Depends(get_db),
 ):
     return await get_branches_for_business(
@@ -53,7 +53,7 @@ async def create_branch(
 )
 async def get_branch(
     branch_id: UUID,
-    current_user: User = Depends(get_current_user),
+    current_user: User = Depends(require_permission("branches.view")),
     db=Depends(get_db),
 ):
     return await get_branch_by_id(db, branch_id, current_user.business_id)

@@ -72,9 +72,11 @@ class User(Base, AuditMixin, SoftDeleteMixin, SyncMixin):
         foreign_keys="UserRole.user_id",
         lazy="selectin",
     )
+    # Never auto-loaded: refresh tokens accumulate (one row per rotation) and are
+    # only ever queried directly through token_service.
     refresh_tokens: Mapped[list["RefreshToken"]] = relationship(
         back_populates="user",
-        lazy="selectin",
+        lazy="noload",
     )
 
 
@@ -232,6 +234,11 @@ class RefreshToken(Base):
         nullable=False,
     )
     jti: Mapped[str] = mapped_column(String(255), unique=True, nullable=False)
+    # All tokens descended from one login share a family; reuse of a rotated
+    # token revokes the whole family. NULL for tokens issued before rotation.
+    family_id: Mapped[uuid.UUID | None] = mapped_column(
+        Uuid(as_uuid=True), nullable=True
+    )
     expires_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
     revoked_at: Mapped[datetime | None] = mapped_column(
         DateTime(timezone=True), nullable=True

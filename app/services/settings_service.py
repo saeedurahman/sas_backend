@@ -47,6 +47,22 @@ NOTIFICATION_SETTINGS = {
     "notifications.expiry",
 }
 
+# Keys any signed-in POS user may read without settings.view (receipt printing,
+# tax display, POS behaviour). Everything else needs settings.view.
+POS_READABLE_PREFIXES = ("receipt.", "tax.")
+POS_READABLE_SETTINGS = BUSINESS_SETTINGS | SALE_SETTINGS
+
+
+def is_pos_readable_setting(setting_key: str) -> bool:
+    return setting_key in POS_READABLE_SETTINGS or setting_key.startswith(
+        POS_READABLE_PREFIXES
+    )
+
+
+def can_read_all_settings(permission_keys: set[str]) -> bool:
+    return "settings.view" in permission_keys or "settings.manage" in permission_keys
+
+
 PREDEFINED_SETTING_KEYS = (
     BUSINESS_SETTINGS
     | RECEIPT_SETTINGS

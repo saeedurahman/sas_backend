@@ -3,7 +3,11 @@ from uuid import UUID
 from fastapi import APIRouter, Depends, HTTPException, Query, status
 
 from app.database import get_db
-from app.dependencies import get_current_user, require_permission
+from app.dependencies import (
+    _user_permission_keys,
+    get_current_user,
+    require_permission,
+)
 from app.models.user import User
 from app.schemas.auth import MessageResponse
 from app.schemas.settings import (
@@ -12,6 +16,8 @@ from app.schemas.settings import (
     UpsertSettingRequest,
 )
 from app.services.settings_service import (
+    can_read_all_settings,
+    is_pos_readable_setting,
     bulk_upsert_settings,
     delete_setting,
     get_setting,
@@ -28,7 +34,10 @@ async def list_settings(
     current_user: User = Depends(get_current_user),
     db=Depends(get_db),
 ):
-    return await get_settings(db, current_user.business_id, branch_id)
+    settings_rows = await get_settings(db, current_user.business_id, branch_id)
+    if can_read_all_settings(_user_permission_keys(current_user)):
+        return settings_rows
+    return [row for row in settings_rows if is_pos_readable_setting(row.setting_key)]
 
 
 @router.put("", response_model=SettingResponse, status_code=status.HTTP_200_OK)
@@ -64,6 +73,13 @@ async def get_setting_endpoint(
     current_user: User = Depends(get_current_user),
     db=Depends(get_db),
 ):
+    if not can_read_all_settings(
+        _user_permission_keys(current_user)
+    ) and not is_pos_readable_setting(setting_key):
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail="Permission required: settings.view",
+        )
     setting = await get_setting(
         db, current_user.business_id, setting_key, branch_id
     )

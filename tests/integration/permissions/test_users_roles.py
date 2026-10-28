@@ -45,7 +45,7 @@ def test_users_module_permissions(
             f"{api_base}/users",
             403,
         ),
-        ("GET /roles (cashier)", cashier_headers, f"{api_base}/roles", 200),
+        ("GET /roles (cashier, needs roles.view)", cashier_headers, f"{api_base}/roles", 403),
     ]
     for label, headers, url, expected in read_cases:
         assert_status(http_client.get(url, headers=headers), expected, label=label)
@@ -118,7 +118,7 @@ def test_users_module_permissions(
             http_client.put(
                 f"{api_base}/users/{cashier_id}/pin",
                 headers=cashier_headers,
-                json={"pin_code": "1234"},
+                json={"pin_code": "482916", "current_password": password},
             ),
             200,
             label="PUT /users/{id}/pin self (cashier)",
@@ -538,8 +538,8 @@ def test_role_management_api(
 
     assert_status(
         http_client.get(f"{api_base}/roles", headers=cashier_headers),
-        200,
-        label="GET /roles (cashier)",
+        403,
+        label="GET /roles (cashier, needs roles.view)",
     )
 
     assert_status(
