@@ -151,6 +151,45 @@ class Settings(BaseSettings):
     )
     license_public_key: str = Field(default="", validation_alias="LICENSE_PUBLIC_KEY")
 
+    # --- Offline sync -------------------------------------------------------------
+    # Oldest occurred_at a replayed op may carry (also bounds how long a device may stay offline).
+    max_offline_days: int = Field(default=14, ge=1, validation_alias="MAX_OFFLINE_DAYS")
+    # A pull cursor older than this gets full_resync_required (tombstones may be gone).
+    tombstone_retention_days: int = Field(
+        default=90, ge=1, validation_alias="TOMBSTONE_RETENTION_DAYS"
+    )
+    # Subscription lease handed to devices; capped by subscription end + GRACE_DAYS.
+    lease_days: int = Field(default=7, ge=1, validation_alias="LEASE_DAYS")
+    # Replayed (offline) sales may drive stock below zero; online sales keep strict checks.
+    allow_negative_stock_on_sync: bool = Field(
+        default=True, validation_alias="ALLOW_NEGATIVE_STOCK_ON_SYNC"
+    )
+    sync_max_ops: int = Field(default=200, ge=1, validation_alias="SYNC_MAX_OPS")
+    # Largest JSON payload of a single op, in bytes.
+    sync_max_payload_bytes: int = Field(
+        default=65536, ge=1024, validation_alias="SYNC_MAX_PAYLOAD_BYTES"
+    )
+    rate_limit_sync_push_device: str = Field(
+        default="60/minute", validation_alias="RATE_LIMIT_SYNC_PUSH_DEVICE"
+    )
+    rate_limit_sync_pull_device: str = Field(
+        default="240/minute", validation_alias="RATE_LIMIT_SYNC_PULL_DEVICE"
+    )
+    rate_limit_time_ip: str = Field(default="120/minute", validation_alias="RATE_LIMIT_TIME_IP")
+    # Optional dedicated Ed25519 pair for subscription leases; falls back to the license pair.
+    lease_signing_private_key: str = Field(
+        default="", validation_alias="LEASE_SIGNING_PRIVATE_KEY"
+    )
+    lease_public_key: str = Field(default="", validation_alias="LEASE_PUBLIC_KEY")
+
+    @property
+    def lease_private_key_effective(self) -> str:
+        return self.lease_signing_private_key or self.license_signing_private_key
+
+    @property
+    def lease_public_key_effective(self) -> str:
+        return self.lease_public_key or self.license_public_key
+
     @property
     def platform_rate_limits(self) -> dict[str, str]:
         from app.core.rate_limit import parse_rate
@@ -216,6 +255,8 @@ class Settings(BaseSettings):
                 problems.append("PLATFORM_JWT_SECRET looks like a placeholder/default value")
             if self.platform_jwt_secret in (self.jwt_secret_key, self.jwt_refresh_secret_key):
                 problems.append("PLATFORM_JWT_SECRET must differ from the tenant JWT secrets")
+        if bool(self.lease_signing_private_key) != bool(self.lease_public_key):
+            problems.append("LEASE_SIGNING_PRIVATE_KEY and LEASE_PUBLIC_KEY must be set together")
         if bool(self.license_signing_private_key) != bool(self.license_public_key):
             problems.append(
                 "LICENSE_SIGNING_PRIVATE_KEY and LICENSE_PUBLIC_KEY must be set together"

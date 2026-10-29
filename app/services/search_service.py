@@ -154,7 +154,7 @@ async def _search_sales(
         FROM sales
         WHERE business_id = :business_id
             AND deleted_at IS NULL
-            AND sale_number ILIKE :pattern
+            AND (sale_number ILIKE :pattern OR client_receipt_no ILIKE :pattern)
         ORDER BY sold_at DESC
         LIMIT :limit
     """

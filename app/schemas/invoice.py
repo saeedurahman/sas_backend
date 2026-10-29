@@ -60,6 +60,7 @@ class InvoiceSummary(BaseSchema):
 class InvoiceData(BaseSchema):
     sale_id: UUID
     sale_number: str
+    client_receipt_no: str | None = None
     sale_type: str
     status: str
     sold_at: datetime
@@ -86,6 +87,7 @@ class ThermalLineItem(BaseSchema):
 
 class ThermalReceiptData(BaseSchema):
     sale_number: str
+    client_receipt_no: str | None = None
     sold_at: datetime
     branch_name: str
     cashier_name: str

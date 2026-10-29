@@ -186,3 +186,257 @@ changes exactly when the user's access changes.
 `python scripts/route_permission_report.py` fails when a non-public route has no permission or
 ownership dependency (allow-lists with reasons are in the script). It runs in
 `python scripts/ci_check.py`.
+
+## Offline sync (Phase 4a)
+
+POS devices keep a local copy of the catalog, work offline, and replay what they did when the
+network returns. The server stays authoritative for FIFO costing, ledgers, stock and document
+numbers; the device only ever supplies facts (what was sold, at what price, when).
+
+Apply `alembic upgrade head` (revision `019_offline_sync`). Everything below is under `/api/v1`
+unless stated; send `Authorization: Bearer ...` except for `/time`.
+
+### Change feed: `change_seq` and cursors
+
+Every synced table (`products`, `product_variations`, `barcodes`, `categories`, `brands`, `units`,
+`tax_rates`, `price_lists`, `price_list_items`, `customers`, `discount_schemes`, `business_configs`,
+`branches`, `cash_registers`, `users`, `roles`, and the derived `stock_levels`) has a per-business
+`change_seq`. A deferred trigger stamps it **at COMMIT**, taking the business counter row lock last,
+so sequence order is commit order: a pull can never skip a row that commits late. Deletes are soft
+(`deleted_at`) and show up as tombstones; synced rows are never hard-deleted by the app (a unit test
+enforces it). `stock_levels` is a per product+branch balance kept by a trigger on `stock_movements`
+(stock itself remains a ledger). Cursors are signed, opaque and server-issued; a device clock is never used.
+Because stamping happens at commit, two transactions that touch the same unlocked row at commit time can
+deadlock; Postgres aborts one and the sync processor retries the op (up to 3 times).
+
+Entities delivered: `settings` (business name/currency/timezone, a subset of the config, feature flags,
+subscription status and contact), `branch`, `cash_register`, `role` (with `permission_keys`), `user`
+(`id, name, roles, role_ids, branch_ids, status, is_locked, permissions_version` only), `category`,
+`brand`, `unit`, `tax_rate`, `product`, `product_variation`, `barcode`, `price_list`, `price_list_item`,
+`customer` (with `balance`), `discount_scheme`, `stock_level`. Entities are filtered by the caller's
+permissions and branch scope. Numbers are exact decimal strings.
+
+#### `GET /sync/pull?since=<cursor>&limit=500&branch_id=<uuid>&device_id=<id>`
+
+`device_id` (or header `X-Device-ID`) is required. `limit` is 1..1000 (default 500). Omit `since` to start from the beginning.
+
+```json
+{
+  "changes": [
+    {"entity": "product", "id": "3b0f...", "op": "upsert", "seq": 118,
+     "data": {"id": "3b0f...", "name": "Rice 5kg", "sku": "R5", "category_id": null, "base_unit_id": "9a1c...",
+              "tax_rate_id": null, "product_type": "standard", "tracking_type": "none", "is_active": true,
+              "min_stock_level": null, "created_at": "2026-10-29T08:15:00+00:00", "deleted_at": null}},
+    {"entity": "stock_level", "id": "c2d4...", "op": "upsert", "seq": 119,
+     "data": {"id": "c2d4...", "branch_id": "5e7a...", "product_id": "3b0f...", "variation_id": null,
+              "qty": "97.0000", "last_movement_at": "2026-10-29T08:20:11+00:00"}},
+    {"entity": "product", "id": "77aa...", "op": "delete", "seq": 120, "data": null}
+  ],
+  "next_cursor": "eyJiIjoi...Zjl9.k3mQ...",
+  "has_more": false,
+  "server_time": "2026-10-29T08:21:00.123456Z",
+  "full_resync_required": false,
+  "full_resync_reason": null,
+  "permissions_version": "9f3c1a77d2b04e51",
+  "entities": ["settings", "branch", "cash_register", "role", "user", "category", "..."],
+  "restricted": false
+}
+```
+
+* Apply the changes in order and store `next_cursor` after each page; if `has_more`, pull again at once.
+* `full_resync_required: true` (with `next_cursor: null` and no changes) means: discard the local copy and run the
+  snapshot. `full_resync_reason` is `cursor_expired` (older than `TOMBSTONE_RETENTION_DAYS`),
+  `permissions_changed` (the user permissions_version differs from the one the cursor was issued under, so data
+  they may now see or no longer see cannot be replayed), `user_changed` (cursor belongs to another user) or
+  `cursor_ahead_of_server` (restored or foreign database).
+* A malformed or forged cursor is `400 {"detail": {"code": "invalid_cursor", ...}}`.
+* Subscription expired/suspended/cancelled: `restricted: true`, only `settings` (the expired-screen data) is
+  served and the cursor does not advance, so everything missed is delivered after renewal. Grace pulls normally.
+
+#### `GET /sync/snapshot?device_id=<id>&limit=500&page_token=<token>`
+
+First install or full resync. Live rows only (no tombstones), keyset-paged per entity in the order above.
+
+```json
+{"changes": [{"entity": "settings", "id": "...", "op": "upsert", "seq": 3, "data": {"...": "..."}}],
+ "next_page_token": "eyJj...", "has_more": true,
+ "cursor": "eyJiIjoi...",
+ "server_time": "2026-10-29T08:21:00Z", "permissions_version": "9f3c1a77d2b04e51",
+ "entities": ["settings", "..."], "restricted": false}
+```
+
+Pass `next_page_token` back as `page_token` until `has_more` is false, then start pulling from `cursor`
+(the same value on every page: the head at the moment the snapshot began; changes made while paging are
+re-delivered by that first pull, and upserts are idempotent).
+
+### `POST /sync/push`
+
+```json
+{
+  "device_id": "till-front-1", "batch_id": "b-2026-10-29-0007",
+  "device_name": "Front till", "app_version": "1.4.2",
+  "ops": [
+    {"op_id": "0d3a5c5e-...", "type": "customer.create",
+     "client_created_at": "2026-10-29T07:58:00Z", "occurred_at": "2026-10-29T07:58:00Z",
+     "payload": {"id": "c1c1...", "name": "Ali Traders", "phone": "0300...", "credit_limit": "5000"}},
+    {"op_id": "6f2e9b0a-...", "type": "sale.create",
+     "client_created_at": "2026-10-29T08:02:10Z", "occurred_at": "2026-10-29T08:02:10Z",
+     "depends_on": ["0d3a5c5e-..."],
+     "payload": {"id": "5a5a...", "client_receipt_no": "T1-000123", "branch_id": "5e7a...",
+                 "register_shift_id": "e0e0...", "customer_id": "c1c1...", "sale_type": "pos",
+                 "price_list_id": null, "discount_scheme_id": null, "notes": null,
+                 "lines": [{"id": "l1l1...", "product_id": "3b0f...", "variation_id": null, "qty": "2",
+                            "unit_price": "100.00", "discount_pct": "0", "discount_amount": "0",
+                            "tax_rate": "5", "tax_amount": "10.00", "notes": null, "line_order": 0}],
+                 "payments": [{"payment_method": "cash", "amount": "150.00", "tendered_amount": "200.00",
+                               "change_given": "50.00", "reference_no": null, "paid_at": null},
+                              {"payment_method": "credit", "amount": "60.00"}]}}
+  ]
+}
+```
+
+Response (always `200` unless the request itself is invalid; results are in request order):
+
+```json
+{"batch_id": "b-2026-10-29-0007", "server_time": "2026-10-29T08:30:00Z",
+ "results": [
+   {"op_id": "0d3a5c5e-...", "status": "applied", "server_id": "c1c1...", "official_number": null,
+    "flags": [], "error": null, "original_status": null},
+   {"op_id": "6f2e9b0a-...", "status": "applied", "server_id": "5a5a...", "official_number": "INV-20261029-0042",
+    "flags": ["oversold", "cost_estimated"], "error": null, "original_status": null},
+   {"op_id": "aaaa...", "status": "duplicate", "server_id": "5a5a...", "official_number": "INV-20261029-0042",
+    "flags": ["oversold", "cost_estimated"], "error": null, "original_status": "applied"},
+   {"op_id": "bbbb...", "status": "rejected", "server_id": null, "official_number": null, "flags": [],
+    "error": {"code": "unknown_product", "message": "Unknown product(s): ...", "retryable": false},
+    "original_status": null}
+ ]}
+```
+
+Statuses: `applied`; `duplicate` (this `op_id` was processed before: the stored result is returned, with
+`original_status`); `rejected`; `conflict` (valid but clashes with server state: id exists, sale already
+voided, shift already closed, ...). **Retry rule:** only outcomes with `error.retryable: true` should be sent
+again; they are not stored, so a re-send is evaluated afresh. Every other outcome is final and a re-send returns
+the same stored answer. Reusing an `op_id` for different content is `rejected` / `idempotency_key_reused`.
+
+Processing: ops run in order, each in its own transaction (effects, stored result and audit row commit
+together, so a crash at any point leaves nothing half-applied and a retry is exact). An op whose `depends_on`
+ids appear later in the same batch runs after them (results stay in request order); a dependency that was never
+sent is `dependency_missing` (retryable), one that failed is `dependency_failed`. At most `SYNC_MAX_OPS` ops per
+push (else `413 batch_too_large`); each payload at most `SYNC_MAX_PAYLOAD_BYTES`.
+
+Op types. `occurred_at` is the business time (`sold_at` / `opened_at` / `closed_at`): at most `MAX_OFFLINE_DAYS`
+in the past and 5 minutes in the future. Money fields are decimal strings.
+
+| type | payload | needs | server_id | official_number |
+|---|---|---|---|---|
+| `customer.create` | `id`, `name`, `phone?`, `email?`, `tax_id?`, `address_line1?`, `city?`, `credit_limit?` | `customers.create` | customer id | |
+| `shift.open` | `id`, `cash_register_id`, `opening_float?`, `notes?` | `shifts.open` | shift id | |
+| `shift.close` | `shift_id`, `actual_cash`, `notes?` | `shifts.close` | shift id | |
+| `sale.create` | see the example above | `sales.create` | sale id | `INV-YYYYMMDD-NNNN` |
+| `sale.void` | `sale_id`, `reason?` (only a synced sale) | `sales.void` | sale id | sale number |
+| `customer.payment` | `id?` (ledger id), `customer_id`, `amount`, `payment_method?`, `register_shift_id?`, `reference_no?`, `notes?` | `customers.update` | ledger entry id | |
+| `expense.create` | as `POST /expenses` | `expenses.create` | expense id | `EXP-...` |
+| `return.create` | as `POST /returns` (`sale_id`, `lines[{sale_line_id, qty}]`, `refund_payments`, ...) | `sales.returns.create` | return id | `RET-...` |
+
+Held orders are not synced (`unsupported_op_type`). Clients generate the ids of customers, shifts, sales and sale
+lines (`id` is the client UUID); inserts are duplicate-safe. `return.create` needs the user's open shift at sync
+time (`no_open_shift`, retryable). `sale.void` follows the online rule: the sale's shift must still be open.
+
+#### Offline sale acceptance (frozen totals)
+
+The customer already has a receipt, so the server stores line prices, tax, discounts and payments exactly as sent
+and never rejects a sale over a money difference. It recomputes on the server and records differences in
+`sales.sync_flags` (also in the push result and in `GET /sync/flags`):
+
+| flag | meaning |
+|---|---|
+| `price_mismatch` | a line unit price differs from the catalog price (price list) |
+| `tax_mismatch` | a line tax rate or amount differs from the product configured rate |
+| `oversold` | stock went negative (allowed for replayed sales while `ALLOW_NEGATIVE_STOCK_ON_SYNC=true`) |
+| `credit_limit_exceeded` | the credit portion pushes the customer past their limit |
+| `cost_estimated` | FIFO layers could not cover the quantity; the last known cost was used for the rest |
+| `shift_mismatch` | the shift is unknown, belongs to another user or branch, or was not open at `occurred_at`; the sale is kept but no cash is posted into a drawer that is not the caller |
+| `subscription_expired` | accepted while the subscription was expired, suspended or cancelled |
+
+FIFO consumption runs normally. Every flagged sale gets an in-app notification (`sync_conflict`) and an audit
+entry; every applied op gets an audit entry carrying the `device_id`. `GET /sync/flags` (owner/manager) lists
+flagged sales (`?flag=oversold&branch_id=&date_from=&date_to=&skip=&limit=`). The server assigns the official
+number when the sale is applied; the device number is kept as `client_receipt_no` (searchable through
+`GET /sales?search=` and `/search`, and returned on sale, invoice and receipt data).
+
+#### Error codes
+
+| code | retryable | meaning |
+|---|---|---|
+| `malformed_op`, `malformed_payload` | no | the op or its payload does not validate |
+| `payload_too_large` | no | over `SYNC_MAX_PAYLOAD_BYTES` |
+| `unsupported_op_type` | no | unknown type, or a held order |
+| `occurred_too_old`, `occurred_in_future` | no | outside the allowed window |
+| `permission_denied` | no | the user lacks the op permission |
+| `branch_forbidden` | no | branch outside the user scope |
+| `unknown_product`, `unknown_branch` | no | referenced record does not exist |
+| `unknown_register`, `unknown_customer`, `unknown_shift`, `sale_not_synced` | yes | sync the creating op first |
+| `duplicate_receipt` | no | that `client_receipt_no` was synced with different content |
+| `idempotency_key_reused` | no | `op_id` already used for another op |
+| `id_conflict`, `id_exists`, `shift_conflict`, `shift_already_closed`, `sale_not_voidable`, `return_rejected` | no | status `conflict`: state clash |
+| `insufficient_stock` | yes | only when `ALLOW_NEGATIVE_STOCK_ON_SYNC=false` |
+| `dependency_missing` | yes | the `depends_on` op has not been synced |
+| `dependency_failed` | as the dependency | a `depends_on` op was rejected |
+| `dependency_cycle` | no | circular `depends_on` |
+| `subscription_grace_readonly`, `subscription_expired`, `subscription_suspended`, `subscription_cancelled` | yes (after renewal) | see the table below |
+| `no_open_shift` | yes | returns need the user open shift |
+| `internal_error` | yes | unexpected failure; the rest of the batch still ran |
+
+Whole-request errors: `403 device_revoked`, `413 batch_too_large`, `429` (per business+device limits
+`RATE_LIMIT_SYNC_PUSH_DEVICE` / `RATE_LIMIT_SYNC_PULL_DEVICE`), `400 invalid_cursor`, `400 device_id_required`.
+Their bodies look like `{"detail": {"code": "...", "message": "..."}}`.
+
+#### Subscription during sync
+
+| state | push | pull |
+|---|---|---|
+| trial / active | everything | everything |
+| grace (read-only) | `sale.create`, `customer.payment`, `shift.close` still accepted (money already taken); other ops rejected `subscription_grace_readonly` | full |
+| expired / suspended / cancelled | the same three op types accepted and flagged `subscription_expired`; others rejected with the subscription code | `settings` only (`restricted: true`) |
+
+### Subscription lease
+
+`GET /subscription/status`, the sign-in and refresh responses and `GET /auth/me` carry:
+
+```json
+"lease": {"v": 1, "business_id": "7d1c...", "valid_until": "2026-11-05T08:15:00Z",
+          "server_time": "2026-10-29T08:15:00Z", "signature": "kq3v...base64url..."}
+```
+
+`valid_until` is `now + LEASE_DAYS`, capped by `subscription_ends_at + GRACE_DAYS` (trial: `trial_ends_at`); an
+expired, suspended or cancelled business gets an already-lapsed lease. The signature is Ed25519 over the
+canonical JSON (sorted keys, no whitespace) of the other four fields, made with `LEASE_SIGNING_PRIVATE_KEY` (or
+the license key). Verify offline with `app.licensing.lease.verify_lease(lease, public_key, business_id=...)`
+(copy the module next to `app/licensing/keys.py`): it rejects a bad signature, another business, an expired
+lease, and a device clock earlier than `server_time` (rollback). `lease` is `null` when no signing key is configured.
+
+### Offline login
+
+There is deliberately no `/auth/offline-credentials` endpoint. Server-issued verifier material would have to be
+derived from the password (which the server only sees at sign-in, and only hashed) or from the stored password
+hash; handing either to a device turns a stolen phone into an offline-crackable copy of a server secret, and a
+random server token the app can store is just a bearer credential with no password check. The safer design:
+after a successful online sign-in the app derives its own verifier from the password the user just typed
+(Argon2id, or PBKDF2-HMAC-SHA256 with at least 600k iterations, with a random per-user, per-device salt generated
+on the device and the key kept in the platform secure storage) and uses it to unlock the local account. Bind it to
+the lease: offline unlock is allowed only while the lease verifies. Pull supplies each user `permissions_version`
+and each role `permission_keys`, so the device knows what that user may do. A password or PIN change is learned at
+the next online sign-in; a revoked device is refused on its next contact.
+
+### Devices and time
+
+* Devices register on first pull or push (`device_id`, optional name and app version) and are listed by
+  `GET /devices` (owner). `POST /devices/{device_id}/revoke` (owner) makes that device get `403 device_revoked`
+  on every sync call.
+* `GET /time` (also at the server root, next to `/health`; unauthenticated, rate limited per IP) returns
+  `{"server_time": "2026-10-29T08:15:00.123456Z", "epoch_ms": 1793261700123}` for reachability pings and clock-skew detection.
+
+### Sync tests
+
+`tests/unit/test_lease.py`, `tests/unit/test_sync_units.py`, `tests/integration/sync/`,
+`tests/concurrency/test_sync_concurrency.py` (all run against `TEST_DATABASE_URL`, like the rest of the suite).

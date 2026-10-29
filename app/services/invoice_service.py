@@ -226,6 +226,7 @@ async def get_invoice_data(
     return InvoiceData(
         sale_id=sale.id,
         sale_number=sale.sale_number,
+        client_receipt_no=sale.client_receipt_no,
         sale_type=sale.sale_type,
         status=sale.status,
         sold_at=sale.sold_at,
@@ -272,6 +273,7 @@ async def get_thermal_receipt_data(
 
     return ThermalReceiptData(
         sale_number=invoice.sale_number,
+        client_receipt_no=invoice.client_receipt_no,
         sold_at=invoice.sold_at,
         branch_name=invoice.branch_name,
         cashier_name=invoice.cashier_name,

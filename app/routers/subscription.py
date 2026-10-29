@@ -1,4 +1,5 @@
 from datetime import datetime
+from typing import Any
 
 from fastapi import APIRouter, Depends, status
 from sqlalchemy import select
@@ -8,6 +9,7 @@ from app.dependencies import get_current_user, subscription_exempt
 from app.models.platform import Plan
 from app.models.user import User
 from app.schemas.base import BaseSchema
+from app.services.lease_service import issue_lease
 from app.services.subscription import (
     PAYMENT_INSTRUCTIONS_KEY,
     compute_state,
@@ -39,6 +41,8 @@ class SubscriptionStatusResponse(BaseSchema):
     in_grace: bool
     contact: ContactInfo
     payment_instructions: str = ""
+    # Signed offline-use lease; null if no signing key is configured.
+    lease: dict[str, Any] | None = None
 
 
 @router.get(
@@ -67,4 +71,5 @@ async def subscription_status(
         in_grace=state.in_grace,
         contact=ContactInfo(**contact_from_settings(values)),
         payment_instructions=values.get(PAYMENT_INSTRUCTIONS_KEY, "") or "",
+        lease=issue_lease(business),
     )

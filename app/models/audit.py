@@ -40,6 +40,7 @@ class AuditLog(Base, SyncMixin):
     new_values: Mapped[dict[str, Any] | None] = mapped_column(JSONB, nullable=True)
     ip_address: Mapped[str | None] = mapped_column(INET, nullable=True)
     user_agent: Mapped[str | None] = mapped_column(Text, nullable=True)
+    device_id: Mapped[str | None] = mapped_column(String(100), nullable=True)
     sync_status: Mapped[str] = mapped_column(
         sync_status_enum, nullable=False, default="synced"
     )

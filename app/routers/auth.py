@@ -31,10 +31,12 @@ from app.services.login_service import (
     logout_with_refresh_token,
     refresh_tokens,
     register_business_and_authenticate,
+    lease_for_business,
     subscription_summary_for_business,
 )
 from app.routers._request_meta import client_ip, user_agent
 from app.services.captcha_service import verify_registration_captcha
+from app.services.lease_service import issue_lease
 from app.services.user_service import change_own_password
 
 router = APIRouter(prefix="/auth", tags=["auth"])
@@ -128,6 +130,7 @@ async def refresh(
         access_token=access_token,
         refresh_token=new_refresh_token,
         subscription=await subscription_summary_for_business(db, business_id),
+        lease=await lease_for_business(db, business_id),
     )
 
 
@@ -186,4 +189,5 @@ async def me(current_user: User = Depends(get_current_user)):
     return MeResponse(
         **info.model_dump(),
         subscription=build_subscription_summary(current_user.business),
+        lease=issue_lease(current_user.business),
     )

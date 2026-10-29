@@ -26,6 +26,9 @@ from app.routers.audit import router as audit_router
 from app.routers.license_public import router as license_public_router
 from app.routers.platform import router as platform_router
 from app.routers.subscription import router as subscription_router
+from app.routers.sync import router as sync_router
+from app.routers.devices import router as devices_router
+from app.routers.time_sync import router as time_router
 from app.routers.auth import router as auth_router
 from app.routers.brands import router as brands_router
 from app.routers.business import router as business_router
@@ -178,9 +181,13 @@ app.include_router(notifications_router, prefix=settings.api_v1_prefix)
 app.include_router(invoice_router, prefix=settings.api_v1_prefix)
 app.include_router(audit_router, prefix=settings.api_v1_prefix)
 app.include_router(subscription_router, prefix=settings.api_v1_prefix)
+app.include_router(sync_router, prefix=settings.api_v1_prefix)
+app.include_router(devices_router, prefix=settings.api_v1_prefix)
+app.include_router(time_router, prefix=settings.api_v1_prefix)
 # Platform owner API and offline-license endpoints live outside the tenant /api/v1 tree.
 app.include_router(platform_router)
 app.include_router(license_public_router)
+app.include_router(time_router)  # /time next to /health for pre-login reachability pings
 
 
 @app.get("/health")

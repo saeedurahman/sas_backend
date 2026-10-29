@@ -494,6 +494,9 @@ class SaleResponse(SalesAuditSchema):
     customer_id: UUID | None
     table_id: UUID | None = None
     sale_number: str
+    client_receipt_no: str | None = None
+    sync_flags: list[str] = Field(default_factory=list)
+    is_offline: bool = False
     sale_type: str
     status: str
     sold_at: datetime
@@ -509,6 +512,7 @@ class SaleListResponse(BaseSchema):
     branch_id: UUID
     customer_id: UUID | None
     sale_number: str
+    client_receipt_no: str | None = None
     sale_type: str
     status: str
     sold_at: datetime

@@ -221,7 +221,11 @@ async def get_sales(
     if search:
         pattern = f"%{search}%"
         filters.append(
-            or_(Sale.sale_number.ilike(pattern), Sale.notes.ilike(pattern))
+            or_(
+                Sale.sale_number.ilike(pattern),
+                Sale.client_receipt_no.ilike(pattern),
+                Sale.notes.ilike(pattern),
+            )
         )
 
     count_result = await db.execute(
@@ -265,6 +269,7 @@ async def get_sales(
                 "branch_id": sale.branch_id,
                 "customer_id": sale.customer_id,
                 "sale_number": sale.sale_number,
+                "client_receipt_no": sale.client_receipt_no,
                 "sale_type": sale.sale_type,
                 "status": sale.status,
                 "sold_at": sale.sold_at,

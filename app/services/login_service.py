@@ -21,6 +21,7 @@ from app.dependencies import (
     user_permission_keys_for_response,
     user_roles_for_response,
 )
+from app.services.lease_service import issue_lease
 from app.services.subscription import compute_state, summary
 from app.services.audit_helper import log_auth_event
 from app.services.auth_service import (
@@ -646,6 +647,11 @@ def build_subscription_summary(business) -> SubscriptionSummary:
     return SubscriptionSummary(**summary(compute_state(business)))
 
 
+async def lease_for_business(db: AsyncSession, business_id: UUID) -> dict | None:
+    business = await db.get(Business, business_id)
+    return None if business is None else issue_lease(business)
+
+
 async def subscription_summary_for_business(
     db: AsyncSession, business_id: UUID
 ) -> SubscriptionSummary | None:
@@ -670,6 +676,7 @@ async def build_token_response(
         token_type="bearer",
         user=build_user_info(loaded),
         subscription=build_subscription_summary(loaded.business),
+        lease=issue_lease(loaded.business),
     )
 
 

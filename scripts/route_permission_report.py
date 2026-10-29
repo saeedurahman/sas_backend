@@ -38,6 +38,8 @@ V1 = settings.api_v1_prefix
 # (method, path) with no authentication at all.
 PUBLIC: dict[tuple[str, str], str] = {
     ("GET", "/health"): "load-balancer health probe",
+    ("GET", "/time"): "server clock probe for offline devices (rate limited)",
+    ("GET", f"{V1}/time"): "server clock probe for offline devices (rate limited)",
     ("POST", f"{V1}/auth/register"): "business sign-up (captcha + rate limited)",
     ("POST", f"{V1}/auth/login"): "sign-in (rate limited, lockout)",
     ("POST", f"{V1}/auth/login/pin"): "PIN sign-in (rate limited, lockout)",

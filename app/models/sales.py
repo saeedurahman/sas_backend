@@ -228,6 +228,19 @@ class Sale(Base, AuditMixin, SoftDeleteMixin, SyncMixin):
         sync_status_enum, nullable=False, default="pending"
     )
     created_by: Mapped[uuid.UUID] = mapped_column(Uuid(as_uuid=True), nullable=False)
+    # Offline replay: receipt number printed by the device, origin device, review flags.
+    client_receipt_no: Mapped[str | None] = mapped_column(String(64), nullable=True)
+    device_id: Mapped[str | None] = mapped_column(String(100), nullable=True)
+    sync_flags: Mapped[list[str]] = mapped_column(
+        JSONB, nullable=False, default=list, server_default="[]"
+    )
+    is_offline: Mapped[bool] = mapped_column(
+        Boolean, nullable=False, default=False, server_default="false"
+    )
+    client_created_at: Mapped[datetime | None] = mapped_column(
+        DateTime(timezone=True), nullable=True
+    )
+    synced_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
 
     business: Mapped["Business"] = relationship(lazy="selectin")
     branch: Mapped["Branch"] = relationship(lazy="selectin")

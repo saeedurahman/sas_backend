@@ -1,3 +1,4 @@
+from typing import Any
 from uuid import UUID
 
 from pydantic import Field, field_validator
@@ -68,6 +69,8 @@ class RefreshTokenResponse(BaseSchema):
     refresh_token: str
     token_type: str = "bearer"
     subscription: SubscriptionSummary | None = None
+    # Signed offline-use lease (see app/licensing/lease.py); null if no signing key is configured.
+    lease: dict[str, Any] | None = None
 
 
 class ChangePasswordRequest(BaseSchema):
@@ -97,6 +100,7 @@ class UserInfo(BaseSchema):
 
 class MeResponse(UserInfo):
     subscription: SubscriptionSummary | None = None
+    lease: dict[str, Any] | None = None
 
 
 class TokenResponse(BaseSchema):
@@ -105,6 +109,7 @@ class TokenResponse(BaseSchema):
     token_type: str = "bearer"
     user: UserInfo
     subscription: SubscriptionSummary | None = None
+    lease: dict[str, Any] | None = None
 
 
 class MessageResponse(BaseSchema):

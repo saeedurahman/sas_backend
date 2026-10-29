@@ -132,6 +132,8 @@ def main() -> int:
         "tests/unit/test_require_feature_flag.py",
         "tests/unit/test_license_keys.py",
         "tests/unit/test_subscription_state.py",
+        "tests/unit/test_lease.py",
+        "tests/unit/test_sync_units.py",
     )
     if args.integration:
         if USING_PLACEHOLDER_TEST_DB:

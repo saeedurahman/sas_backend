@@ -78,19 +78,20 @@ async def log_audit(
     old_values: dict[str, Any] | None = None,
     new_values: dict[str, Any] | None = None,
     ip_address: str | None = None,
+    device_id: str | None = None,
 ) -> None:
-    """Tenant audit row with actor, branch and before/after (``action``: create/update/delete)."""
+    """Tenant audit row with actor, branch and before/after (``action``: create/update/delete/sync)."""
     await db.execute(
         text(
             """
             INSERT INTO audit_logs (
                 business_id, user_id, branch_id, action, table_name, record_id,
-                old_values, new_values, ip_address
+                old_values, new_values, ip_address, device_id
             ) VALUES (
                 :business_id, :user_id, :branch_id, CAST(:action AS audit_action_enum),
                 :table_name, :record_id,
                 CAST(:old_values AS jsonb), CAST(:new_values AS jsonb),
-                CAST(:ip_address AS inet)
+                CAST(:ip_address AS inet), :device_id
             )
             """
         ),
@@ -104,5 +105,6 @@ async def log_audit(
             "old_values": None if old_values is None else json.dumps(old_values, default=str),
             "new_values": None if new_values is None else json.dumps(new_values, default=str),
             "ip_address": ip_address,
+            "device_id": device_id,
         },
     )
