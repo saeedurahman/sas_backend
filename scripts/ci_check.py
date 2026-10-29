@@ -1,7 +1,7 @@
 """CI gate for the security baseline.
 
     python scripts/ci_check.py                 # static checks + unit tests (no DB)
-    python scripts/ci_check.py --integration   # + security suite (needs DATABASE_URL, migrated DB)
+    python scripts/ci_check.py --integration   # + security suite (needs TEST_DATABASE_URL, migrated DB)
 
 Exit code is non-zero when any check fails.
 """
@@ -23,6 +23,13 @@ sys.path.insert(0, str(ROOT))
 os.environ.setdefault("DATABASE_URL", "postgresql+asyncpg://ci:ci@localhost:5432/ci")
 os.environ.setdefault("JWT_SECRET_KEY", "ci-only-access-secret-not-for-deploys")
 os.environ.setdefault("JWT_REFRESH_SECRET_KEY", "ci-only-refresh-secret-not-for-deploys")
+
+from tests.helpers.testdb import configured_test_database_url  # noqa: E402
+
+# Unit tests never connect, but pytest insists on a test database distinct from DATABASE_URL.
+USING_PLACEHOLDER_TEST_DB = configured_test_database_url() is None
+if USING_PLACEHOLDER_TEST_DB:
+    os.environ["TEST_DATABASE_URL"] = "postgresql+asyncpg://ci:ci@localhost:5432/ci_test"
 
 FAILURES: list[str] = []
 
@@ -127,6 +134,11 @@ def main() -> int:
         "tests/unit/test_subscription_state.py",
     )
     if args.integration:
+        if USING_PLACEHOLDER_TEST_DB:
+            check("TEST_DATABASE_URL is set for integration tests", False, "set it, then run scripts/create_test_db.py")
+            print()
+            print("FAILED: " + "; ".join(FAILURES))
+            return 1
         run_pytest("security integration tests", "tests/security")
 
     print()

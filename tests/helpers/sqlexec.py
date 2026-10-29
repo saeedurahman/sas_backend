@@ -4,13 +4,13 @@ from __future__ import annotations
 
 from sqlalchemy import create_engine, text
 
-from app.core.config import settings
+from tests.helpers.testdb import require_test_database_url
 
 _engine = None
 
 
 def _sync_url() -> str:
-    url = settings.database_url
+    url = require_test_database_url()
     for prefix in ("postgresql+asyncpg://", "postgresql://"):
         if url.startswith(prefix):
             return "postgresql+psycopg2://" + url[len(prefix):]

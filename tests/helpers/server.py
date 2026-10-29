@@ -2,7 +2,7 @@
 
 Security tests need settings (tiny rate limits, low lockout thresholds, captcha
 on) that differ from a developer's running server, so each group of tests boots
-its own app process against the same database.
+its own app process against the test database (``TEST_DATABASE_URL``).
 """
 
 from __future__ import annotations
@@ -16,6 +16,8 @@ from contextlib import contextmanager
 from pathlib import Path
 
 import httpx
+
+from tests.helpers.testdb import require_test_database_url
 
 ROOT = Path(__file__).resolve().parents[2]
 
@@ -69,7 +71,10 @@ def _free_port() -> int:
 def managed_server(env: dict[str, str] | None = None):
     """Yield the API base URL (``http://127.0.0.1:<port>/api/v1``) of a fresh server."""
     port = _free_port()
-    child_env = {**os.environ, **RELAXED_ENV, **(env or {})}
+    # Never inherit a development DATABASE_URL; `env` may still override it (e.g. an
+    # unreachable URL for the DB-down test).
+    test_db = {"DATABASE_URL": require_test_database_url()}
+    child_env = {**os.environ, **RELAXED_ENV, **test_db, **(env or {})}
     proc = subprocess.Popen(
         [
             sys.executable,

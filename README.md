@@ -24,6 +24,7 @@ uvicorn main:app --reload --port 8000
 | `ENV` | `development` | Set to `production` to enable startup safety checks (below) |
 | `DEBUG` | `false` | Must be `false` in production |
 | `DATABASE_URL` | required | Postgres URL (`postgresql+asyncpg://...`) |
+| `TEST_DATABASE_URL` | required for tests | Separate Postgres database used only by the test suite. Tests refuse to run if it is unset or points at `DATABASE_URL`'s database |
 | `JWT_SECRET_KEY`, `JWT_REFRESH_SECRET_KEY` | required | Distinct secrets, 32+ chars in production |
 | `ALLOWED_ORIGINS` | localhost dev origins | Comma-separated CORS origins. Required in production, `*` rejected |
 | `LOGIN_REQUIRE_BUSINESS_SLUG` | `false` | `true` makes password login require `business_slug` |
@@ -81,15 +82,30 @@ That flow should issue a short-lived single-use reset token, rate limit it with 
 
 ## Tests
 
+The suite registers throw-away tenants, so it runs against its own database and never against
+`DATABASE_URL`. Set `TEST_DATABASE_URL` (environment or `.env`) to a different database, then create
+and migrate it once (re-run after adding migrations):
+
 ```bash
+python scripts/create_test_db.py           # creates the database if missing, runs alembic upgrade head
 python scripts/ci_check.py                 # static checks + unit tests, no database needed
-python scripts/ci_check.py --integration   # also boots isolated servers against DATABASE_URL (migrated DB)
+python scripts/ci_check.py --integration   # also boots isolated servers against TEST_DATABASE_URL
 pytest tests/security                      # the security suite directly
 ```
 
-The security suite starts its own uvicorn processes (random ports, custom limits) via
-`tests/helpers/server.py`, so it does not need or disturb a server you already have running.
-It creates throw-away tenants in the configured database; use a development database.
+pytest exits immediately when `TEST_DATABASE_URL` is unset or is the same database as `DATABASE_URL`.
+The suite starts its own uvicorn processes (random ports, custom limits) via `tests/helpers/server.py`,
+pointed at the test database, so it does not need or disturb a server you already have running. If you
+set `API_BASE` to a server you started yourself, run that server with `DATABASE_URL` set to the test
+database; the suite cannot check that.
+
+To remove leftover test tenants from a development database (names starting with `POSTest`, or
+`VoidRace` / `CancelRace` / `FIFO` followed by a number):
+
+```bash
+python scripts/cleanup_test_data.py            # dry run: per-table row counts, deletes nothing
+python scripts/cleanup_test_data.py --apply    # delete them and all their rows in one transaction
+```
 
 ## Subscription, platform admin and licenses (Phase 3)
 

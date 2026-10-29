@@ -8,11 +8,11 @@ from typing import Any
 from sqlalchemy import create_engine, text
 from sqlalchemy.engine import Engine
 
-from app.core.config import settings
+from tests.helpers.testdb import require_test_database_url
 
 
 def sync_db_url() -> str:
-    url = settings.database_url
+    url = require_test_database_url()
     if url.startswith("postgresql+asyncpg://"):
         return url.replace("postgresql+asyncpg://", "postgresql+psycopg2://", 1)
     return url

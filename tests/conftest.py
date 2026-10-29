@@ -8,7 +8,23 @@ import uuid
 import httpx
 import pytest
 
+from tests.helpers.testdb import TestDatabaseConfigError, require_test_database_url
 from tests.helpers.tenants import TenantContext, build_pos_tenant, build_rbac_tenant
+
+
+def _use_test_database() -> None:
+    """Point everything (this process and spawned servers) at TEST_DATABASE_URL.
+
+    Runs when conftest is imported, i.e. before any ``app`` module builds its settings.
+    """
+    try:
+        url = require_test_database_url()
+    except TestDatabaseConfigError as exc:
+        pytest.exit(str(exc), returncode=4)
+    os.environ["DATABASE_URL"] = url
+
+
+_use_test_database()
 
 
 @pytest.fixture(scope="session")
@@ -17,7 +33,9 @@ def api_base() -> str:
 
     ``API_BASE`` points at a server you started yourself (it must run with relaxed
     ``RATE_LIMIT_*`` values, because the suite registers many tenants from one IP).
-    Without it, an isolated server with relaxed limits is started for the session.
+    Without it, an isolated server with relaxed limits is started for the session
+    against ``TEST_DATABASE_URL``. A server you start yourself must also run with
+    ``DATABASE_URL`` set to the test database; the suite cannot verify that.
     """
     explicit = os.environ.get("API_BASE")
     if explicit:
