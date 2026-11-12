@@ -89,4 +89,5 @@ async def get_product_price_endpoint(
         variation_id,
         price_list_id,
     )
+    await db.commit()  # persists a lazily created default price list, if any
     return ProductPriceResponse(unit_price=unit_price)

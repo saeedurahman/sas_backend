@@ -93,14 +93,11 @@ def _setup_tenant(client: httpx.Client, api_base: str, suffix: int) -> dict:
         },
     )
 
-    price_list = client.post(
-        f"{api_base}/prices/lists",
-        headers=owner_headers,
-        json={"name": "Retail", "list_type": "retail", "is_default": True},
-    )
-    if price_list.status_code != 201:
-        raise RuntimeError(f"price list failed: {price_list.status_code}")
-    price_list_id = price_list.json()["id"]
+    # Registration already seeded the default "Retail" list.
+    price_lists = client.get(f"{api_base}/prices/lists", headers=owner_headers)
+    if price_lists.status_code != 200:
+        raise RuntimeError(f"price list failed: {price_lists.status_code}")
+    price_list_id = next(x["id"] for x in price_lists.json() if x["is_default"])
 
     set_price = client.post(
         f"{api_base}/prices/lists/{price_list_id}/items",

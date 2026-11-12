@@ -15,6 +15,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.core.config import settings
 from app.models.business import Branch, Business, BusinessConfig, BusinessType
+from app.models.product import PriceList
 from app.models.user import Role, User, UserRole
 from app.schemas.auth import RegisterBusinessRequest
 from app.services.auth_service import hash_password
@@ -206,6 +207,20 @@ async def register_new_business(
                 status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
                 detail="Owner role was not created during registration",
             )
+
+        # Every business starts with a default retail price list so prices can be set at once.
+        db.add(
+            PriceList(
+                business_id=business.id,
+                name="Retail",
+                list_type="retail",
+                is_default=True,
+                is_active=True,
+                created_by=user.id,
+                created_at=now,
+                updated_at=now,
+            )
+        )
 
         user_role = UserRole(
             business_id=business.id,

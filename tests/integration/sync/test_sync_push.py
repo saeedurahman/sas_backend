@@ -312,12 +312,10 @@ def test_frozen_totals_stored_exactly_and_mismatches_flagged(http_client, pos_te
 
 def test_price_mismatch_against_catalog(http_client, pos_tenant):
     t = pos_tenant
-    pl = http_client.post(
-        t.url("/prices/lists"), headers=t.owner_headers,
-        json={"name": "Retail", "list_type": "retail", "is_default": True},
-    )
-    assert pl.status_code == 201, pl.text
-    pl_id = pl.json()["id"]
+    # Registration already seeded the default "Retail" list.
+    pl = http_client.get(t.url("/prices/lists"), headers=t.owner_headers)
+    assert pl.status_code == 200, pl.text
+    pl_id = next(x["id"] for x in pl.json() if x["is_default"])
     item = http_client.post(
         t.url(f"/prices/lists/{pl_id}/items"), headers=t.owner_headers,
         json={"product_id": t.product_id, "unit_price": "100.00"},

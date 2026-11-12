@@ -5,19 +5,107 @@ from decimal import Decimal
 from uuid import UUID
 
 from fastapi import HTTPException, status
-from sqlalchemy import select
+from sqlalchemy import select, text
+from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import AsyncSession
-from sqlalchemy.orm import selectinload
+from sqlalchemy.orm import noload, selectinload
 
 from app.models.product import PriceList, PriceListItem, Product
 from app.services.audit_helper import log_audit
 from app.schemas.product import CreatePriceListRequest, SetPriceRequest
 
 
+DEFAULT_PRICE_LIST_NAME = "Retail"
+
+
+async def ensure_default_price_list(
+    db: AsyncSession,
+    business_id: UUID,
+    created_by: UUID | None = None,
+) -> UUID:
+    """Return the business's default price list id, creating it if missing.
+
+    Race-safe: a transaction-scoped advisory lock per business serialises
+    concurrent creators, and the partial unique index ``uq_price_lists_one_default``
+    is the backstop. Flushes but never commits - the caller owns the transaction
+    (so it can be used inside sale/sync transactions).
+    """
+    find_default = select(PriceList.id).where(
+        PriceList.business_id == business_id,
+        PriceList.deleted_at.is_(None),
+        PriceList.is_default.is_(True),
+    )
+    existing = (await db.execute(find_default)).scalar_one_or_none()
+    if existing is not None:
+        return existing
+
+    await db.execute(
+        text("SELECT pg_advisory_xact_lock(hashtextextended(:k, 0))"),
+        {"k": f"default_price_list:{business_id}"},
+    )
+    existing = (await db.execute(find_default)).scalar_one_or_none()
+    if existing is not None:
+        return existing
+
+    now = datetime.now(timezone.utc)
+
+    # Prefer promoting a live, active retail list the owner already made.
+    candidate = (
+        await db.execute(
+            select(PriceList)
+            .where(
+                PriceList.business_id == business_id,
+                PriceList.deleted_at.is_(None),
+                PriceList.is_active.is_(True),
+                PriceList.list_type == "retail",
+            )
+            .order_by(PriceList.created_at, PriceList.id)
+            .limit(1)
+            .options(noload(PriceList.items))
+        )
+    ).scalar_one_or_none()
+    if candidate is not None:
+        candidate.is_default = True
+        candidate.updated_at = now
+        await db.flush()
+        return candidate.id
+
+    # (business_id, name) is unique even across soft-deleted rows.
+    taken = set(
+        (
+            await db.execute(
+                select(PriceList.name).where(PriceList.business_id == business_id)
+            )
+        ).scalars()
+    )
+    name = DEFAULT_PRICE_LIST_NAME
+    if name in taken:
+        name = f"{DEFAULT_PRICE_LIST_NAME} Default"
+    if name in taken:
+        name = f"{DEFAULT_PRICE_LIST_NAME} Default {str(business_id)[:8]}"
+
+    price_list = PriceList(
+        business_id=business_id,
+        name=name,
+        list_type="retail",
+        is_default=True,
+        is_active=True,
+        created_by=created_by,
+        created_at=now,
+        updated_at=now,
+    )
+    db.add(price_list)
+    await db.flush()
+    return price_list.id
+
+
 async def get_price_lists(
     db: AsyncSession,
     business_id: UUID,
 ) -> list[PriceList]:
+    # Lazy safety net: a business must always have a default list to price against.
+    await ensure_default_price_list(db, business_id)
+    await db.commit()
     result = await db.execute(
         select(PriceList)
         .where(
@@ -66,6 +154,12 @@ async def create_price_list(
         )
         db.add(price_list)
         await db.commit()
+    except IntegrityError:
+        await db.rollback()
+        raise HTTPException(
+            status_code=status.HTTP_409_CONFLICT,
+            detail="Price list name already exists or a default list was just created",
+        )
     except Exception:
         await db.rollback()
         raise
@@ -201,16 +295,7 @@ async def get_product_price(
         await _get_price_list_by_id(db, price_list_id, business_id)
         target_list_id = price_list_id
     else:
-        default_result = await db.execute(
-            select(PriceList.id).where(
-                PriceList.business_id == business_id,
-                PriceList.deleted_at.is_(None),
-                PriceList.is_default.is_(True),
-            )
-        )
-        target_list_id = default_result.scalar_one_or_none()
-        if target_list_id is None:
-            return None
+        target_list_id = await ensure_default_price_list(db, business_id)
 
     stmt = select(PriceListItem.unit_price).where(
         PriceListItem.price_list_id == target_list_id,
