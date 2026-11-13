@@ -2,9 +2,10 @@ from datetime import datetime
 from uuid import UUID
 
 from fastapi import APIRouter, Depends, Query, Request, status
+from pydantic import BaseModel
 
 from app.core.idempotency import run_idempotent
-from app.branch_scope import guard_body_branches, guard_record, scoped_branch_query
+from app.branch_scope import assert_branch_access, guard_body_branches, guard_record, scoped_branch_query
 from app.database import get_db
 from app.dependencies import (
     _user_permission_keys,
@@ -26,6 +27,12 @@ from app.schemas.sales import (
     SalePricePreviewResponse,
     SaleResponse,
 )
+from app.services.receipt_link_service import (
+    find_sale_by_number,
+    issue_for_sale_id,
+    issue_link,
+    revoke_links_for_sale,
+)
 from app.services.restaurant_tab_service import (
     add_lines_to_tab,
     complete_tab,
@@ -43,6 +50,74 @@ from app.services.sale_service import (
 )
 
 router = APIRouter(prefix="/sales", tags=["Sales"], dependencies=[Depends(guard_body_branches)])
+
+
+class ReceiptLinkResponse(BaseModel):
+    url: str
+    expires_at: datetime
+
+
+class ReceiptLinkLookupRequest(BaseModel):
+    """Find a sale by its official number and/or the receipt number printed offline."""
+
+    sale_number: str | None = None
+    client_receipt_no: str | None = None
+
+
+@router.post(
+    "/receipt-link/lookup",
+    response_model=ReceiptLinkResponse,
+    status_code=status.HTTP_201_CREATED,
+)
+async def create_receipt_link_by_number(
+    request: Request,
+    data: ReceiptLinkLookupRequest,
+    current_user: User = Depends(require_permission("sales.view")),
+    db=Depends(get_db),
+):
+    sale = await find_sale_by_number(
+        db,
+        current_user.business_id,
+        sale_number=data.sale_number,
+        client_receipt_no=data.client_receipt_no,
+    )
+    assert_branch_access(current_user, sale.branch_id)
+    issued = await issue_link(
+        db, current_user.business_id, sale, current_user.id, str(request.base_url)
+    )
+    return ReceiptLinkResponse(url=issued.url, expires_at=issued.expires_at)
+
+
+@router.post(
+    "/{sale_id}/receipt-link",
+    response_model=ReceiptLinkResponse,
+    status_code=status.HTTP_201_CREATED,
+    dependencies=[Depends(guard_record("sales", "sale_id"))],
+)
+async def create_receipt_link(
+    request: Request,
+    sale_id: UUID,
+    current_user: User = Depends(require_permission("sales.view")),
+    db=Depends(get_db),
+):
+    issued = await issue_for_sale_id(
+        db, current_user.business_id, sale_id, current_user.id, str(request.base_url)
+    )
+    return ReceiptLinkResponse(url=issued.url, expires_at=issued.expires_at)
+
+
+@router.delete(
+    "/{sale_id}/receipt-link",
+    dependencies=[Depends(guard_record("sales", "sale_id"))],
+)
+async def revoke_receipt_links(
+    sale_id: UUID,
+    current_user: User = Depends(require_permission("sales.view")),
+    db=Depends(get_db),
+):
+    """Revoke every active public link of this sale."""
+    revoked = await revoke_links_for_sale(db, current_user.business_id, sale_id, current_user.id)
+    return {"revoked": revoked}
 
 
 @router.get(

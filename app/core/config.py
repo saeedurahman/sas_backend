@@ -182,6 +182,37 @@ class Settings(BaseSettings):
     )
     lease_public_key: str = Field(default="", validation_alias="LEASE_PUBLIC_KEY")
 
+    # --- Public receipt links, exports, imports, uploads (Phase 5) -----------------
+    # Origin used to build shareable receipt/upload URLs (e.g. https://pos.example.com).
+    # Empty = derive from the incoming request (fine for dev, set it behind a proxy).
+    public_base_url: str = Field(default="", validation_alias="PUBLIC_BASE_URL")
+    receipt_link_days: int = Field(default=30, ge=1, validation_alias="RECEIPT_LINK_DAYS")
+    rate_limit_receipt_ip: str = Field(
+        default="60/minute", validation_alias="RATE_LIMIT_RECEIPT_IP"
+    )
+    export_max_rows: int = Field(default=50000, ge=1, validation_alias="EXPORT_MAX_ROWS")
+    rate_limit_export_user: str = Field(
+        default="20/minute", validation_alias="RATE_LIMIT_EXPORT_USER"
+    )
+    import_max_rows: int = Field(default=5000, ge=1, validation_alias="IMPORT_MAX_ROWS")
+    # Largest JSON body of the CSV import endpoints (the global limit is too small for 5k rows).
+    import_max_body_bytes: int = Field(
+        default=8 * 1024 * 1024, ge=1024, validation_alias="IMPORT_MAX_BODY_BYTES"
+    )
+    price_bulk_max_items: int = Field(
+        default=2000, ge=1, validation_alias="PRICE_BULK_MAX_ITEMS"
+    )
+    # "cloudinary://<api_key>:<api_secret>@<cloud_name>". Empty = local /static uploads (dev only).
+    cloudinary_url: str = Field(default="", validation_alias="CLOUDINARY_URL")
+    cloudinary_folder: str = Field(default="pos", validation_alias="CLOUDINARY_FOLDER")
+    upload_max_image_bytes: int = Field(
+        default=5 * 1024 * 1024, ge=1024, validation_alias="UPLOAD_MAX_IMAGE_BYTES"
+    )
+    upload_local_dir: str = Field(default="static/uploads", validation_alias="UPLOAD_LOCAL_DIR")
+    rate_limit_upload_user: str = Field(
+        default="30/minute", validation_alias="RATE_LIMIT_UPLOAD_USER"
+    )
+
     @property
     def lease_private_key_effective(self) -> str:
         return self.lease_signing_private_key or self.license_signing_private_key

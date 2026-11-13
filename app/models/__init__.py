@@ -1,5 +1,6 @@
 from app.models.audit import AuditLog
 from app.models.sync import SyncDevice, SyncOp
+from app.models.receipt_link import ReceiptLink
 from app.models.idempotency import IdempotencyKey
 from app.models.platform import (
     License,

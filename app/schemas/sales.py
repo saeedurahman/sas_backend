@@ -31,6 +31,7 @@ class CreateCustomerRequest(BaseSchema):
     address_line1: str | None = None
     city: str | None = None
     credit_limit: Decimal = Decimal("0")
+    price_list_id: UUID | None = None
 
     @field_validator("credit_limit")
     @classmethod
@@ -46,6 +47,8 @@ class UpdateCustomerRequest(BaseSchema):
     phone: str | None = None
     credit_limit: Decimal | None = None
     is_active: bool | None = None
+    # Send null to clear the assignment; omit the field to leave it unchanged.
+    price_list_id: UUID | None = None
 
     @field_validator("credit_limit")
     @classmethod
@@ -147,7 +150,8 @@ class CreateSaleLineRequest(BaseSchema):
     product_id: UUID
     variation_id: UUID | None = None
     qty: Decimal
-    unit_price: Decimal
+    # Omit to price the line from the customer's price list (fallback: default list).
+    unit_price: Decimal | None = None
     discount_pct: Decimal = Decimal("0")
     discount_amount: Decimal = Decimal("0")
     # Ignored unless the caller holds ``sales.override_tax``: the rate comes from
@@ -166,8 +170,8 @@ class CreateSaleLineRequest(BaseSchema):
 
     @field_validator("unit_price")
     @classmethod
-    def validate_unit_price(cls, value: Decimal) -> Decimal:
-        if value < 0:
+    def validate_unit_price(cls, value: Decimal | None) -> Decimal | None:
+        if value is not None and value < 0:
             raise ValueError("unit_price cannot be negative")
         return value
 
@@ -228,6 +232,8 @@ class CreateSaleRequest(BaseSchema):
 
 class TabSaleLineRequest(CreateSaleLineRequest):
     """Sale line for dine-in tab append — supports modifier_ids."""
+
+    unit_price: Decimal  # tab lines always carry an explicit price
 
 
 class OpenTabRequest(BaseSchema):
@@ -355,6 +361,7 @@ class CustomerResponse(SalesAuditSchema):
     city: str | None
     credit_limit: Decimal
     is_active: bool
+    price_list_id: UUID | None = None
 
 
 class CustomerLedgerResponse(BaseSchema):

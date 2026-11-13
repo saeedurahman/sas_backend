@@ -1,9 +1,10 @@
 from uuid import UUID
 
-from fastapi import APIRouter, Depends, Query, status
+from fastapi import APIRouter, Depends, HTTPException, Query, status
 
 from app.database import get_db
-from app.dependencies import require_permission
+from app.branch_scope import assert_branch_access
+from app.dependencies import _user_permission_keys, require_permission
 from app.models.user import User
 from app.schemas.auth import MessageResponse
 from app.schemas.product import (
@@ -18,6 +19,11 @@ from app.schemas.product import (
     UpdateVariationRequest,
     VariationResponse,
 )
+from app.services.product_import_service import (
+    ProductImportRequest,
+    import_products,
+    resolve_import_branch,
+)
 from app.services.product_service import (
     add_barcode,
     add_variation,
@@ -31,6 +37,35 @@ from app.services.product_service import (
 )
 
 router = APIRouter(prefix="/products", tags=["Products"])
+
+
+@router.post("/import")
+async def import_products_endpoint(
+    data: ProductImportRequest,
+    current_user: User = Depends(require_permission("products.create")),
+    db=Depends(get_db),
+):
+    """CSV/rows product import. ``dry_run`` (default) validates; ``dry_run: false`` applies.
+
+    Matched rows (by sku, then barcode) are updated, so the same file can be re-run safely.
+    Applying needs ``products.update`` too, and opening stock needs ``inventory.adjust``.
+    """
+    keys = _user_permission_keys(current_user)
+    if not data.dry_run and "products.update" not in keys:
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN, detail="Permission required: products.update"
+        )
+    assert_branch_access(current_user, data.branch_id)
+    branch_id = await resolve_import_branch(db, current_user.business_id, data.branch_id)
+    assert_branch_access(current_user, branch_id)
+    return await import_products(
+        db,
+        current_user.business_id,
+        data,
+        current_user.id,
+        branch_id,
+        can_adjust_stock="inventory.adjust" in keys,
+    )
 
 
 @router.get(

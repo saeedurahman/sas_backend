@@ -24,6 +24,9 @@ from app.routers.adjustments import router as adjustments_router
 from app.routers.analytics import router as analytics_router
 from app.routers.audit import router as audit_router
 from app.routers.license_public import router as license_public_router
+from app.routers.public_receipt import router as public_receipt_router
+from app.routers.export import router as export_router
+from app.routers.uploads import router as uploads_router
 from app.routers.platform import router as platform_router
 from app.routers.subscription import router as subscription_router
 from app.routers.sync import router as sync_router
@@ -130,7 +133,17 @@ def custom_openapi():
 app.openapi = custom_openapi
 
 # Middleware order: the last one added is outermost.
-app.add_middleware(BodySizeLimitMiddleware, max_bytes=settings.max_request_body_bytes)
+app.add_middleware(
+    BodySizeLimitMiddleware,
+    max_bytes=settings.max_request_body_bytes,
+    path_limits={
+        # multipart overhead on top of the image itself
+        f"{settings.api_v1_prefix}/uploads/image": settings.upload_max_image_bytes + 64 * 1024,
+        f"{settings.api_v1_prefix}/products/import": settings.import_max_body_bytes,
+        # price list CSV import: /prices/lists/{id}/import
+        f"{settings.api_v1_prefix}/prices/lists/": settings.import_max_body_bytes,
+    },
+)
 app.add_middleware(SecurityHeadersMiddleware, hsts=settings.is_production)
 app.add_middleware(
     CORSMiddleware,
@@ -184,9 +197,21 @@ app.include_router(subscription_router, prefix=settings.api_v1_prefix)
 app.include_router(sync_router, prefix=settings.api_v1_prefix)
 app.include_router(devices_router, prefix=settings.api_v1_prefix)
 app.include_router(time_router, prefix=settings.api_v1_prefix)
+app.include_router(export_router, prefix=settings.api_v1_prefix)
+app.include_router(uploads_router, prefix=settings.api_v1_prefix)
 # Platform owner API and offline-license endpoints live outside the tenant /api/v1 tree.
+# Local image uploads (development only; production must use CLOUDINARY_URL).
+if not settings.is_production and not settings.cloudinary_url.strip():
+    from pathlib import Path as _Path
+
+    from fastapi.staticfiles import StaticFiles
+
+    _upload_dir = _Path(settings.upload_local_dir)
+    _upload_dir.mkdir(parents=True, exist_ok=True)
+    app.mount("/static/uploads", StaticFiles(directory=_upload_dir), name="uploads")
 app.include_router(platform_router)
 app.include_router(license_public_router)
+app.include_router(public_receipt_router)  # GET /r/{token}: public receipt pages
 app.include_router(time_router)  # /time next to /health for pre-login reachability pings
 
 

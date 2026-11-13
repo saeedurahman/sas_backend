@@ -115,6 +115,7 @@ class CustomerCreatePayload(BaseSchema):
     address_line1: str | None = Field(default=None, max_length=255)
     city: str | None = Field(default=None, max_length=100)
     credit_limit: Decimal = Decimal("0")
+    price_list_id: UUID | None = None  # dropped (not rejected) if the list no longer exists
 
     @field_validator("credit_limit")
     @classmethod

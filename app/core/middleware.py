@@ -120,17 +120,32 @@ class SecurityHeadersMiddleware:
 class BodySizeLimitMiddleware:
     """Reject request bodies larger than ``max_bytes`` with 413."""
 
-    def __init__(self, app: ASGIApp, *, max_bytes: int) -> None:
+    def __init__(
+        self, app: ASGIApp, *, max_bytes: int, path_limits: dict[str, int] | None = None
+    ) -> None:
         self.app = app
         self.max_bytes = max_bytes
+        # Larger limits for specific endpoints (uploads, CSV imports). A key ending in "/"
+        # is a prefix and only applies to paths ending in "/import"; others match exactly.
+        self.path_limits = path_limits or {}
+
+    def _limit_for(self, path: str) -> int:
+        for key, limit in self.path_limits.items():
+            if key.endswith("/"):
+                if path.startswith(key) and path.endswith("/import"):
+                    return max(limit, self.max_bytes)
+            elif path == key:
+                return max(limit, self.max_bytes)
+        return self.max_bytes
 
     async def __call__(self, scope: Scope, receive: Receive, send: Send) -> None:
         if scope["type"] != "http":
             await self.app(scope, receive, send)
             return
 
+        max_bytes = self._limit_for(scope["path"])
         declared = dict(scope["headers"]).get(b"content-length", b"")
-        if declared.isdigit() and int(declared) > self.max_bytes:
+        if declared.isdigit() and int(declared) > max_bytes:
             await self._reject(send)
             return
 
@@ -143,7 +158,7 @@ class BodySizeLimitMiddleware:
             message = await receive()
             if message["type"] == "http.request":
                 received += len(message.get("body", b""))
-                if received > self.max_bytes:
+                if received > max_bytes:
                     too_large = True
                     # Stop feeding the app; whatever it replies is swapped for a 413.
                     return {"type": "http.request", "body": b"", "more_body": False}

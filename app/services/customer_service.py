@@ -22,6 +22,7 @@ from app.schemas.sales import (
     CustomerPaymentResponse,
     UpdateCustomerRequest,
 )
+from app.services.price_service import validate_customer_price_list
 from app.services.register_service import verify_open_register_shift
 
 
@@ -140,11 +141,13 @@ async def create_customer(
         address_line1=data.address_line1,
         city=data.city,
         credit_limit=data.credit_limit,
+        price_list_id=data.price_list_id,
         is_active=True,
         created_by=created_by,
         created_at=now,
         updated_at=now,
     )
+    await validate_customer_price_list(db, business_id, data.price_list_id)
     db.add(customer)
     await db.commit()
     await db.refresh(customer)
@@ -171,6 +174,9 @@ async def update_customer(
         customer.credit_limit = data.credit_limit
     if data.is_active is not None:
         customer.is_active = data.is_active
+    if "price_list_id" in data.model_fields_set:
+        await validate_customer_price_list(db, business_id, data.price_list_id)
+        customer.price_list_id = data.price_list_id
 
     customer.updated_by = updated_by
     customer.updated_at = now

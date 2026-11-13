@@ -440,3 +440,90 @@ the next online sign-in; a revoked device is refused on its next contact.
 
 `tests/unit/test_lease.py`, `tests/unit/test_sync_units.py`, `tests/integration/sync/`,
 `tests/concurrency/test_sync_concurrency.py` (all run against `TEST_DATABASE_URL`, like the rest of the suite).
+
+## Support endpoints (Phase 5)
+
+### Receipts by link
+
+* `POST /sales/{id}/receipt-link` (`sales.view`) → `201 {"url": "https://pos.example.com/r/<token>", "expires_at": "2026-12-13T08:15:00Z"}`.
+  The origin is `PUBLIC_BASE_URL` (else the request origin); expiry is `RECEIPT_LINK_DAYS` (default 30) from issue.
+* `POST /sales/receipt-link/lookup` (`sales.view`) with `{"sale_number": "..."}` or `{"client_receipt_no": "..."}` finds a
+  sale (including offline-synced ones) and returns the same shape.
+* `DELETE /sales/{id}/receipt-link` revokes every link of the sale → `{"revoked": 2}`.
+* `GET /r/{token}` is public and rate limited per IP (`RATE_LIMIT_RECEIPT_IP`): a mobile-friendly HTML receipt
+  (business name, items, totals, payments, receipt number, receipt footer from settings), or `?format=pdf` for an 80 mm PDF.
+  Unknown, forged or revoked token → `404`; expired → `410`. The page never shows customer, cashier or ledger data.
+  The token is `base64url(random id).base64url(HMAC-SHA256(JWT_SECRET, id)[:16])`; the signature is checked before the database.
+
+### Exports
+
+`GET /export` lists the datasets you may export. `GET /export/{dataset}?format=csv|xlsx&date_from=&date_to=&branch_id=`
+needs `reports.export` (some datasets need one more permission, shown by the listing).
+
+Datasets: `sales`, `sale_lines`, `inventory` (alias `stock_valuation`), `products`, `customers` (+`customers.view`),
+`customer_ledger` (+`customers.ledger.view`), `suppliers` (+`suppliers.view`), `supplier_ledger` (+`suppliers.ledger.view`),
+`expenses` (+`expenses.view`), `purchases` (+`inventory.purchase_orders.view`), `profit_loss` and `tax_summary`
+(+`reports.financial`), `cashier_performance`, `top_products`.
+
+* Dates default to the last 30 days (business timezone); `date_to` is inclusive. `branch_id` follows the user's branch scope.
+* Dates are `YYYY-MM-DD`, times `YYYY-MM-DD HH:MM` in the business timezone (default Asia/Karachi); money is a plain
+  number with two decimals (PKR, no symbol); CSV is UTF-8 with a BOM.
+* Ledger balances are the sum of ledger amounts: negative means the party owes you (customers) or is owed (suppliers).
+* Text starting with `= + - @`, tab, CR or LF is prefixed with `'` (formula-injection safe); plain numbers are untouched.
+* More than `EXPORT_MAX_ROWS` rows → `413 {"detail": "Export too large: more than 50000 rows. Narrow the date range or pick a branch and try again."}`.
+* The `products` columns (`name, sku, barcode, category, unit, cost, price, stock`) are what `POST /products/import`
+  reads (`stock` is accepted as `opening_stock`).
+* The older `/invoice/export/sales` and `/invoice/export/inventory` keep working.
+
+### Price lists
+
+* `GET/POST /prices/lists`, `GET/PUT/DELETE /prices/lists/{id}`: `name`, `list_type` (`retail|wholesale|custom`), `is_default`,
+  `valid_from`, `valid_to`, `is_active`. `GET /prices/lists` returns `item_count` and `customer_count` and **no longer embeds items**.
+  Exactly one list is the default: set `is_default: true` on another list to switch. The default cannot be deleted,
+  deactivated, given a validity window, or un-defaulted directly. Deleting a list unassigns its customers
+  (`{"deleted": true, "customers_unassigned": 3}`).
+* `GET /prices/lists/{id}/items?search=&skip=&limit=` → `{"total", "skip", "limit", "items": [{id, product_id, variation_id, product_name, variation_name, sku, unit_price, min_qty, updated_at}]}`.
+* `POST /prices/lists/{id}/items/bulk` with `{"items": [{"product_id", "variation_id": null, "price": "90.00", "min_qty": "1"}]}`
+  (at most `PRICE_BULK_MAX_ITEMS`) → `{"created", "updated", "unchanged", "total"}`. `DELETE /prices/lists/{id}/items/{item_id}` → 204.
+* `POST /prices/lists/{id}/copy` `{"name", "percent"?, "list_type"?, "valid_from"?, "valid_to"?}`;
+  `POST /prices/lists/{id}/adjust` `{"percent": "-5", "category_id"?, "round_to"?, "dry_run"?}` → `{dry_run, updated, unchanged, sample}`.
+* `POST /prices/lists/{id}/import` `{"csv": "sku,price,min_qty\n..." | "rows": [...], "dry_run": true, "on_error": "abort|skip"}`.
+  Rows match by `sku` (product, then variation) or `barcode`. See *Import reports* below.
+* Customers carry `price_list_id` (create/update/sync). **Sale pricing rule:** a sale with a customer and no explicit
+  `price_list_id` uses the customer's list; a line without `unit_price` is priced server-side from that list (quantity tiers via
+  `min_qty`), falling back to the default list when the list is inactive, outside its validity window, or has no price.
+  `GET /prices/product/{id}?customer_id=&qty=` shows the result.
+* All list, item and customer changes are stamped for the sync feed; `customer.price_list_id` and `price_list.valid_from/valid_to` are in pull payloads.
+
+### Product import
+
+`POST /products/import` (`products.create`; applying also needs `products.update`; opening stock needs `inventory.adjust`)
+with `{"csv": "name,sku,barcode,category,unit,cost,price,opening_stock\n...", "dry_run": true, "on_error": "abort", "branch_id"?}`.
+Products match by `sku`, then `barcode`, so re-running a file changes nothing. The price goes to the default list; unknown
+categories are created; the unit must already exist (name or symbol); opening stock is posted once as an `opening_balance`
+adjustment (skipped for products that already have stock history).
+
+### Import reports (products and price lists)
+
+```json
+{"dry_run": true,
+ "summary": {"total_rows": 4, "create": 1, "update": 0, "unchanged": 0, "errors": 3, "applied": 0},
+ "unknown_columns": [],
+ "rows": [{"row": 2, "action": "create", "sku": "SOAP-1", "errors": [], "warnings": []},
+          {"row": 3, "action": "error", "sku": "BU-1", "errors": ["unit 'Parsec' not found"], "warnings": []}]}
+```
+
+`row` is the file line (header = 1). Applying with errors and `on_error: "abort"` (the default) writes nothing and answers
+`422 {"detail": {"code": "import_has_errors", "message": "...", "report": {...}}}`; `on_error: "skip"` applies the valid rows.
+More than `IMPORT_MAX_ROWS` rows → 413.
+
+### Image upload
+
+`POST /uploads/image` (`products.update` or `settings.manage`), multipart field `file` (jpg, png, gif, webp; checked by
+content, at most `UPLOAD_MAX_IMAGE_BYTES`) → `201 {"url": "..."}`. With `CLOUDINARY_URL` set the image goes to Cloudinary
+(folder `CLOUDINARY_FOLDER/<business id>`); otherwise it is stored under `UPLOAD_LOCAL_DIR` and served from `/static/uploads`
+(development only; production answers 503 without Cloudinary). 415 for a wrong type, 413 when too large.
+
+### Phase 5 tests
+
+`tests/integration/phase5/` (receipt links, exports, price lists, product import, uploads).

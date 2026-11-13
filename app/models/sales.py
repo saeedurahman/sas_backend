@@ -44,6 +44,12 @@ class Customer(Base, AuditMixin, SoftDeleteMixin, SyncMixin):
     city: Mapped[str | None] = mapped_column(String(100), nullable=True)
     credit_limit: Mapped[Decimal] = mapped_column(Numeric(15, 2), nullable=False, default=0)
     is_active: Mapped[bool] = mapped_column(Boolean, nullable=False, default=True)
+    # Customer-specific price list; sales fall back to the business default list.
+    price_list_id: Mapped[uuid.UUID | None] = mapped_column(
+        Uuid(as_uuid=True),
+        ForeignKey("price_lists.id", ondelete="SET NULL"),
+        nullable=True,
+    )
     sync_status: Mapped[str] = mapped_column(
         sync_status_enum, nullable=False, default="synced"
     )

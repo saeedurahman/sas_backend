@@ -45,6 +45,7 @@ PUBLIC: dict[tuple[str, str], str] = {
     ("POST", f"{V1}/auth/login/pin"): "PIN sign-in (rate limited, lockout)",
     ("POST", f"{V1}/auth/refresh"): "token rotation (refresh token is the credential)",
     ("POST", "/platform/auth/login"): "admin sign-in (password + TOTP, rate limited, lockout)",
+    ("GET", "/r/{token}"): "public receipt page: token is an HMAC-signed, expiring, revocable link (rate limited)",
     ("GET", "/licenses/revocations"): "signed revocation list for the offline edition (rate limited)",
 }
 

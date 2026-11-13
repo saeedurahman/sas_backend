@@ -61,6 +61,7 @@ from app.schemas.sync import (
 )
 from app.services import subscription as sub
 from app.services.audit_helper import log_audit
+from app.services.price_service import validate_customer_price_list
 from app.services.customer_service import (
     get_customer_balance,
     get_customer_by_id,
@@ -269,9 +270,17 @@ def _map_http(exc: HTTPException) -> OpReject:
 async def _h_customer_create(ctx: Ctx, db, p: CustomerCreatePayload, op: OpEnvelope) -> Outcome:
     if await _exists(db, Customer, p.id):
         raise OpReject("id_exists", "A customer with this id already exists", status="conflict")
+    price_list_id = None
+    if p.price_list_id is not None:
+        try:
+            await validate_customer_price_list(db, ctx.business_id, p.price_list_id)
+            price_list_id = p.price_list_id
+        except HTTPException:
+            price_list_id = None  # an offline customer must never fail on a vanished list
     customer = Customer(
         id=p.id,
         business_id=ctx.business_id,
+        price_list_id=price_list_id,
         name=p.name,
         phone=p.phone,
         email=p.email,
@@ -554,7 +563,8 @@ async def _h_sale_create(ctx: Ctx, db, p: SaleCreatePayload, op: OpEnvelope) -> 
             flag(FLAG_TAX)
         try:
             catalog = await get_product_price(
-                db, ctx.business_id, line.product_id, line.variation_id, p.price_list_id
+                db, ctx.business_id, line.product_id, line.variation_id, p.price_list_id,
+                customer_id=p.customer_id, qty=line.qty,
             )
         except HTTPException:
             catalog = None

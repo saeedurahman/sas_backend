@@ -48,7 +48,7 @@ from app.services.discount_engine import (
     has_manual_discount,
     merge_line_discount_inputs,
 )
-from app.services.price_service import get_product_price
+from app.services.price_service import apply_sale_price_rules, get_product_price
 from app.services.audit_helper import log_audit
 from app.services.fifo_service import (
     allocate_sale_line_fifo,
@@ -348,6 +348,7 @@ async def _enforce_sale_pricing_permissions(
                 line.product_id,
                 line.variation_id,
                 data.price_list_id,
+                qty=line.qty,
             )
             if catalog_price is None:
                 continue
@@ -366,6 +367,8 @@ async def compute_sale_pricing(
 ) -> SalePricePreviewResponse:
     """Pricing-only path shared by sale preview and create_sale."""
     await verify_branch(db, data.branch_id, business_id)
+    # Customer price list + server-side pricing of lines sent without a unit_price.
+    await apply_sale_price_rules(db, business_id, data)
     await _enforce_sale_pricing_permissions(
         db, business_id, data, permission_keys
     )

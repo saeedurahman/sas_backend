@@ -306,7 +306,11 @@ class PriceListResponse(ProductAuditSchema):
     is_active: bool
     valid_from: datetime | None
     valid_to: datetime | None
+    # Items are served by GET /prices/lists/{id}/items (paginated); the list itself only
+    # carries counts so the management screen stays light.
     items: list[PriceListItemResponse] = Field(default_factory=list)
+    item_count: int = 0
+    customer_count: int = 0
 
 
 class ProductListResponse(BaseSchema):
