@@ -457,7 +457,7 @@ the next online sign-in; a revoked device is refused on its next contact.
 
 ### Exports
 
-`GET /export` lists the datasets you may export. `GET /export/{dataset}?format=csv|xlsx&date_from=&date_to=&branch_id=`
+`GET /export` lists the datasets you may export. `GET /export/{dataset}?format=csv|xlsx|pdf&date_from=&date_to=&branch_id=`
 needs `reports.export` (some datasets need one more permission, shown by the listing).
 
 Datasets: `sales`, `sale_lines`, `inventory` (alias `stock_valuation`), `products`, `customers` (+`customers.view`),
@@ -471,6 +471,8 @@ Datasets: `sales`, `sale_lines`, `inventory` (alias `stock_valuation`), `product
 * Ledger balances are the sum of ledger amounts: negative means the party owes you (customers) or is owed (suppliers).
 * Text starting with `= + - @`, tab, CR or LF is prefixed with `'` (formula-injection safe); plain numbers are untouched.
 * More than `EXPORT_MAX_ROWS` rows → `413 {"detail": "Export too large: more than 50000 rows. Narrow the date range or pick a branch and try again."}`.
+* For PDF (`format=pdf`), more than `EXPORT_PDF_MAX_ROWS` (default 5,000) rows → `413` with a message suggesting CSV or Excel format.
+* PDF exports include a clean branded layout (business name, dataset title, date range, generated timestamp in Asia/Karachi, page numbers, repeating headers, landscape for wide tables, PKR number formatting, summary totals row, and Unicode Urdu RTL text support).
 * The `products` columns (`name, sku, barcode, category, unit, cost, price, stock`) are what `POST /products/import`
   reads (`stock` is accepted as `opening_stock`).
 * The older `/invoice/export/sales` and `/invoice/export/inventory` keep working.

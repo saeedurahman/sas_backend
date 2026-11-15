@@ -191,6 +191,7 @@ class Settings(BaseSettings):
         default="60/minute", validation_alias="RATE_LIMIT_RECEIPT_IP"
     )
     export_max_rows: int = Field(default=50000, ge=1, validation_alias="EXPORT_MAX_ROWS")
+    export_pdf_max_rows: int = Field(default=5000, ge=1, validation_alias="EXPORT_PDF_MAX_ROWS")
     rate_limit_export_user: str = Field(
         default="20/minute", validation_alias="RATE_LIMIT_EXPORT_USER"
     )

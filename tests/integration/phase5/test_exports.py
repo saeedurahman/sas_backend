@@ -84,7 +84,7 @@ def test_bad_date_range_and_format_and_dataset(http_client, tenant):
     r = http_client.get(tenant.url("/export/sales"), headers=h,
                         params={"date_from": "2024-02-01", "date_to": "2024-01-01"})
     assert r.status_code == 422
-    assert http_client.get(tenant.url("/export/sales"), headers=h, params={"format": "pdf"}).status_code == 422
+    assert http_client.get(tenant.url("/export/sales"), headers=h, params={"format": "invalid"}).status_code == 422
     assert http_client.get(tenant.url("/export/nope"), headers=h).status_code == 404
 
 

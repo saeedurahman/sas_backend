@@ -1,7 +1,10 @@
-"""``GET /export/{dataset}`` – CSV / XLSX downloads (see ``app.services.export_datasets``)."""
+"""``GET /export/{dataset}`` – CSV / XLSX / PDF downloads (see ``app.services.export_datasets``)."""
 
 from __future__ import annotations
 
+import logging
+import time
+from collections.abc import AsyncIterator
 from datetime import date, timedelta
 from uuid import UUID
 
@@ -22,6 +25,8 @@ from app.models.user import User
 from app.services import export_datasets as ds
 from app.services.business_time import get_business_tz
 
+logger = logging.getLogger("app.export")
+
 router = APIRouter(
     prefix="/export",
     tags=["Export"],
@@ -29,7 +34,8 @@ router = APIRouter(
 )
 
 _XLSX = "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
-_FORMATS = {"csv": "csv", "xlsx": "xlsx", "excel": "xlsx"}
+_PDF = "application/pdf"
+_FORMATS = {"csv": "csv", "xlsx": "xlsx", "excel": "xlsx", "pdf": "pdf"}
 _DEFAULT_DAYS = 30
 
 
@@ -54,7 +60,7 @@ async def list_datasets(
                 "columns": [c.key for c in d.columns],
                 "date_filter": d.uses_dates,
                 "branch_filter": d.uses_branch,
-                "formats": ["csv", "xlsx"],
+                "formats": ["csv", "xlsx", "pdf"],
             }
             for d in _allowed(current_user)
         ],
@@ -64,13 +70,14 @@ async def list_datasets(
 @router.get("/{dataset}")
 async def export_dataset(
     dataset: str,
-    format: str = Query(default="csv", description="csv | xlsx"),
+    format: str = Query(default="csv", description="csv | xlsx | pdf"),
     date_from: date | None = Query(default=None),
     date_to: date | None = Query(default=None),
     branch_id: UUID | None = Depends(scoped_branch_query),
     current_user: User = Depends(require_permission("reports.export")),
     db: AsyncSession = Depends(get_db),
 ):
+    start_time = time.perf_counter()
     spec = ds.resolve_dataset(dataset.lower())
     if spec.extra_permission and spec.extra_permission not in set(
         user_permission_keys_for_response(current_user)
@@ -80,7 +87,9 @@ async def export_dataset(
         )
     fmt = _FORMATS.get(format.lower())
     if fmt is None:
-        raise HTTPException(status.HTTP_422_UNPROCESSABLE_ENTITY, "format must be 'csv' or 'xlsx'")
+        raise HTTPException(
+            status.HTTP_422_UNPROCESSABLE_ENTITY, "format must be 'csv', 'xlsx', or 'pdf'"
+        )
 
     enforce_rate_limit("export", str(current_user.id), settings.rate_limit_export_user)
 
@@ -103,16 +112,57 @@ async def export_dataset(
         date_to=date_to,
         branch_id=branch_id if spec.uses_branch else None,
     )
-    prepared = await ds.prepare(db, spec, ctx)
+    prepared = await ds.prepare(db, spec, ctx, fmt=fmt)
     # End the request transaction now: the stream opens its own session.
     await db.commit()
 
     stamp = f"{date_from}_{date_to}" if spec.uses_dates else str(date_to)
     filename = f"{spec.name}_{stamp}.{fmt}"
+
+    if fmt == "pdf":
+        pdf_bytes = await ds.generate_pdf(prepared)
+        duration = time.perf_counter() - start_time
+        logger.info(
+            "Export completed",
+            extra={
+                "dataset": spec.name,
+                "format": fmt,
+                "rows": prepared.row_count,
+                "duration_seconds": round(duration, 4),
+            },
+        )
+        return StreamingResponse(
+            iter([pdf_bytes]),
+            media_type=_PDF,
+            headers={
+                "Content-Disposition": f'attachment; filename="{filename}"',
+                "Cache-Control": "no-store",
+                "X-Row-Count": str(prepared.row_count),
+            },
+        )
+
+    async def _logged_stream(body: AsyncIterator[bytes]) -> AsyncIterator[bytes]:
+        try:
+            async for chunk in body:
+                yield chunk
+        finally:
+            duration = time.perf_counter() - start_time
+            logger.info(
+                "Export completed",
+                extra={
+                    "dataset": spec.name,
+                    "format": fmt,
+                    "rows": prepared.row_count,
+                    "duration_seconds": round(duration, 4),
+                },
+            )
+
     body = ds.stream_csv(prepared) if fmt == "csv" else ds.stream_xlsx(prepared)
+    media_type = "text/csv; charset=utf-8" if fmt == "csv" else _XLSX
+
     return StreamingResponse(
-        body,
-        media_type="text/csv; charset=utf-8" if fmt == "csv" else _XLSX,
+        _logged_stream(body),
+        media_type=media_type,
         headers={
             "Content-Disposition": f'attachment; filename="{filename}"',
             "Cache-Control": "no-store",

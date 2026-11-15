@@ -1,32 +1,41 @@
-"""Dataset exports (CSV / XLSX) behind ``GET /export/{dataset}``.
+"""Dataset exports (CSV / XLSX / PDF) behind ``GET /export/{dataset}``.
 
 Rules every dataset follows, so files from different screens look alike:
 
 * Column names are fixed ``snake_case`` per dataset (see ``DATASETS``).
 * Dates are ``YYYY-MM-DD`` and timestamps ``YYYY-MM-DD HH:MM`` in the business timezone
-  (default Asia/Karachi); money is a plain number with two decimals (no symbol, no grouping),
-  quantities up to four decimals.
+  (default Asia/Karachi); money is a plain number with two decimals (no symbol, no grouping)
+  in CSV/XLSX, formatted PKR in PDF; quantities up to four decimals.
 * Text cells that could start a spreadsheet formula (= + - @ tab CR LF) are prefixed with
   ``'`` (``sanitize_cell``), in CSV and XLSX alike.
 * Row cap ``EXPORT_MAX_ROWS``: larger results are refused up front with 413.
+* PDF cap ``EXPORT_PDF_MAX_ROWS``: larger results return friendly 413 suggesting CSV/Excel.
 * SQL-backed datasets stream from a server-side cursor in batches, so memory stays flat.
+* CPU-bound XLSX and PDF file building runs off the asyncio event loop.
 """
 
 from __future__ import annotations
 
+import asyncio
 import csv
 import io
+import os
+import queue
 import re
 import tempfile
-from collections.abc import AsyncIterator, Awaitable, Callable
+import threading
+from collections.abc import AsyncIterator, Awaitable, Callable, Iterable
 from dataclasses import dataclass, field
 from datetime import date, datetime
 from decimal import ROUND_HALF_UP, Decimal
+from pathlib import Path
 from typing import Any
 from uuid import UUID
 from zoneinfo import ZoneInfo
 
 from fastapi import HTTPException, status
+from fpdf import FPDF
+from fpdf.fonts import FontFace
 from sqlalchemy import text
 from sqlalchemy.ext.asyncio import AsyncSession
 
@@ -35,7 +44,7 @@ from app.database import AsyncSessionLocal
 from app.services import analytics_service as analytics
 from app.services.business_time import local_day_bounds_utc
 
-_FORMULA_TRIGGERS = ("=", "+", "-", "@", "\t", "\r", "\n")
+_FORMULA_TRIGGERS_SET = frozenset(("=", "+", "-", "@", "\t", "\r", "\n"))
 _PLAIN_NUMBER = re.compile(r"^[+-]?\d+(\.\d+)?$")
 _CENT = Decimal("0.01")
 _QTY = Decimal("0.0001")
@@ -49,7 +58,7 @@ def sanitize_cell(value: Any) -> Any:
     Sheets and LibreOffice show it as text. Plain numbers such as "-5.00" or a phone number
     "+923001234567" are left alone.
     """
-    if isinstance(value, str) and value.startswith(_FORMULA_TRIGGERS):
+    if isinstance(value, str) and value and value[0] in _FORMULA_TRIGGERS_SET:
         if not _PLAIN_NUMBER.match(value):
             return "'" + value
     return value
@@ -72,6 +81,7 @@ class ExportCtx:
     date_from: date
     date_to: date
     branch_id: UUID | None
+    business_name: str = ""
     start_utc: datetime = field(init=False)
     end_utc: datetime = field(init=False)
 
@@ -102,6 +112,7 @@ class Dataset:
     uses_branch: bool = False
     extra_permission: str | None = None  # on top of reports.export
     sql: Callable[[ExportCtx], str] | None = None
+    count_sql: Callable[[ExportCtx], str] | None = None
     loader: Callable[[AsyncSession, ExportCtx], Awaitable[list[dict[str, Any]]]] | None = None
 
 
@@ -109,13 +120,20 @@ class Dataset:
 
 
 def _dec(value: Any) -> Decimal:
-    return Decimal("0") if value is None else Decimal(str(value))
+    if value is None:
+        return Decimal("0")
+    if isinstance(value, Decimal):
+        return value
+    return Decimal(str(value))
 
 
 def _stamp(value: Any, zone: ZoneInfo, with_time: bool) -> str:
     if value is None:
         return ""
     if isinstance(value, datetime):
+        if value.tzinfo is None:
+            from datetime import timezone
+            value = value.replace(tzinfo=timezone.utc)
         value = value.astimezone(zone)
         return value.strftime("%Y-%m-%d %H:%M" if with_time else "%Y-%m-%d")
     return value.strftime("%Y-%m-%d")
@@ -145,6 +163,29 @@ def format_cell(value: Any, col: Col, zone: ZoneInfo, *, numeric: bool) -> Any:
     if col.kind == "int":
         return int(value) if numeric else str(int(value))
     return sanitize_cell("" if value is None else str(value))
+
+
+def format_cell_pdf(value: Any, col: Col, zone: ZoneInfo) -> str:
+    """Cell formatting for human-readable PDF document."""
+    if value is None or value == "":
+        return ""
+    if col.kind == "date":
+        return _stamp(value, zone, False)
+    if col.kind == "datetime":
+        return _stamp(value, zone, True)
+    if col.kind == "money":
+        val = _dec(value)
+        if val < 0:
+            return f"-PKR {abs(val):,.2f}"
+        return f"PKR {val:,.2f}"
+    if col.kind == "pct":
+        val = _dec(value)
+        return f"{val:.2f}%"
+    if col.kind == "qty":
+        return _qty_text(_dec(value))
+    if col.kind == "int":
+        return f"{int(value):,}"
+    return str(value)
 
 
 def _row_cells(row: dict[str, Any], dataset: Dataset, zone: ZoneInfo, numeric: bool) -> list[Any]:
@@ -178,16 +219,25 @@ def _sales_sql(ctx: ExportCtx) -> str:
         LEFT JOIN LATERAL (
             SELECT SUM(sl.qty * sl.unit_price) AS subtotal, SUM(sl.discount_amount) AS discount,
                    SUM(sl.tax_amount) AS tax
-            FROM sale_lines sl WHERE sl.sale_id = s.id AND sl.deleted_at IS NULL
+            FROM sale_lines sl
+            WHERE sl.business_id = s.business_id AND sl.sale_id = s.id AND sl.deleted_at IS NULL
         ) l ON TRUE
         LEFT JOIN LATERAL (
             SELECT SUM(sp.amount) AS paid, STRING_AGG(DISTINCT sp.payment_method::text, ', ') AS methods
             FROM sale_payments sp
-            WHERE sp.sale_id = s.id AND sp.deleted_at IS NULL AND sp.status = 'completed'
+            WHERE sp.business_id = s.business_id AND sp.sale_id = s.id AND sp.deleted_at IS NULL AND sp.status = 'completed'
         ) p ON TRUE
         WHERE s.business_id = :business_id AND s.deleted_at IS NULL
           AND s.sold_at >= :start AND s.sold_at < :end{_branch_clause(ctx, "s.branch_id")}
         ORDER BY s.sold_at, s.id
+    """
+
+
+def _sales_count_sql(ctx: ExportCtx) -> str:
+    return f"""
+        SELECT COUNT(*) FROM sales s
+        WHERE s.business_id = :business_id AND s.deleted_at IS NULL
+          AND s.sold_at >= :start AND s.sold_at < :end{_branch_clause(ctx, "s.branch_id")}
     """
 
 
@@ -211,6 +261,15 @@ def _sale_lines_sql(ctx: ExportCtx) -> str:
     """
 
 
+def _sale_lines_count_sql(ctx: ExportCtx) -> str:
+    return f"""
+        SELECT COUNT(*) FROM sale_lines sl
+        JOIN sales s ON s.id = sl.sale_id
+        WHERE sl.business_id = :business_id AND sl.deleted_at IS NULL AND s.deleted_at IS NULL
+          AND s.sold_at >= :start AND s.sold_at < :end{_branch_clause(ctx, "s.branch_id")}
+    """
+
+
 def _products_sql(ctx: ExportCtx) -> str:
     branch = _branch_clause(ctx, "sv.branch_id")
     return f"""
@@ -224,33 +283,37 @@ def _products_sql(ctx: ExportCtx) -> str:
         LEFT JOIN units u ON u.id = p.base_unit_id
         LEFT JOIN LATERAL (
             SELECT b.barcode FROM barcodes b
-            WHERE b.product_id = p.id AND b.deleted_at IS NULL
+            WHERE b.business_id = p.business_id AND b.product_id = p.id AND b.deleted_at IS NULL
             ORDER BY b.is_primary DESC, b.created_at LIMIT 1
         ) bc ON TRUE
         LEFT JOIN LATERAL (
             SELECT COALESCE(
                 (SELECT SUM(pl.qty_remaining * pl.cost_per_unit) / NULLIF(SUM(pl.qty_remaining), 0)
                    FROM purchase_lines pl
-                  WHERE pl.product_id = p.id AND pl.deleted_at IS NULL AND pl.qty_remaining > 0),
+                  WHERE pl.business_id = p.business_id AND pl.product_id = p.id AND pl.deleted_at IS NULL AND pl.qty_remaining > 0),
                 (SELECT pl.cost_per_unit FROM purchase_lines pl
-                  WHERE pl.product_id = p.id AND pl.deleted_at IS NULL
+                  WHERE pl.business_id = p.business_id AND pl.product_id = p.id AND pl.deleted_at IS NULL
                   ORDER BY pl.created_at DESC LIMIT 1)
             ) AS cost
         ) cost ON TRUE
         LEFT JOIN LATERAL (
             SELECT pli.unit_price FROM price_list_items pli
             JOIN price_lists pls ON pls.id = pli.price_list_id
-            WHERE pli.product_id = p.id AND pli.variation_id IS NULL AND pli.min_qty = 1
+            WHERE pli.business_id = p.business_id AND pli.product_id = p.id AND pli.variation_id IS NULL AND pli.min_qty = 1
               AND pli.deleted_at IS NULL AND pls.is_default AND pls.deleted_at IS NULL
             LIMIT 1
         ) price ON TRUE
         LEFT JOIN LATERAL (
             SELECT SUM(sv.qty) AS qty FROM stock_levels sv
-            WHERE sv.product_id = p.id AND sv.deleted_at IS NULL{branch}
+            WHERE sv.business_id = p.business_id AND sv.product_id = p.id AND sv.deleted_at IS NULL{branch}
         ) stock ON TRUE
         WHERE p.business_id = :business_id AND p.deleted_at IS NULL
         ORDER BY p.name, p.id
     """
+
+
+def _products_count_sql(ctx: ExportCtx) -> str:
+    return "SELECT COUNT(*) FROM products p WHERE p.business_id = :business_id AND p.deleted_at IS NULL"
 
 
 def _customers_sql(ctx: ExportCtx) -> str:
@@ -264,11 +327,15 @@ def _customers_sql(ctx: ExportCtx) -> str:
         LEFT JOIN price_lists pl ON pl.id = c.price_list_id
         LEFT JOIN LATERAL (
             SELECT SUM(cl.amount) AS balance FROM customer_ledger cl
-            WHERE cl.customer_id = c.id AND cl.deleted_at IS NULL
+            WHERE cl.business_id = c.business_id AND cl.customer_id = c.id AND cl.deleted_at IS NULL
         ) led ON TRUE
         WHERE c.business_id = :business_id AND c.deleted_at IS NULL
         ORDER BY c.name, c.id
     """
+
+
+def _customers_count_sql(ctx: ExportCtx) -> str:
+    return "SELECT COUNT(*) FROM customers c WHERE c.business_id = :business_id AND c.deleted_at IS NULL"
 
 
 def _customer_ledger_sql(ctx: ExportCtx) -> str:
@@ -285,6 +352,14 @@ def _customer_ledger_sql(ctx: ExportCtx) -> str:
     """
 
 
+def _customer_ledger_count_sql(ctx: ExportCtx) -> str:
+    return """
+        SELECT COUNT(*) FROM customer_ledger cl
+        WHERE cl.business_id = :business_id AND cl.deleted_at IS NULL
+          AND cl.entry_at >= :start AND cl.entry_at < :end
+    """
+
+
 def _suppliers_sql(ctx: ExportCtx) -> str:
     return """
         SELECT s.name AS name, COALESCE(s.contact_person, '') AS contact_person,
@@ -295,11 +370,15 @@ def _suppliers_sql(ctx: ExportCtx) -> str:
         FROM suppliers s
         LEFT JOIN LATERAL (
             SELECT SUM(sl.amount) AS balance FROM supplier_ledger sl
-            WHERE sl.supplier_id = s.id AND sl.deleted_at IS NULL
+            WHERE sl.business_id = s.business_id AND sl.supplier_id = s.id AND sl.deleted_at IS NULL
         ) led ON TRUE
         WHERE s.business_id = :business_id AND s.deleted_at IS NULL
         ORDER BY s.name, s.id
     """
+
+
+def _suppliers_count_sql(ctx: ExportCtx) -> str:
+    return "SELECT COUNT(*) FROM suppliers s WHERE s.business_id = :business_id AND s.deleted_at IS NULL"
 
 
 def _supplier_ledger_sql(ctx: ExportCtx) -> str:
@@ -312,6 +391,14 @@ def _supplier_ledger_sql(ctx: ExportCtx) -> str:
         WHERE sl.business_id = :business_id AND sl.deleted_at IS NULL
           AND sl.entry_at >= :start AND sl.entry_at < :end
         ORDER BY sl.entry_at, sl.id
+    """
+
+
+def _supplier_ledger_count_sql(ctx: ExportCtx) -> str:
+    return """
+        SELECT COUNT(*) FROM supplier_ledger sl
+        WHERE sl.business_id = :business_id AND sl.deleted_at IS NULL
+          AND sl.entry_at >= :start AND sl.entry_at < :end
     """
 
 
@@ -331,6 +418,14 @@ def _expenses_sql(ctx: ExportCtx) -> str:
     """
 
 
+def _expenses_count_sql(ctx: ExportCtx) -> str:
+    return f"""
+        SELECT COUNT(*) FROM expenses e
+        WHERE e.business_id = :business_id AND e.deleted_at IS NULL
+          AND e.expense_date BETWEEN :date_from AND :date_to{_branch_clause(ctx, "e.branch_id")}
+    """
+
+
 def _purchases_sql(ctx: ExportCtx) -> str:
     return f"""
         SELECT po.po_number AS po_number, po.ordered_at AS ordered_at, b.name AS branch,
@@ -343,11 +438,20 @@ def _purchases_sql(ctx: ExportCtx) -> str:
         LEFT JOIN LATERAL (
             SELECT COUNT(*) AS lines, SUM(pl.ordered_qty * pl.cost_per_unit) AS ordered_total,
                    SUM(pl.received_qty * pl.cost_per_unit) AS received_total
-            FROM purchase_lines pl WHERE pl.purchase_order_id = po.id AND pl.deleted_at IS NULL
+            FROM purchase_lines pl
+            WHERE pl.business_id = po.business_id AND pl.purchase_order_id = po.id AND pl.deleted_at IS NULL
         ) l ON TRUE
         WHERE po.business_id = :business_id AND po.deleted_at IS NULL
           AND po.ordered_at >= :start AND po.ordered_at < :end{_branch_clause(ctx, "po.branch_id")}
         ORDER BY po.ordered_at, po.id
+    """
+
+
+def _purchases_count_sql(ctx: ExportCtx) -> str:
+    return f"""
+        SELECT COUNT(*) FROM purchase_orders po
+        WHERE po.business_id = :business_id AND po.deleted_at IS NULL
+          AND po.ordered_at >= :start AND po.ordered_at < :end{_branch_clause(ctx, "po.branch_id")}
     """
 
 
@@ -465,7 +569,7 @@ DATASETS: dict[str, Dataset] = {
                 "payment_methods cashier"
             ),
             "One row per sale in the date range",
-            uses_dates=True, uses_branch=True, sql=_sales_sql,
+            uses_dates=True, uses_branch=True, sql=_sales_sql, count_sql=_sales_count_sql,
         ),
         Dataset(
             "sale_lines",
@@ -475,7 +579,7 @@ DATASETS: dict[str, Dataset] = {
                 "cost_per_unit:money"
             ),
             "One row per sale line in the date range",
-            uses_dates=True, uses_branch=True, sql=_sale_lines_sql,
+            uses_dates=True, uses_branch=True, sql=_sale_lines_sql, count_sql=_sale_lines_count_sql,
         ),
         Dataset(
             "inventory",
@@ -488,7 +592,7 @@ DATASETS: dict[str, Dataset] = {
             _cols("name sku barcode category unit cost:money price:money stock:qty"),
             "Product catalog; the same columns are accepted by POST /products/import "
             "(stock = current stock, import column opening_stock)",
-            uses_branch=True, sql=_products_sql,
+            uses_branch=True, sql=_products_sql, count_sql=_products_count_sql,
         ),
         Dataset(
             "customers",
@@ -497,13 +601,14 @@ DATASETS: dict[str, Dataset] = {
                 "price_list is_active"
             ),
             "Customers with ledger balance (negative = customer owes)",
-            extra_permission="customers.view", sql=_customers_sql,
+            extra_permission="customers.view", sql=_customers_sql, count_sql=_customers_count_sql,
         ),
         Dataset(
             "customer_ledger",
             _cols("entry_at:datetime customer entry_type amount:money reference_type reference notes"),
             "Customer ledger entries in the date range",
-            uses_dates=True, extra_permission="customers.ledger.view", sql=_customer_ledger_sql,
+            uses_dates=True, extra_permission="customers.ledger.view",
+            sql=_customer_ledger_sql, count_sql=_customer_ledger_count_sql,
         ),
         Dataset(
             "suppliers",
@@ -512,13 +617,14 @@ DATASETS: dict[str, Dataset] = {
                 "balance:money is_active"
             ),
             "Suppliers with ledger balance",
-            extra_permission="suppliers.view", sql=_suppliers_sql,
+            extra_permission="suppliers.view", sql=_suppliers_sql, count_sql=_suppliers_count_sql,
         ),
         Dataset(
             "supplier_ledger",
             _cols("entry_at:datetime supplier entry_type amount:money reference_type notes"),
             "Supplier ledger entries in the date range",
-            uses_dates=True, extra_permission="suppliers.ledger.view", sql=_supplier_ledger_sql,
+            uses_dates=True, extra_permission="suppliers.ledger.view",
+            sql=_supplier_ledger_sql, count_sql=_supplier_ledger_count_sql,
         ),
         Dataset(
             "expenses",
@@ -527,7 +633,8 @@ DATASETS: dict[str, Dataset] = {
                 "amount:money tax:money total:money"
             ),
             "Expenses dated in the range",
-            uses_dates=True, uses_branch=True, extra_permission="expenses.view", sql=_expenses_sql,
+            uses_dates=True, uses_branch=True, extra_permission="expenses.view",
+            sql=_expenses_sql, count_sql=_expenses_count_sql,
         ),
         Dataset(
             "purchases",
@@ -537,7 +644,7 @@ DATASETS: dict[str, Dataset] = {
             ),
             "Purchase orders ordered in the range",
             uses_dates=True, uses_branch=True, extra_permission="inventory.purchase_orders.view",
-            sql=_purchases_sql,
+            sql=_purchases_sql, count_sql=_purchases_count_sql,
         ),
         Dataset(
             "profit_loss",
@@ -596,6 +703,14 @@ def too_large(limit: int) -> HTTPException:
     )
 
 
+def too_large_pdf(limit: int, count: int) -> HTTPException:
+    return HTTPException(
+        status.HTTP_413_REQUEST_ENTITY_TOO_LARGE,
+        f"PDF export is limited to {limit:,} rows (requested {count:,} rows). "
+        "Please narrow the date range or choose Excel / CSV format.",
+    )
+
+
 @dataclass
 class Prepared:
     dataset: Dataset
@@ -605,22 +720,47 @@ class Prepared:
     row_count: int = 0
 
 
-async def prepare(db: AsyncSession, dataset: Dataset, ctx: ExportCtx) -> Prepared:
+async def prepare(
+    db: AsyncSession, dataset: Dataset, ctx: ExportCtx, fmt: str = "csv"
+) -> Prepared:
     """Run the cheap checks (row cap) before any byte is sent, so a 413 is a clean response."""
+    # Ensure business_name is populated
+    if not ctx.business_name:
+        r = await db.execute(
+            text("SELECT name FROM businesses WHERE id = :id"), {"id": ctx.business_id}
+        )
+        ctx.business_name = r.scalar_one_or_none() or "Business"
+
     limit = settings.export_max_rows
+    pdf_limit = settings.export_pdf_max_rows
+
     if dataset.loader is not None:
         rows = await dataset.loader(db, ctx)
-        if len(rows) > limit:
+        count = len(rows)
+        if count > limit:
             raise too_large(limit)
-        return Prepared(dataset, ctx, rows=rows, row_count=len(rows))
+        if fmt == "pdf" and count > pdf_limit:
+            raise too_large_pdf(pdf_limit, count)
+        return Prepared(dataset, ctx, rows=rows, row_count=count)
+
     assert dataset.sql is not None
-    sql = dataset.sql(ctx)
-    count = (
-        await db.execute(text(f"SELECT COUNT(*) FROM ({sql}) AS export_rows"), _bind(sql, ctx))  # noqa: S608
-    ).scalar_one()
+    # Fast count query when available
+    if dataset.count_sql is not None:
+        c_sql = dataset.count_sql(ctx)
+        count = (await db.execute(text(c_sql), _bind(c_sql, ctx))).scalar_one()
+    else:
+        sql = dataset.sql(ctx)
+        count = (
+            await db.execute(text(f"SELECT COUNT(*) FROM ({sql}) AS export_rows"), _bind(sql, ctx))  # noqa: S608
+        ).scalar_one()
+
+    count = int(count)
     if count > limit:
         raise too_large(limit)
-    return Prepared(dataset, ctx, sql=sql, row_count=int(count))
+    if fmt == "pdf" and count > pdf_limit:
+        raise too_large_pdf(pdf_limit, count)
+
+    return Prepared(dataset, ctx, sql=dataset.sql(ctx), row_count=count)
 
 
 def _bind(sql: str, ctx: ExportCtx) -> dict[str, Any]:
@@ -674,13 +814,14 @@ async def stream_csv(prepared: Prepared) -> AsyncIterator[bytes]:
 _WIDTH = {"text": 24, "date": 12, "datetime": 17, "money": 14, "qty": 12, "int": 10, "pct": 10}
 
 
-async def stream_xlsx(prepared: Prepared) -> AsyncIterator[bytes]:
+def _build_xlsx_file(
+    tmp_path: str, dataset: Dataset, zone: ZoneInfo, rows_iter: Iterable[dict[str, Any]]
+) -> None:
     from openpyxl import Workbook
     from openpyxl.cell import WriteOnlyCell
     from openpyxl.styles import Font
     from openpyxl.utils import get_column_letter
 
-    dataset, zone = prepared.dataset, prepared.ctx.zone
     wb = Workbook(write_only=True)
     ws = wb.create_sheet(dataset.name[:31])
     for index, col in enumerate(dataset.columns, start=1):
@@ -689,28 +830,279 @@ async def stream_xlsx(prepared: Prepared) -> AsyncIterator[bytes]:
         )
     ws.freeze_panes = "A2"
     bold = Font(bold=True)
-    header_cells = []
-    for col in dataset.columns:
-        cell = WriteOnlyCell(ws, value=col.header)
+    header_cells = [WriteOnlyCell(ws, value=col.header) for col in dataset.columns]
+    for cell in header_cells:
         cell.font = bold
-        header_cells.append(cell)
     ws.append(header_cells)
 
-    async for row in iter_rows(prepared):
+    for row in rows_iter:
         cells: list[Any] = []
         for col, value in zip(
             dataset.columns, _row_cells(row, dataset, zone, numeric=True), strict=True
         ):
             if col.kind in ("money", "pct") and value is not None and value != "":
-                cell = WriteOnlyCell(ws, value=value)
-                cell.number_format = "0.00"
-                cells.append(cell)
+                cells.append(float(value))
             else:
                 cells.append(value)
         ws.append(cells)
 
-    with tempfile.SpooledTemporaryFile(max_size=8 * 1024 * 1024) as spool:
-        wb.save(spool)
-        spool.seek(0)
-        while chunk := spool.read(64 * 1024):
-            yield chunk
+    wb.save(tmp_path)
+
+
+async def stream_xlsx(prepared: Prepared) -> AsyncIterator[bytes]:
+    dataset, zone = prepared.dataset, prepared.ctx.zone
+    with tempfile.NamedTemporaryFile(suffix=".xlsx", delete=False) as tmp:
+        tmp_path = tmp.name
+
+    try:
+        row_queue: queue.Queue[list[dict[str, Any]] | None] = queue.Queue(maxsize=10)
+        worker_error: list[Exception] = []
+
+        def xlsx_worker() -> None:
+            try:
+                def row_generator() -> Iterable[dict[str, Any]]:
+                    while True:
+                        batch = row_queue.get()
+                        if batch is None:
+                            break
+                        for r in batch:
+                            yield r
+                        row_queue.task_done()
+
+                _build_xlsx_file(tmp_path, dataset, zone, row_generator())
+            except Exception as e:
+                worker_error.append(e)
+
+        thread = threading.Thread(target=xlsx_worker, daemon=True)
+        thread.start()
+
+        batch: list[dict[str, Any]] = []
+        async for row in iter_rows(prepared):
+            batch.append(row)
+            if len(batch) >= 1000:
+                await asyncio.to_thread(row_queue.put, batch)
+                batch = []
+                if worker_error:
+                    raise worker_error[0]
+
+        if batch:
+            await asyncio.to_thread(row_queue.put, batch)
+        await asyncio.to_thread(row_queue.put, None)
+        await asyncio.to_thread(thread.join)
+
+        if worker_error:
+            raise worker_error[0]
+
+        with open(tmp_path, "rb") as f:
+            while chunk := f.read(64 * 1024):
+                yield chunk
+    finally:
+        try:
+            os.remove(tmp_path)
+        except OSError:
+            pass
+
+
+# ── PDF generation (fpdf2 off event loop) ───────────────────────────────────
+
+
+_COL_WEIGHTS = {
+    "text": 1.5,
+    "date": 1.1,
+    "datetime": 1.4,
+    "money": 1.3,
+    "qty": 1.0,
+    "int": 0.8,
+    "pct": 0.8,
+}
+_SPECIAL_COL_WEIGHTS = {
+    "sale_number": 1.6,
+    "client_receipt_no": 1.4,
+    "customer": 2.0,
+    "cashier": 1.6,
+    "product": 2.2,
+    "variation": 1.4,
+    "description": 2.4,
+    "notes": 2.2,
+    "name": 2.0,
+    "address": 2.2,
+    "email": 2.0,
+    "payment_methods": 1.8,
+    "po_number": 1.6,
+    "expense_number": 1.6,
+    "supplier": 2.0,
+    "category": 1.6,
+    "sku": 1.2,
+    "barcode": 1.3,
+    "unit": 0.8,
+    "status": 1.1,
+    "sale_type": 1.1,
+    "branch": 1.5,
+}
+
+_SUMMARY_COLS = {
+    "sales": {"subtotal", "discount", "tax", "total", "paid", "balance_due"},
+    "sale_lines": {"qty", "discount", "tax", "line_total"},
+    "inventory": {"qty", "total_value"},
+    "products": {"stock"},
+    "customer_ledger": {"amount"},
+    "supplier_ledger": {"amount"},
+    "expenses": {"amount", "tax", "total"},
+    "purchases": {"lines", "ordered_total", "received_total"},
+    "cashier_performance": {"sales", "revenue", "returns", "voids", "discounts"},
+    "top_products": {"qty_sold", "revenue", "cost", "gross_profit"},
+}
+
+
+class ExportPDF(FPDF):
+    def __init__(
+        self,
+        business_name: str,
+        title: str,
+        date_range_str: str,
+        generated_at_str: str,
+        orientation: str = "landscape",
+    ):
+        super().__init__(orientation=orientation, unit="mm", format="A4")
+        self.business_name = business_name
+        self.doc_title = title
+        self.date_range_str = date_range_str
+        self.generated_at_str = generated_at_str
+
+        font_dir = Path(__file__).resolve().parents[2] / "static" / "fonts"
+        sans = font_dir / "NotoSans-Regular.ttf"
+        arabic = font_dir / "NotoNaskhArabic-Regular.ttf"
+
+        if sans.exists():
+            self.set_text_shaping(True)
+            self.add_font("NotoSans", "", str(sans))
+            self.add_font("NotoSans", "B", str(sans))
+            if arabic.exists():
+                self.add_font("NotoArabic", "", str(arabic))
+                self.add_font("NotoArabic", "B", str(arabic))
+                self.set_fallback_fonts(["NotoArabic"])
+            self.default_font = "NotoSans"
+        else:
+            self.default_font = "Helvetica"
+
+        self.set_auto_page_break(auto=True, margin=15)
+
+    def header(self) -> None:
+        self.set_font(self.default_font, "B", 13)
+        self.cell(0, 6, self.business_name, new_x="LMARGIN", new_y="NEXT")
+
+        self.set_font(self.default_font, "B", 10)
+        self.cell(0, 5, self.doc_title, new_x="LMARGIN", new_y="NEXT")
+
+        self.set_font(self.default_font, "", 8)
+        self.set_text_color(90, 90, 90)
+        info = f"{self.date_range_str}   |   {self.generated_at_str}"
+        self.cell(0, 5, info, new_x="LMARGIN", new_y="NEXT")
+        self.set_text_color(0, 0, 0)
+        self.ln(2)
+
+    def footer(self) -> None:
+        self.set_y(-12)
+        self.set_font(self.default_font, "", 8)
+        self.set_text_color(128, 128, 128)
+        page_str = f"Page {self.page_no()} of {{nb}}"
+        self.cell(0, 8, page_str, align="C")
+
+
+def _build_pdf_bytes(dataset: Dataset, ctx: ExportCtx, rows: list[dict[str, Any]]) -> bytes:
+    orientation = "landscape" if len(dataset.columns) > 6 else "portrait"
+    printable_width = 277.0 if orientation == "landscape" else 190.0
+
+    pdf = ExportPDF(
+        business_name=ctx.business_name or "Store",
+        title=f"{dataset.name.replace('_', ' ').title()} Export",
+        date_range_str=(
+            f"Date Range: {ctx.date_from.strftime('%Y-%m-%d')} to {ctx.date_to.strftime('%Y-%m-%d')}"
+            if dataset.uses_dates
+            else f"As of: {ctx.date_to.strftime('%Y-%m-%d')}"
+        ),
+        generated_at_str=f"Generated: {datetime.now(ctx.zone).strftime('%Y-%m-%d %H:%M')} ({ctx.zone.key})",
+        orientation=orientation,
+    )
+    pdf.add_page()
+
+    weights = [
+        _SPECIAL_COL_WEIGHTS.get(c.key, _COL_WEIGHTS.get(c.kind, 1.2)) for c in dataset.columns
+    ]
+    total_w = sum(weights)
+    raw_widths = [round(printable_width * (w / total_w), 1) for w in weights]
+    diff = round(printable_width - sum(raw_widths), 1)
+    raw_widths[-1] = round(raw_widths[-1] + diff, 1)
+    col_widths = tuple(raw_widths)
+
+    aligns = tuple(
+        "RIGHT"
+        if c.kind in ("money", "pct", "qty", "int")
+        else "CENTER"
+        if c.kind in ("date", "datetime")
+        else "LEFT"
+        for c in dataset.columns
+    )
+
+    num_cols = len(dataset.columns)
+    font_size = 6.5 if num_cols > 12 else 7.5 if num_cols > 8 else 8.5 if num_cols > 5 else 9.0
+    pdf.set_font(pdf.default_font, size=font_size)
+
+    totals = {
+        c.key: Decimal("0")
+        for c in dataset.columns
+        if c.key in _SUMMARY_COLS.get(dataset.name, set())
+    }
+
+    with pdf.table(
+        col_widths=col_widths,
+        text_align=aligns,
+        headings_style=FontFace(emphasis="B", fill_color=(240, 240, 240)),
+        repeat_headings=1,
+    ) as table:
+        hdr_row = table.row()
+        for col in dataset.columns:
+            hdr_row.cell(col.header)
+
+        for row in rows:
+            for k in totals:
+                val = row.get(k)
+                if val is not None:
+                    totals[k] += _dec(val)
+            r = table.row()
+            for col in dataset.columns:
+                r.cell(format_cell_pdf(row.get(col.key), col, ctx.zone))
+
+        if dataset.name in _SUMMARY_COLS and rows:
+            summary_cols = _SUMMARY_COLS[dataset.name]
+            summary_row = table.row(style=FontFace(emphasis="B", fill_color=(235, 235, 235)))
+            for col_idx, col in enumerate(dataset.columns):
+                if col_idx == 0:
+                    summary_row.cell("Total")
+                elif col.key in summary_cols:
+                    tot_val = totals[col.key]
+                    if col.kind == "money":
+                        summary_row.cell(
+                            f"PKR {tot_val:,.2f}" if tot_val >= 0 else f"-PKR {abs(tot_val):,.2f}"
+                        )
+                    elif col.kind == "qty":
+                        text_ = f"{tot_val.quantize(_QTY, rounding=ROUND_HALF_UP):f}"
+                        if "." in text_:
+                            text_ = text_.rstrip("0").rstrip(".")
+                        summary_row.cell(text_ or "0")
+                    elif col.kind == "int":
+                        summary_row.cell(f"{int(tot_val):,}")
+                    else:
+                        summary_row.cell(f"{tot_val:.2f}")
+                else:
+                    summary_row.cell("")
+
+    return bytes(pdf.output())
+
+
+async def generate_pdf(prepared: Prepared) -> bytes:
+    """Render PDF off the event loop so CPU work does not block other requests."""
+    rows: list[dict[str, Any]] = []
+    async for r in iter_rows(prepared):
+        rows.append(r)
+    return await asyncio.to_thread(_build_pdf_bytes, prepared.dataset, prepared.ctx, rows)
