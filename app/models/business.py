@@ -100,11 +100,11 @@ class Business(Base, AuditMixin, SoftDeleteMixin, SyncMixin):
     )
     branches: Mapped[list["Branch"]] = relationship(
         back_populates="business",
-        lazy="selectin",
+        lazy="noload",
     )
     users: Mapped[list["User"]] = relationship(
         back_populates="business",
-        lazy="selectin",
+        lazy="noload",
     )
 
 

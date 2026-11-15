@@ -94,19 +94,19 @@ class PurchaseOrder(Base, AuditMixin, SoftDeleteMixin, SyncMixin):
     )
     created_by: Mapped[uuid.UUID] = mapped_column(Uuid(as_uuid=True), nullable=False)
 
-    business: Mapped["Business"] = relationship(lazy="selectin")
-    branch: Mapped["Branch"] = relationship(lazy="selectin")
+    business: Mapped["Business"] = relationship(lazy="noload")
+    branch: Mapped["Branch"] = relationship(lazy="noload")
     supplier: Mapped["Supplier"] = relationship(
         back_populates="purchase_orders",
-        lazy="selectin",
+        lazy="noload",
     )
     lines: Mapped[list["PurchaseLine"]] = relationship(
         back_populates="purchase_order",
-        lazy="selectin",
+        lazy="noload",
     )
     receipts: Mapped[list["PurchaseReceipt"]] = relationship(
         back_populates="purchase_order",
-        lazy="selectin",
+        lazy="noload",
     )
 
 
@@ -181,17 +181,17 @@ class PurchaseLine(Base, SoftDeleteMixin, SyncMixin):
 
     purchase_order: Mapped["PurchaseOrder | None"] = relationship(
         back_populates="lines",
-        lazy="selectin",
+        lazy="noload",
     )
     production_order: Mapped["ProductionOrder | None"] = relationship(
         back_populates="cost_layers",
-        lazy="selectin",
+        lazy="noload",
     )
-    product: Mapped["Product"] = relationship(lazy="selectin")
-    variation: Mapped["ProductVariation | None"] = relationship(lazy="selectin")
+    product: Mapped["Product"] = relationship(lazy="noload")
+    variation: Mapped["ProductVariation | None"] = relationship(lazy="noload")
     stock_movements: Mapped[list["StockMovement"]] = relationship(
         back_populates="purchase_line",
-        lazy="selectin",
+        lazy="noload",
     )
 
 
@@ -379,13 +379,13 @@ class StockMovement(Base, SoftDeleteMixin, SyncMixin):
     )
     created_by: Mapped[uuid.UUID] = mapped_column(Uuid(as_uuid=True), nullable=False)
 
-    business: Mapped["Business"] = relationship(lazy="selectin")
-    branch: Mapped["Branch"] = relationship(lazy="selectin")
-    product: Mapped["Product"] = relationship(lazy="selectin")
-    variation: Mapped["ProductVariation | None"] = relationship(lazy="selectin")
+    business: Mapped["Business"] = relationship(lazy="noload")
+    branch: Mapped["Branch"] = relationship(lazy="noload")
+    product: Mapped["Product"] = relationship(lazy="noload")
+    variation: Mapped["ProductVariation | None"] = relationship(lazy="noload")
     purchase_line: Mapped["PurchaseLine | None"] = relationship(
         back_populates="stock_movements",
-        lazy="selectin",
+        lazy="noload",
     )
 
 

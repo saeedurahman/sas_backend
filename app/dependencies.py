@@ -5,7 +5,7 @@ from fastapi import Depends, HTTPException, Request, status
 from fastapi.security import OAuth2PasswordBearer
 from sqlalchemy import select, text
 from sqlalchemy.ext.asyncio import AsyncSession
-from sqlalchemy.orm import noload, selectinload
+from sqlalchemy.orm import joinedload, noload, selectinload
 
 from app.core import permission_cache
 from app.core.config import settings
@@ -68,12 +68,12 @@ async def get_current_user(
             headers={"WWW-Authenticate": "Bearer"},
         ) from None
 
-    from app.models.business import Business
+    from app.models.business import Branch, Business
 
     cached_keys = permission_cache.get(user_id)
-    roles_load = selectinload(User.user_roles).selectinload(UserRole.role)
+    roles_load = selectinload(User.user_roles).joinedload(UserRole.role)
     if cached_keys is None:
-        roles_load = roles_load.selectinload(Role.role_permissions).selectinload(
+        roles_load = roles_load.selectinload(Role.role_permissions).joinedload(
             RolePermission.permission
         )
     else:
@@ -84,11 +84,9 @@ async def get_current_user(
         select(User)
         .where(User.id == user_id)
         .options(
-            selectinload(User.business).options(
-                selectinload(Business.business_type),
-                selectinload(Business.config),
-            ),
-            selectinload(User.default_branch),
+            joinedload(User.business).joinedload(Business.business_type),
+            joinedload(User.business).joinedload(Business.config),
+            joinedload(User.default_branch).noload(Branch.business),
             roles_load,
         )
     )

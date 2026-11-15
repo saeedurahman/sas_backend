@@ -655,8 +655,8 @@ async def _h_sale_create(ctx: Ctx, db, p: SaleCreatePayload, op: OpEnvelope) -> 
             updated_at=ctx.now,
         )
         db.add(sale_line)
-        await db.flush()
         created_lines.append(sale_line)
+    await db.flush()
 
     for pay in p.payments:
         paid_at = pay.paid_at or sold_at
@@ -1084,6 +1084,9 @@ async def _run_op_once(ctx: Ctx, op: OpEnvelope, payload_hash: str) -> dict[str,
             device_id=ctx.device_id,
         )
     await db.commit()
+    from app.services.analytics_service import invalidate_dashboard_cache
+
+    invalidate_dashboard_cache(ctx.business_id)
     return result
 
 

@@ -203,6 +203,10 @@ class Settings(BaseSettings):
     price_bulk_max_items: int = Field(
         default=2000, ge=1, validation_alias="PRICE_BULK_MAX_ITEMS"
     )
+    # Analytics date range cap in days (Phase 6a).
+    analytics_max_range_days: int = Field(
+        default=400, ge=1, validation_alias="ANALYTICS_MAX_RANGE_DAYS"
+    )
     # "cloudinary://<api_key>:<api_secret>@<cloud_name>". Empty = local /static uploads (dev only).
     cloudinary_url: str = Field(default="", validation_alias="CLOUDINARY_URL")
     cloudinary_folder: str = Field(default="pos", validation_alias="CLOUDINARY_FOLDER")

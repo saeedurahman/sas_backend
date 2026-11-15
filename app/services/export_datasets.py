@@ -36,8 +36,20 @@ from zoneinfo import ZoneInfo
 from fastapi import HTTPException, status
 from fpdf import FPDF
 from fpdf.fonts import FontFace
+import arabic_reshaper
+from bidi.algorithm import get_display
 from sqlalchemy import text
 from sqlalchemy.ext.asyncio import AsyncSession
+
+_ARABIC_URDU_RE = re.compile(r"[\u0600-\u06FF\u0750-\u077F\uFB50-\uFDFF\uFE70-\uFEFF]")
+
+
+def shape_text_if_needed(text: str) -> str:
+    """Selectively reshape and apply BiDi to text containing Arabic/Urdu characters."""
+    if not text or not _ARABIC_URDU_RE.search(text):
+        return text
+    reshaped = arabic_reshaper.reshape(text)
+    return get_display(reshaped)
 
 from app.core.config import settings
 from app.database import AsyncSessionLocal
@@ -185,7 +197,7 @@ def format_cell_pdf(value: Any, col: Col, zone: ZoneInfo) -> str:
         return _qty_text(_dec(value))
     if col.kind == "int":
         return f"{int(value):,}"
-    return str(value)
+    return shape_text_if_needed(str(value))
 
 
 def _row_cells(row: dict[str, Any], dataset: Dataset, zone: ZoneInfo, numeric: bool) -> list[Any]:
@@ -964,17 +976,19 @@ class ExportPDF(FPDF):
         orientation: str = "landscape",
     ):
         super().__init__(orientation=orientation, unit="mm", format="A4")
-        self.business_name = business_name
-        self.doc_title = title
+        self.business_name = shape_text_if_needed(business_name)
+        self.doc_title = shape_text_if_needed(title)
         self.date_range_str = date_range_str
         self.generated_at_str = generated_at_str
+        self.header_func: Callable[[], None] | None = None
 
         font_dir = Path(__file__).resolve().parents[2] / "static" / "fonts"
         sans = font_dir / "NotoSans-Regular.ttf"
         arabic = font_dir / "NotoNaskhArabic-Regular.ttf"
 
         if sans.exists():
-            self.set_text_shaping(True)
+            # Performance optimization: disable global uharfbuzz text shaping which adds
+            # 30+ seconds overhead to large tables. Arabic/Urdu text is selectively shaped.
             self.add_font("NotoSans", "", str(sans))
             self.add_font("NotoSans", "B", str(sans))
             if arabic.exists():
@@ -1000,6 +1014,8 @@ class ExportPDF(FPDF):
         self.cell(0, 5, info, new_x="LMARGIN", new_y="NEXT")
         self.set_text_color(0, 0, 0)
         self.ln(2)
+        if self.header_func is not None:
+            self.header_func()
 
     def footer(self) -> None:
         self.set_y(-12)
@@ -1024,7 +1040,6 @@ def _build_pdf_bytes(dataset: Dataset, ctx: ExportCtx, rows: list[dict[str, Any]
         generated_at_str=f"Generated: {datetime.now(ctx.zone).strftime('%Y-%m-%d %H:%M')} ({ctx.zone.key})",
         orientation=orientation,
     )
-    pdf.add_page()
 
     weights = [
         _SPECIAL_COL_WEIGHTS.get(c.key, _COL_WEIGHTS.get(c.kind, 1.2)) for c in dataset.columns
@@ -1036,17 +1051,39 @@ def _build_pdf_bytes(dataset: Dataset, ctx: ExportCtx, rows: list[dict[str, Any]
     col_widths = tuple(raw_widths)
 
     aligns = tuple(
-        "RIGHT"
+        "R"
         if c.kind in ("money", "pct", "qty", "int")
-        else "CENTER"
+        else "C"
         if c.kind in ("date", "datetime")
-        else "LEFT"
+        else "L"
         for c in dataset.columns
     )
 
     num_cols = len(dataset.columns)
     font_size = 6.5 if num_cols > 12 else 7.5 if num_cols > 8 else 8.5 if num_cols > 5 else 9.0
-    pdf.set_font(pdf.default_font, size=font_size)
+    row_height = 5.0 if font_size < 8 else 5.5
+
+    headers = [shape_text_if_needed(c.header) for c in dataset.columns]
+
+    def render_table_header() -> None:
+        pdf.set_font(pdf.default_font, "B", size=font_size)
+        pdf.set_fill_color(240, 240, 240)
+        pdf.set_draw_color(220, 220, 220)
+        for i, (h, w, a) in enumerate(zip(headers, col_widths, aligns)):
+            is_last = (i == len(headers) - 1)
+            pdf.cell(
+                w,
+                row_height + 1,
+                f" {h} ",
+                border=1,
+                align=a,
+                fill=True,
+                new_x="LMARGIN" if is_last else "RIGHT",
+                new_y="NEXT" if is_last else "TOP",
+            )
+
+    pdf.header_func = render_table_header
+    pdf.add_page()
 
     totals = {
         c.key: Decimal("0")
@@ -1054,48 +1091,76 @@ def _build_pdf_bytes(dataset: Dataset, ctx: ExportCtx, rows: list[dict[str, Any]
         if c.key in _SUMMARY_COLS.get(dataset.name, set())
     }
 
-    with pdf.table(
-        col_widths=col_widths,
-        text_align=aligns,
-        headings_style=FontFace(emphasis="B", fill_color=(240, 240, 240)),
-        repeat_headings=1,
-    ) as table:
-        hdr_row = table.row()
-        for col in dataset.columns:
-            hdr_row.cell(col.header)
+    pdf.set_font(pdf.default_font, "", size=font_size)
+    pdf.set_fill_color(255, 255, 255)
+    pdf.set_draw_color(230, 230, 230)
 
-        for row in rows:
-            for k in totals:
-                val = row.get(k)
-                if val is not None:
-                    totals[k] += _dec(val)
-            r = table.row()
-            for col in dataset.columns:
-                r.cell(format_cell_pdf(row.get(col.key), col, ctx.zone))
+    for row in rows:
+        for k in totals:
+            val = row.get(k)
+            if val is not None:
+                totals[k] += _dec(val)
 
-        if dataset.name in _SUMMARY_COLS and rows:
-            summary_cols = _SUMMARY_COLS[dataset.name]
-            summary_row = table.row(style=FontFace(emphasis="B", fill_color=(235, 235, 235)))
-            for col_idx, col in enumerate(dataset.columns):
-                if col_idx == 0:
-                    summary_row.cell("Total")
-                elif col.key in summary_cols:
-                    tot_val = totals[col.key]
-                    if col.kind == "money":
-                        summary_row.cell(
-                            f"PKR {tot_val:,.2f}" if tot_val >= 0 else f"-PKR {abs(tot_val):,.2f}"
-                        )
-                    elif col.kind == "qty":
-                        text_ = f"{tot_val.quantize(_QTY, rounding=ROUND_HALF_UP):f}"
-                        if "." in text_:
-                            text_ = text_.rstrip("0").rstrip(".")
-                        summary_row.cell(text_ or "0")
-                    elif col.kind == "int":
-                        summary_row.cell(f"{int(tot_val):,}")
-                    else:
-                        summary_row.cell(f"{tot_val:.2f}")
+        # Check page break trigger
+        if pdf.get_y() + row_height > pdf.page_break_trigger:
+            pdf.add_page()
+            pdf.set_font(pdf.default_font, "", size=font_size)
+            pdf.set_draw_color(230, 230, 230)
+
+        for i, col in enumerate(dataset.columns):
+            text_val = format_cell_pdf(row.get(col.key), col, ctx.zone)
+            is_last = (i == len(dataset.columns) - 1)
+            pdf.cell(
+                col_widths[i],
+                row_height,
+                f" {text_val} " if text_val else "",
+                border=1,
+                align=aligns[i],
+                new_x="LMARGIN" if is_last else "RIGHT",
+                new_y="NEXT" if is_last else "TOP",
+            )
+
+    # Summary row
+    if dataset.name in _SUMMARY_COLS and rows:
+        if pdf.get_y() + row_height > pdf.page_break_trigger:
+            pdf.add_page()
+        pdf.set_font(pdf.default_font, "B", size=font_size)
+        pdf.set_fill_color(235, 235, 235)
+        pdf.set_draw_color(220, 220, 220)
+        summary_cols = _SUMMARY_COLS[dataset.name]
+        for col_idx, col in enumerate(dataset.columns):
+            is_last = (col_idx == len(dataset.columns) - 1)
+            if col_idx == 0:
+                text_ = " Total "
+            elif col.key in summary_cols:
+                tot_val = totals[col.key]
+                if col.kind == "money":
+                    text_ = (
+                        f" PKR {tot_val:,.2f} "
+                        if tot_val >= 0
+                        else f" -PKR {abs(tot_val):,.2f} "
+                    )
+                elif col.kind == "qty":
+                    t = f"{tot_val.quantize(_QTY, rounding=ROUND_HALF_UP):f}"
+                    if "." in t:
+                        t = t.rstrip("0").rstrip(".")
+                    text_ = f" {t or '0'} "
+                elif col.kind == "int":
+                    text_ = f" {int(tot_val):,} "
                 else:
-                    summary_row.cell("")
+                    text_ = f" {tot_val:.2f} "
+            else:
+                text_ = ""
+            pdf.cell(
+                col_widths[col_idx],
+                row_height,
+                text_,
+                border=1,
+                align=aligns[col_idx],
+                fill=True,
+                new_x="LMARGIN" if is_last else "RIGHT",
+                new_y="NEXT" if is_last else "TOP",
+            )
 
     return bytes(pdf.output())
 

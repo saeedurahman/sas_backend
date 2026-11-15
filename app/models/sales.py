@@ -349,9 +349,9 @@ class SaleLine(Base, SoftDeleteMixin, SyncMixin):
     )
     created_by: Mapped[uuid.UUID] = mapped_column(Uuid(as_uuid=True), nullable=False)
 
-    sale: Mapped["Sale"] = relationship(back_populates="lines", lazy="selectin")
-    product: Mapped["Product"] = relationship(lazy="selectin")
-    variation: Mapped["ProductVariation | None"] = relationship(lazy="selectin")
+    sale: Mapped["Sale"] = relationship(back_populates="lines", lazy="noload")
+    product: Mapped["Product"] = relationship(lazy="noload")
+    variation: Mapped["ProductVariation | None"] = relationship(lazy="noload")
 
 
 class SalePayment(Base, SoftDeleteMixin, SyncMixin):

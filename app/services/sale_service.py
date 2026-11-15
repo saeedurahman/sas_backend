@@ -394,11 +394,47 @@ async def compute_sale_pricing(
             product_category_by_id,
         )
 
-    for line in data.lines:
-        await verify_product(db, line.product_id, business_id)
-        if line.variation_id is not None:
-            await verify_variation(
-                db, line.variation_id, line.product_id, business_id
+    product_ids_set = {line.product_id for line in data.lines}
+    if product_ids_set:
+        found_products = set(
+            (
+                await db.execute(
+                    select(Product.id).where(
+                        Product.id.in_(product_ids_set),
+                        Product.business_id == business_id,
+                        Product.deleted_at.is_(None),
+                    )
+                )
+            ).scalars().all()
+        )
+        if len(found_products) != len(product_ids_set):
+            raise HTTPException(
+                status_code=status.HTTP_400_BAD_REQUEST,
+                detail="Product not found",
+            )
+
+    variation_map = {
+        (line.product_id, line.variation_id)
+        for line in data.lines
+        if line.variation_id is not None
+    }
+    if variation_map:
+        v_ids = [v_id for _, v_id in variation_map]
+        found_variations = set(
+            (
+                await db.execute(
+                    select(ProductVariation.product_id, ProductVariation.id).where(
+                        ProductVariation.id.in_(v_ids),
+                        ProductVariation.business_id == business_id,
+                        ProductVariation.deleted_at.is_(None),
+                    )
+                )
+            ).all()
+        )
+        if not variation_map.issubset(found_variations):
+            raise HTTPException(
+                status_code=status.HTTP_400_BAD_REQUEST,
+                detail="Variation not found for product",
             )
 
     # Tax comes from the product's tax_rate_id; a client rate only counts for
@@ -604,8 +640,8 @@ async def create_sale(
                 updated_at=now,
             )
             db.add(sale_line)
-            await db.flush()
             created_lines.append(sale_line)
+        await db.flush()
 
         for applied in settlement.payments:
             paid_at = applied.paid_at or now
@@ -692,6 +728,9 @@ async def create_sale(
             )
 
         await db.commit()
+        from app.services.analytics_service import invalidate_dashboard_cache
+
+        invalidate_dashboard_cache(business_id)
     except HTTPException:
         await db.rollback()
         raise
@@ -973,6 +1012,9 @@ async def void_sale(
         )
 
         await db.commit()
+        from app.services.analytics_service import invalidate_dashboard_cache
+
+        invalidate_dashboard_cache(business_id)
     except HTTPException:
         await db.rollback()
         raise
@@ -1058,6 +1100,9 @@ async def cancel_sale(
         )
 
         await db.commit()
+        from app.services.analytics_service import invalidate_dashboard_cache
+
+        invalidate_dashboard_cache(business_id)
     except HTTPException:
         await db.rollback()
         raise

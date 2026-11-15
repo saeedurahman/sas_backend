@@ -2,7 +2,7 @@
 
 from datetime import datetime, timezone
 from decimal import ROUND_HALF_UP, Decimal
-from uuid import UUID
+from uuid import UUID, uuid4
 
 from fastapi import HTTPException, status
 from sqlalchemy import func, select
@@ -443,7 +443,9 @@ async def create_sale_return(
         for item in prepared:
             line_data = item["request"]
             original = item["original"]
+            line_id = uuid4()
             return_line = SaleReturnLine(
+                id=line_id,
                 business_id=business_id,
                 sale_return_id=sale_return.id,
                 sale_line_id=line_data.sale_line_id,
@@ -458,7 +460,6 @@ async def create_sale_return(
                 updated_at=now,
             )
             db.add(return_line)
-            await db.flush()
 
             if original is not None:
                 await restore_sale_line_inventory(
@@ -473,7 +474,7 @@ async def create_sale_return(
                     qty_to_restore=line_data.qty,
                     movement_type=StockMovementTypeEnum.sale_return,
                     reference_type=ReferenceTypeEnum.sale_return_line,
-                    reference_id=return_line.id,
+                    reference_id=line_id,
                     created_by=created_by,
                     movement_at=returned_at,
                 )
@@ -505,11 +506,12 @@ async def create_sale_return(
                     qty=line_data.qty,
                     cost_per_unit=cost,
                     reference_type=ReferenceTypeEnum.sale_return_line,
-                    reference_id=return_line.id,
+                    reference_id=line_id,
                     created_by=created_by,
                     purchase_line_id=layer.id,
                     movement_at=returned_at,
                 )
+        await db.flush()
 
         for refund in data.refund_payments:
             payment = SaleReturnPayment(
@@ -579,6 +581,9 @@ async def create_sale_return(
         )
 
         await db.commit()
+        from app.services.analytics_service import invalidate_dashboard_cache
+
+        invalidate_dashboard_cache(business_id)
     except HTTPException:
         await db.rollback()
         raise

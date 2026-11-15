@@ -49,9 +49,26 @@ uvicorn main:app --reload --port 8000
 | `PLATFORM_ADMIN_RATE_LIMITS` | defaults below | `login_ip=10/minute,login_account=5/minute,api=300/minute` overrides |
 | `LICENSE_SIGNING_PRIVATE_KEY` / `LICENSE_PUBLIC_KEY` | empty | Ed25519 key pair (`scripts/generate_license_keypair.py`); set both or neither |
 
+| `DB_POOL_SIZE` | `10` | SQLAlchemy persistent connection pool size per process |
+| `DB_MAX_OVERFLOW` | `20` | Maximum connections allowed beyond `DB_POOL_SIZE` during traffic bursts |
+| `DB_POOL_TIMEOUT` | `10` | Pool checkout timeout in seconds |
+| `ANALYTICS_MAX_RANGE_DAYS` | `400` | Maximum date range span allowed on analytics endpoints (returns 400 when breached) |
+
 Rate limits use the format `<count>/<second|minute|hour|day>`. Exceeding one returns `429` with a
 `Retry-After` header. The limiter is **in-process**: with several workers or instances each keeps its own
 counters, so also enforce limits at the reverse proxy / load balancer.
+
+### Connection Pool and Worker Sizing
+
+The backend uses SQLAlchemy with an asyncpg connection pool (`app/database.py`).
+- **Recommended Gunicorn/Uvicorn worker count:** `(2 x CPU_cores) + 1` (e.g., 4–8 workers on typical 2–4 core cloud instances).
+- **Total Postgres connection capacity calculation:**
+  $$\text{Total Connections} = \text{Workers} \times (\text{DB\_POOL\_SIZE} + \text{DB\_MAX\_OVERFLOW})$$
+  With 4 workers, this represents up to $4 \times (10 + 20) = 120$ possible connections. Ensure PostgreSQL's `max_connections` (default 100 on stock Postgres) is sized accordingly, or adjust `DB_POOL_SIZE=5` and `DB_MAX_OVERFLOW=10` per worker if running high worker counts or external connection poolers (e.g. PgBouncer).
+- **Per-Process In-Memory State & Rate Limiting:**
+  - **Rate Limits:** In-process sliding window (`slowapi`/`limits`). Each worker tracks rate limits in its own memory. When multiple workers or instances are deployed, rate limits are per-worker; configure upstream rate limiting on your reverse proxy / API gateway (e.g. NGINX, Cloudflare) for unified edge enforcement.
+  - **Dashboard Cache:** 30-second TTL cache for `/analytics/dashboard` and `/analytics/dashboard/enhanced` stored in worker memory, automatically invalidated on local sale creations, voids, returns, and sync pushes.
+  - **Permission Cache:** In-memory user permission cache (`app/core/permission_cache.py`) invalidated on role/user permission mutations; avoids redundant database role lookups on hot API paths.
 
 ### Production startup checks
 

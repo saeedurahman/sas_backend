@@ -55,7 +55,7 @@ class Category(Base, AuditMixin, SoftDeleteMixin, SyncMixin):
     )
     products: Mapped[list["Product"]] = relationship(
         back_populates="category",
-        lazy="selectin",
+        lazy="noload",
     )
 
 
@@ -78,7 +78,7 @@ class Brand(Base, AuditMixin, SoftDeleteMixin, SyncMixin):
 
     products: Mapped[list["Product"]] = relationship(
         back_populates="brand",
-        lazy="selectin",
+        lazy="noload",
     )
 
 
@@ -102,11 +102,11 @@ class Unit(Base, AuditMixin, SoftDeleteMixin, SyncMixin):
 
     products: Mapped[list["Product"]] = relationship(
         back_populates="base_unit",
-        lazy="selectin",
+        lazy="noload",
     )
     variations: Mapped[list["ProductVariation"]] = relationship(
         back_populates="unit",
-        lazy="selectin",
+        lazy="noload",
     )
 
 
@@ -191,31 +191,31 @@ class Product(Base, AuditMixin, SoftDeleteMixin, SyncMixin):
 
     category: Mapped["Category | None"] = relationship(
         back_populates="products",
-        lazy="selectin",
+        lazy="noload",
     )
     brand: Mapped["Brand | None"] = relationship(
         back_populates="products",
-        lazy="selectin",
+        lazy="noload",
     )
     base_unit: Mapped["Unit | None"] = relationship(
         back_populates="products",
-        lazy="selectin",
+        lazy="noload",
     )
     variations: Mapped[list["ProductVariation"]] = relationship(
         back_populates="product",
-        lazy="selectin",
+        lazy="noload",
     )
     barcodes: Mapped[list["Barcode"]] = relationship(
         back_populates="product",
-        lazy="selectin",
+        lazy="noload",
     )
     locations: Mapped[list["ProductLocation"]] = relationship(
         back_populates="product",
-        lazy="selectin",
+        lazy="noload",
     )
     price_list_items: Mapped[list["PriceListItem"]] = relationship(
         back_populates="product",
-        lazy="selectin",
+        lazy="noload",
     )
 
 
@@ -251,23 +251,23 @@ class ProductVariation(Base, AuditMixin, SoftDeleteMixin, SyncMixin):
 
     product: Mapped["Product"] = relationship(
         back_populates="variations",
-        lazy="selectin",
+        lazy="noload",
     )
     unit: Mapped["Unit | None"] = relationship(
         back_populates="variations",
-        lazy="selectin",
+        lazy="noload",
     )
     barcodes: Mapped[list["Barcode"]] = relationship(
         back_populates="variation",
-        lazy="selectin",
+        lazy="noload",
     )
     locations: Mapped[list["ProductLocation"]] = relationship(
         back_populates="variation",
-        lazy="selectin",
+        lazy="noload",
     )
     price_list_items: Mapped[list["PriceListItem"]] = relationship(
         back_populates="variation",
-        lazy="selectin",
+        lazy="noload",
     )
 
 

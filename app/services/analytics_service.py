@@ -1,12 +1,17 @@
 """Analytics and reporting services — SQL aggregation only."""
 
+import time
 from datetime import date, datetime, timedelta, timezone
 from decimal import Decimal
+from typing import Any
 from uuid import UUID
+from zoneinfo import ZoneInfo
 
+from fastapi import HTTPException
 from sqlalchemy import text
 from sqlalchemy.ext.asyncio import AsyncSession
 
+from app.core.config import settings
 from app.schemas.analytics import (
     BranchComparisonItem,
     CashInDrawerResponse,
@@ -34,6 +39,7 @@ from app.schemas.analytics import (
     TodayVsYesterdayResponse,
     TopProductItem,
 )
+from app.services.business_time import get_business_tz
 
 _ZERO = Decimal("0")
 _HUNDRED = Decimal("100")
@@ -48,9 +54,60 @@ _DAY_NAMES = [
     "Saturday",
 ]
 
+_DASHBOARD_CACHE_TTL = 30.0  # seconds
+_dashboard_cache: dict[tuple[UUID, UUID | None, str], tuple[float, Any]] = {}
+
+
+def invalidate_dashboard_cache(business_id: UUID) -> None:
+    """Invalidate cached dashboard data when a sale or void occurs."""
+    keys_to_del = [k for k in _dashboard_cache if k[0] == business_id]
+    for k in keys_to_del:
+        _dashboard_cache.pop(k, None)
+
+
+def validate_date_range(date_from: date, date_to: date) -> None:
+    """Ensure date_to >= date_from and span does not exceed ANALYTICS_MAX_RANGE_DAYS."""
+    if date_to < date_from:
+        raise HTTPException(
+            status_code=400,
+            detail="date_to must be on or after date_from",
+        )
+    max_days = settings.analytics_max_range_days
+    if (date_to - date_from).days > max_days:
+        raise HTTPException(
+            status_code=400,
+            detail=f"Date range exceeds maximum allowed {max_days} days",
+        )
+
+
+async def _date_bounds(
+    db: AsyncSession,
+    business_id: UUID,
+    date_from: date,
+    date_to: date,
+) -> tuple[datetime, datetime, ZoneInfo]:
+    """Sargable date range bounds computed in business timezone."""
+    zone = await get_business_tz(db, business_id)
+    from_ts = datetime(date_from.year, date_from.month, date_from.day, 0, 0, 0, tzinfo=zone)
+    to_ts_next = datetime(date_to.year, date_to.month, date_to.day, 0, 0, 0, tzinfo=zone) + timedelta(days=1)
+    return from_ts, to_ts_next, zone
+
+
+async def _business_today_bounds(
+    db: AsyncSession,
+    business_id: UUID,
+) -> tuple[date, datetime, datetime, ZoneInfo]:
+    """Business today and sargable boundaries in business timezone."""
+    zone = await get_business_tz(db, business_id)
+    now_in_tz = datetime.now(zone)
+    today = now_in_tz.date()
+    today_from = datetime(today.year, today.month, today.day, 0, 0, 0, tzinfo=zone)
+    today_to = today_from + timedelta(days=1)
+    return today, today_from, today_to, zone
+
 
 async def _today(db: AsyncSession) -> date:
-    """Today in the business timezone (the request sets the session TimeZone)."""
+    """Today in the business timezone."""
     return (await db.execute(text("SELECT CURRENT_DATE"))).scalar_one()
 
 
@@ -164,41 +221,44 @@ async def get_dashboard_summary(
     business_id: UUID,
     branch_id: UUID | None = None,
 ) -> DashboardSummaryResponse:
-    today = await _today(db)
-    branch_sql = _branch_clause(branch_id, "s")
-    params: dict = {"business_id": business_id, "today": today}
+    cache_key = (business_id, branch_id, "summary")
+    cached = _dashboard_cache.get(cache_key)
+    if cached is not None and cached[0] > time.monotonic():
+        return cached[1]
 
+    today, today_from, today_to, zone = await _business_today_bounds(db, business_id)
+    month_start = today.replace(day=1)
+    month_from = datetime(month_start.year, month_start.month, 1, 0, 0, 0, tzinfo=zone)
+    month_to = today_to
+
+    branch_sql = _branch_clause(branch_id, "s")
+    params: dict = {
+        "business_id": business_id,
+        "today_from": today_from,
+        "today_to": today_to,
+        "month_from": month_from,
+        "month_to": month_to,
+    }
     if branch_id is not None:
         params["branch_id"] = branch_id
 
-    base_from = _base_sale_joins() + branch_sql + " AND s.sold_at::date = :today"
-
-    today_revenue_sql = f"""
-        SELECT COALESCE(SUM({_line_revenue_expr()}), 0)
-        {base_from}
-    """
-    today_cost_sql = f"""
-        SELECT COALESCE(SUM({_line_cost_expr()}), 0)
-        {base_from}
-    """
-    today_tx_sql = f"""
-        SELECT COUNT(DISTINCT s.id)
-        {base_from}
+    today_sales_sql = f"""
+        SELECT
+            COALESCE(SUM({_line_revenue_expr()}), 0) AS revenue,
+            COALESCE(SUM({_line_cost_expr()}), 0) AS cost,
+            COUNT(DISTINCT s.id) AS tx_count
+        {_base_sale_joins()}
+            {branch_sql}
+            AND s.sold_at >= :today_from AND s.sold_at < :today_to
     """
 
-    month_branch = _branch_clause(branch_id, "s")
-    month_from = (
-        _base_sale_joins()
-        + month_branch
-        + " AND s.sold_at >= DATE_TRUNC('month', CURRENT_DATE)"
-    )
-    month_revenue_sql = f"""
-        SELECT COALESCE(SUM({_line_revenue_expr()}), 0)
-        {month_from}
-    """
-    month_cost_sql = f"""
-        SELECT COALESCE(SUM({_line_cost_expr()}), 0)
-        {month_from}
+    month_sales_sql = f"""
+        SELECT
+            COALESCE(SUM({_line_revenue_expr()}), 0) AS revenue,
+            COALESCE(SUM({_line_cost_expr()}), 0) AS cost
+        {_base_sale_joins()}
+            {branch_sql}
+            AND s.sold_at >= :month_from AND s.sold_at < :month_to
     """
 
     low_stock_sql = """
@@ -255,11 +315,17 @@ async def get_dashboard_summary(
         ) sub
     """
 
-    today_revenue = await _scalar(db, today_revenue_sql, params)
-    today_cost = await _scalar(db, today_cost_sql, params)
-    today_transactions = await _scalar_int(db, today_tx_sql, params)
-    month_revenue = await _scalar(db, month_revenue_sql, params)
-    month_cost = await _scalar(db, month_cost_sql, params)
+    today_result = await db.execute(text(today_sales_sql), params)
+    today_row = today_result.one()
+    today_revenue = _dec(today_row.revenue)
+    today_cost = _dec(today_row.cost)
+    today_transactions = int(today_row.tx_count or 0)
+
+    month_result = await db.execute(text(month_sales_sql), params)
+    month_row = month_result.one()
+    month_revenue = _dec(month_row.revenue)
+    month_cost = _dec(month_row.cost)
+
     low_stock_alerts = await _scalar_int(db, low_stock_sql, params)
     open_shifts = await _scalar_int(db, open_shifts_sql, params)
     pending_customer = await _scalar(db, customer_bal_sql, params)
@@ -273,7 +339,7 @@ async def get_dashboard_summary(
         else _ZERO
     )
 
-    return DashboardSummaryResponse(
+    res = DashboardSummaryResponse(
         today_revenue=today_revenue,
         today_transactions=today_transactions,
         today_profit=today_profit,
@@ -285,6 +351,8 @@ async def get_dashboard_summary(
         pending_customer_balances=pending_customer,
         pending_supplier_balances=pending_supplier,
     )
+    _dashboard_cache[cache_key] = (time.monotonic() + _DASHBOARD_CACHE_TTL, res)
+    return res
 
 
 async def get_sales_summary(
@@ -294,11 +362,13 @@ async def get_sales_summary(
     date_to: date,
     branch_id: UUID | None = None,
 ) -> SalesSummaryResponse:
+    validate_date_range(date_from, date_to)
+    from_ts, to_ts_next, zone = await _date_bounds(db, business_id, date_from, date_to)
     branch_sql = _branch_clause(branch_id, "s")
     params: dict = {
         "business_id": business_id,
-        "date_from": date_from,
-        "date_to": date_to,
+        "from_ts": from_ts,
+        "to_ts_next": to_ts_next,
     }
     if branch_id is not None:
         params["branch_id"] = branch_id
@@ -312,7 +382,7 @@ async def get_sales_summary(
             COALESCE(SUM(sl.tax_amount), 0) AS total_tax
         {_base_sale_joins()}
             {branch_sql}
-            AND s.sold_at::date BETWEEN :date_from AND :date_to
+            AND s.sold_at >= :from_ts AND s.sold_at < :to_ts_next
     """
     result = await db.execute(text(summary_sql), params)
     row = result.one()
@@ -325,7 +395,7 @@ async def get_sales_summary(
         WHERE srl.business_id = :business_id
             AND srl.deleted_at IS NULL
             AND sr.deleted_at IS NULL
-            AND sr.returned_at::date BETWEEN :date_from AND :date_to
+            AND sr.returned_at >= :from_ts AND sr.returned_at < :to_ts_next
             {_branch_clause(branch_id, "sr").replace("s.", "sr.")}
     """
     total_returns = await _scalar(db, returns_sql, params)
@@ -362,6 +432,8 @@ async def get_sales_trend(
     date_to: date,
     branch_id: UUID | None = None,
 ) -> list[SalesTrendItem]:
+    validate_date_range(date_from, date_to)
+    from_ts, to_ts_next, zone = await _date_bounds(db, business_id, date_from, date_to)
     trunc_map = {"daily": "day", "weekly": "week", "monthly": "month"}
     trunc = trunc_map.get(period, "day")
     format_map = {
@@ -373,22 +445,22 @@ async def get_sales_trend(
     branch_sql = _branch_clause(branch_id, "s")
     params: dict = {
         "business_id": business_id,
-        "date_from": date_from,
-        "date_to": date_to,
+        "from_ts": from_ts,
+        "to_ts_next": to_ts_next,
     }
     if branch_id is not None:
         params["branch_id"] = branch_id
 
     sql = f"""
         SELECT
-            TO_CHAR(DATE_TRUNC('{trunc}', s.sold_at), '{fmt}') AS period,
+            TO_CHAR(DATE_TRUNC('{trunc}', s.sold_at AT TIME ZONE current_setting('TimeZone')), '{fmt}') AS period,
             COALESCE(SUM({_line_revenue_expr()}), 0) AS revenue,
             COUNT(DISTINCT s.id) AS transactions
         {_base_sale_joins()}
             {branch_sql}
-            AND s.sold_at::date BETWEEN :date_from AND :date_to
-        GROUP BY DATE_TRUNC('{trunc}', s.sold_at)
-        ORDER BY DATE_TRUNC('{trunc}', s.sold_at) ASC
+            AND s.sold_at >= :from_ts AND s.sold_at < :to_ts_next
+        GROUP BY DATE_TRUNC('{trunc}', s.sold_at AT TIME ZONE current_setting('TimeZone'))
+        ORDER BY DATE_TRUNC('{trunc}', s.sold_at AT TIME ZONE current_setting('TimeZone')) ASC
     """
     result = await db.execute(text(sql), params)
     items: list[SalesTrendItem] = []
@@ -414,29 +486,16 @@ async def get_payment_breakdown(
     date_to: date,
     branch_id: UUID | None = None,
 ) -> list[PaymentBreakdownItem]:
+    validate_date_range(date_from, date_to)
+    from_ts, to_ts_next, zone = await _date_bounds(db, business_id, date_from, date_to)
     branch_sql = _branch_clause(branch_id, "s")
     params: dict = {
         "business_id": business_id,
-        "date_from": date_from,
-        "date_to": date_to,
+        "from_ts": from_ts,
+        "to_ts_next": to_ts_next,
     }
     if branch_id is not None:
         params["branch_id"] = branch_id
-
-    total_sql = f"""
-        SELECT COALESCE(SUM(sp.amount), 0)
-        FROM sale_payments sp
-        INNER JOIN sales s ON s.id = sp.sale_id
-            AND s.business_id = sp.business_id
-        WHERE sp.business_id = :business_id
-            AND sp.deleted_at IS NULL
-            AND s.deleted_at IS NULL
-            AND sp.status = 'completed'
-            AND {_SALE_ACTIVE}
-            {branch_sql}
-            AND s.sold_at::date BETWEEN :date_from AND :date_to
-    """
-    grand_total = await _scalar(db, total_sql, params)
 
     breakdown_sql = f"""
         SELECT
@@ -452,13 +511,16 @@ async def get_payment_breakdown(
             AND sp.status = 'completed'
             AND {_SALE_ACTIVE}
             {branch_sql}
-            AND s.sold_at::date BETWEEN :date_from AND :date_to
+            AND s.sold_at >= :from_ts AND s.sold_at < :to_ts_next
         GROUP BY sp.payment_method
         ORDER BY total_amount DESC
     """
     result = await db.execute(text(breakdown_sql), params)
+    rows = result.fetchall()
+    grand_total = sum((_dec(r.total_amount) for r in rows), _ZERO)
+
     items: list[PaymentBreakdownItem] = []
-    for row in result:
+    for row in rows:
         amount = _dec(row.total_amount)
         pct = (
             (amount / grand_total * _HUNDRED).quantize(Decimal("0.01"))
@@ -484,11 +546,13 @@ async def get_top_products(
     branch_id: UUID | None = None,
     limit: int = 20,
 ) -> list[TopProductItem]:
+    validate_date_range(date_from, date_to)
+    from_ts, to_ts_next, zone = await _date_bounds(db, business_id, date_from, date_to)
     branch_sql = _branch_clause(branch_id, "s")
     params: dict = {
         "business_id": business_id,
-        "date_from": date_from,
-        "date_to": date_to,
+        "from_ts": from_ts,
+        "to_ts_next": to_ts_next,
         "limit": limit,
     }
     if branch_id is not None:
@@ -514,7 +578,7 @@ async def get_top_products(
                 AND s.deleted_at IS NULL
                 AND {_SALE_ACTIVE}
                 {branch_sql}
-                AND s.sold_at::date BETWEEN :date_from AND :date_to
+                AND s.sold_at >= :from_ts AND s.sold_at < :to_ts_next
             GROUP BY sl.product_id, sl.variation_id, p.name, pv.name
         ),
         ranked AS (
@@ -552,11 +616,13 @@ async def get_category_performance(
     date_to: date,
     branch_id: UUID | None = None,
 ) -> list[CategoryPerformanceItem]:
+    validate_date_range(date_from, date_to)
+    from_ts, to_ts_next, zone = await _date_bounds(db, business_id, date_from, date_to)
     branch_sql = _branch_clause(branch_id, "s")
     params: dict = {
         "business_id": business_id,
-        "date_from": date_from,
-        "date_to": date_to,
+        "from_ts": from_ts,
+        "to_ts_next": to_ts_next,
     }
     if branch_id is not None:
         params["branch_id"] = branch_id
@@ -578,7 +644,7 @@ async def get_category_performance(
                 AND s.deleted_at IS NULL
                 AND {_SALE_ACTIVE}
                 {branch_sql}
-                AND s.sold_at::date BETWEEN :date_from AND :date_to
+                AND s.sold_at >= :from_ts AND s.sold_at < :to_ts_next
             GROUP BY c.id, c.name
         ),
         grand AS (
@@ -617,10 +683,12 @@ async def get_branch_comparison(
     date_from: date,
     date_to: date,
 ) -> list[BranchComparisonItem]:
+    validate_date_range(date_from, date_to)
+    from_ts, to_ts_next, zone = await _date_bounds(db, business_id, date_from, date_to)
     params = {
         "business_id": business_id,
-        "date_from": date_from,
-        "date_to": date_to,
+        "from_ts": from_ts,
+        "to_ts_next": to_ts_next,
     }
     sql = f"""
         SELECT
@@ -637,7 +705,7 @@ async def get_branch_comparison(
             AND sl.deleted_at IS NULL
             AND s.deleted_at IS NULL
             AND {_SALE_ACTIVE}
-            AND s.sold_at::date BETWEEN :date_from AND :date_to
+            AND s.sold_at >= :from_ts AND s.sold_at < :to_ts_next
         GROUP BY s.branch_id, b.name
         ORDER BY total_revenue DESC
     """
@@ -667,12 +735,14 @@ async def get_cashier_performance(
     date_to: date,
     branch_id: UUID | None = None,
 ) -> list[CashierPerformanceItem]:
+    validate_date_range(date_from, date_to)
+    from_ts, to_ts_next, zone = await _date_bounds(db, business_id, date_from, date_to)
     branch_sql = _branch_clause(branch_id, "s")
     branch_ret = _branch_clause(branch_id, "sr").replace("s.", "sr.")
     params: dict = {
         "business_id": business_id,
-        "date_from": date_from,
-        "date_to": date_to,
+        "from_ts": from_ts,
+        "to_ts_next": to_ts_next,
     }
     if branch_id is not None:
         params["branch_id"] = branch_id
@@ -701,7 +771,7 @@ async def get_cashier_performance(
             WHERE sl.business_id = :business_id
                 AND sl.deleted_at IS NULL
                 AND s.deleted_at IS NULL
-                AND s.sold_at::date BETWEEN :date_from AND :date_to
+                AND s.sold_at >= :from_ts AND s.sold_at < :to_ts_next
                 {branch_sql}
             GROUP BY s.created_by, u.full_name
         ),
@@ -710,7 +780,7 @@ async def get_cashier_performance(
             FROM sale_returns sr
             WHERE sr.business_id = :business_id
                 AND sr.deleted_at IS NULL
-                AND sr.returned_at::date BETWEEN :date_from AND :date_to
+                AND sr.returned_at >= :from_ts AND sr.returned_at < :to_ts_next
                 {branch_ret}
             GROUP BY sr.created_by
         ),
@@ -759,12 +829,14 @@ async def get_fraud_alerts(
     date_to: date,
     branch_id: UUID | None = None,
 ) -> list[FraudAlertItem]:
+    validate_date_range(date_from, date_to)
+    from_ts, to_ts_next, zone = await _date_bounds(db, business_id, date_from, date_to)
     branch_sql = _branch_clause(branch_id, "s")
     branch_ret = _branch_clause(branch_id, "sr").replace("s.", "sr.")
     params: dict = {
         "business_id": business_id,
-        "date_from": date_from,
-        "date_to": date_to,
+        "from_ts": from_ts,
+        "to_ts_next": to_ts_next,
     }
     if branch_id is not None:
         params["branch_id"] = branch_id
@@ -776,16 +848,16 @@ async def get_fraud_alerts(
             s.created_by AS user_id,
             u.full_name AS user_name,
             s.branch_id,
-            s.sold_at::date AS sale_date,
+            (s.sold_at AT TIME ZONE current_setting('TimeZone'))::date AS sale_date,
             COUNT(*) AS void_count
         FROM sales s
         INNER JOIN users u ON u.id = s.created_by
         WHERE s.business_id = :business_id
             AND s.deleted_at IS NULL
             AND s.status IN ('cancelled', 'voided')
-            AND s.sold_at::date BETWEEN :date_from AND :date_to
+            AND s.sold_at >= :from_ts AND s.sold_at < :to_ts_next
             {branch_sql}
-        GROUP BY s.created_by, u.full_name, s.branch_id, s.sold_at::date
+        GROUP BY s.created_by, u.full_name, s.branch_id, (s.sold_at AT TIME ZONE current_setting('TimeZone'))::date
         HAVING COUNT(*) > 3
     """
     void_result = await db.execute(text(high_voids_sql), params)
@@ -823,14 +895,14 @@ async def get_fraud_alerts(
                 AND s.deleted_at IS NULL
                 AND {_SALE_ACTIVE}
                 {branch_sql}
-                AND s.sold_at::date BETWEEN :date_from AND :date_to
+                AND s.sold_at >= :from_ts AND s.sold_at < :to_ts_next
             GROUP BY s.created_by, u.full_name, s.branch_id
         ),
         business_avg AS (
             SELECT AVG(sl.discount_pct) AS avg_discount
             {_base_sale_joins()}
                 {branch_sql}
-                AND s.sold_at::date BETWEEN :date_from AND :date_to
+                AND s.sold_at >= :from_ts AND s.sold_at < :to_ts_next
         )
         SELECT
             ca.user_id,
@@ -871,7 +943,7 @@ async def get_fraud_alerts(
             WHERE s.business_id = :business_id
                 AND s.deleted_at IS NULL
                 AND {_SALE_ACTIVE}
-                AND s.sold_at::date BETWEEN :date_from AND :date_to
+                AND s.sold_at >= :from_ts AND s.sold_at < :to_ts_next
                 {branch_sql}
             GROUP BY s.created_by
         ),
@@ -880,7 +952,7 @@ async def get_fraud_alerts(
             FROM sale_returns sr
             WHERE sr.business_id = :business_id
                 AND sr.deleted_at IS NULL
-                AND sr.returned_at::date BETWEEN :date_from AND :date_to
+                AND sr.returned_at >= :from_ts AND sr.returned_at < :to_ts_next
                 {branch_ret}
             GROUP BY sr.created_by
         )
@@ -947,7 +1019,7 @@ async def get_fraud_alerts(
             AND rs.deleted_at IS NULL
             AND rt.deleted_at IS NULL
             AND rt.tx_type = 'cash_out'
-            AND rs.opened_at::date BETWEEN :date_from AND :date_to
+            AND rs.opened_at >= :from_ts AND rs.opened_at < :to_ts_next
     """
     if branch_id is not None:
         drawer_sql += " AND rs.branch_id = :branch_id"
@@ -1176,46 +1248,47 @@ async def get_customer_insights(
     params = {"business_id": business_id, "limit": limit}
 
     sql = f"""
-        SELECT
-            c.id AS customer_id,
-            c.name AS customer_name,
-            c.phone,
-            COUNT(DISTINCT s.id) FILTER (
-                WHERE s.id IS NOT NULL AND {_SALE_ACTIVE}
-            ) AS total_purchases,
-            COALESCE(SUM({_line_revenue_expr()}) FILTER (
-                WHERE s.id IS NOT NULL AND {_SALE_ACTIVE}
-            ), 0) AS total_spent,
-            COALESCE(ledger.balance, 0) AS outstanding_balance,
-            MAX(s.sold_at) FILTER (
-                WHERE s.id IS NOT NULL AND {_SALE_ACTIVE}
-            )::date AS last_purchase_date,
-            CASE
-                WHEN MAX(s.sold_at) FILTER (
-                    WHERE s.id IS NOT NULL AND {_SALE_ACTIVE}
-                ) IS NOT NULL
-                THEN CURRENT_DATE - MAX(s.sold_at) FILTER (
-                    WHERE s.id IS NOT NULL AND {_SALE_ACTIVE}
-                )::date
-                ELSE NULL
-            END AS days_since_last_purchase
-        FROM customers c
-        LEFT JOIN sales s ON s.customer_id = c.id
-            AND s.business_id = c.business_id
-            AND s.deleted_at IS NULL
-        LEFT JOIN sale_lines sl ON sl.sale_id = s.id
-            AND sl.business_id = c.business_id
-            AND sl.deleted_at IS NULL
-        LEFT JOIN (
+        WITH customer_sales AS (
+            SELECT
+                s.customer_id,
+                COUNT(DISTINCT s.id) AS total_purchases,
+                COALESCE(SUM({_line_revenue_expr()}), 0) AS total_spent,
+                MAX(s.sold_at) AS last_sold_at
+            FROM sales s
+            INNER JOIN sale_lines sl ON sl.sale_id = s.id
+                AND sl.business_id = s.business_id
+                AND sl.deleted_at IS NULL
+            WHERE s.business_id = :business_id
+                AND s.deleted_at IS NULL
+                AND {_SALE_ACTIVE}
+                AND s.customer_id IS NOT NULL
+            GROUP BY s.customer_id
+        ),
+        ledger AS (
             SELECT customer_id, SUM(amount) AS balance
             FROM customer_ledger
             WHERE business_id = :business_id
                 AND deleted_at IS NULL
             GROUP BY customer_id
-        ) ledger ON ledger.customer_id = c.id
+        )
+        SELECT
+            c.id AS customer_id,
+            c.name AS customer_name,
+            c.phone,
+            COALESCE(cs.total_purchases, 0) AS total_purchases,
+            COALESCE(cs.total_spent, 0) AS total_spent,
+            COALESCE(ledger.balance, 0) AS outstanding_balance,
+            cs.last_sold_at::date AS last_purchase_date,
+            CASE
+                WHEN cs.last_sold_at IS NOT NULL
+                THEN CURRENT_DATE - cs.last_sold_at::date
+                ELSE NULL
+            END AS days_since_last_purchase
+        FROM customers c
+        LEFT JOIN customer_sales cs ON cs.customer_id = c.id
+        LEFT JOIN ledger ON ledger.customer_id = c.id
         WHERE c.business_id = :business_id
             AND c.deleted_at IS NULL
-        GROUP BY c.id, c.name, c.phone, ledger.balance
         ORDER BY {order_clause}
         LIMIT :limit
     """
@@ -1252,6 +1325,7 @@ async def get_expense_summary(
     date_to: date,
     branch_id: UUID | None = None,
 ) -> list[ExpenseSummaryItem]:
+    validate_date_range(date_from, date_to)
     branch_sql = ""
     params: dict = {
         "business_id": business_id,
@@ -1274,7 +1348,7 @@ async def get_expense_summary(
             WHERE e.business_id = :business_id
                 AND e.deleted_at IS NULL
                 AND ec.deleted_at IS NULL
-                AND e.expense_date BETWEEN :date_from AND :date_to
+                AND e.expense_date >= :date_from AND e.expense_date <= :date_to
                 {branch_sql}
             GROUP BY ec.id, ec.name
         ),
@@ -1315,11 +1389,13 @@ async def get_profit_loss(
     date_to: date,
     branch_id: UUID | None = None,
 ) -> ProfitLossResponse:
+    validate_date_range(date_from, date_to)
+    from_ts, to_ts_next, _ = await _date_bounds(db, business_id, date_from, date_to)
     branch_sql = _branch_clause(branch_id, "s")
     params: dict = {
         "business_id": business_id,
-        "date_from": date_from,
-        "date_to": date_to,
+        "from_ts": from_ts,
+        "to_ts_next": to_ts_next,
     }
     if branch_id is not None:
         params["branch_id"] = branch_id
@@ -1330,7 +1406,7 @@ async def get_profit_loss(
             COALESCE(SUM({_line_cost_expr()}), 0) AS cogs
         {_base_sale_joins()}
             {branch_sql}
-            AND s.sold_at::date BETWEEN :date_from AND :date_to
+            AND s.sold_at >= :from_ts AND s.sold_at < :to_ts_next
     """
     rev_result = await db.execute(text(revenue_sql), params)
     rev_row = rev_result.one()
@@ -1374,23 +1450,29 @@ async def _daily_sale_metrics(
     target_date: date,
     branch_id: UUID | None = None,
 ) -> tuple[Decimal, int, Decimal, Decimal]:
+    from_ts, to_ts_next, _ = await _date_bounds(db, business_id, target_date, target_date)
     branch_sql = _branch_clause(branch_id, "s")
-    params: dict = {"business_id": business_id, "target_date": target_date}
+    params: dict = {
+        "business_id": business_id,
+        "from_ts": from_ts,
+        "to_ts_next": to_ts_next,
+    }
     if branch_id is not None:
         params["branch_id"] = branch_id
 
-    base = f"""
+    sql = f"""
+        SELECT
+            COALESCE(SUM({_line_revenue_expr()}), 0) AS revenue,
+            COALESCE(SUM({_line_cost_expr()}), 0) AS cost,
+            COUNT(DISTINCT s.id) AS transactions
         {_base_sale_joins()}
             {branch_sql}
-            AND s.sold_at::date = :target_date
+            AND s.sold_at >= :from_ts AND s.sold_at < :to_ts_next
     """
-    revenue_sql = f"SELECT COALESCE(SUM({_line_revenue_expr()}), 0) {base}"
-    cost_sql = f"SELECT COALESCE(SUM({_line_cost_expr()}), 0) {base}"
-    tx_sql = f"SELECT COUNT(DISTINCT s.id) {base}"
-
-    revenue = await _scalar(db, revenue_sql, params)
-    cost = await _scalar(db, cost_sql, params)
-    transactions = await _scalar_int(db, tx_sql, params)
+    row = (await db.execute(text(sql), params)).one()
+    revenue = _dec(row.revenue)
+    cost = _dec(row.cost)
+    transactions = int(row.transactions or 0)
     profit = revenue - cost
     avg_order = revenue / transactions if transactions > 0 else _ZERO
     return revenue, transactions, profit, avg_order.quantize(Decimal("0.01"))
@@ -1401,7 +1483,7 @@ async def get_today_vs_yesterday(
     business_id: UUID,
     branch_id: UUID | None = None,
 ) -> TodayVsYesterdayResponse:
-    today = await _today(db)
+    today, _, _, _ = await _business_today_bounds(db, business_id)
     yesterday = today - timedelta(days=1)
 
     (
@@ -1441,23 +1523,26 @@ async def get_peak_hours(
     date_to: date,
     branch_id: UUID | None = None,
 ) -> list[PeakHourItem]:
+    validate_date_range(date_from, date_to)
+    from_ts, to_ts_next, zone = await _date_bounds(db, business_id, date_from, date_to)
     branch_sql = _branch_clause(branch_id, "s")
     params: dict = {
         "business_id": business_id,
-        "date_from": date_from,
-        "date_to": date_to,
+        "from_ts": from_ts,
+        "to_ts_next": to_ts_next,
+        "tz_name": str(zone),
     }
     if branch_id is not None:
         params["branch_id"] = branch_id
 
     sql = f"""
         SELECT
-            EXTRACT(HOUR FROM s.sold_at AT TIME ZONE current_setting('TimeZone'))::int AS hour,
+            EXTRACT(HOUR FROM s.sold_at AT TIME ZONE :tz_name)::int AS hour,
             COALESCE(SUM({_line_revenue_expr()}), 0) AS total_revenue,
             COUNT(DISTINCT s.id) AS transaction_count
         {_base_sale_joins()}
             {branch_sql}
-            AND s.sold_at::date BETWEEN :date_from AND :date_to
+            AND s.sold_at >= :from_ts AND s.sold_at < :to_ts_next
         GROUP BY hour
     """
     result = await db.execute(text(sql), params)
@@ -1489,23 +1574,26 @@ async def get_peak_days(
     date_to: date,
     branch_id: UUID | None = None,
 ) -> list[PeakDayItem]:
+    validate_date_range(date_from, date_to)
+    from_ts, to_ts_next, zone = await _date_bounds(db, business_id, date_from, date_to)
     branch_sql = _branch_clause(branch_id, "s")
     params: dict = {
         "business_id": business_id,
-        "date_from": date_from,
-        "date_to": date_to,
+        "from_ts": from_ts,
+        "to_ts_next": to_ts_next,
+        "tz_name": str(zone),
     }
     if branch_id is not None:
         params["branch_id"] = branch_id
 
     sql = f"""
         SELECT
-            EXTRACT(DOW FROM s.sold_at AT TIME ZONE current_setting('TimeZone'))::int AS day_of_week,
+            EXTRACT(DOW FROM s.sold_at AT TIME ZONE :tz_name)::int AS day_of_week,
             COALESCE(SUM({_line_revenue_expr()}), 0) AS total_revenue,
             COUNT(DISTINCT s.id) AS transaction_count
         {_base_sale_joins()}
             {branch_sql}
-            AND s.sold_at::date BETWEEN :date_from AND :date_to
+            AND s.sold_at >= :from_ts AND s.sold_at < :to_ts_next
         GROUP BY day_of_week
     """
     result = await db.execute(text(sql), params)
@@ -1541,11 +1629,14 @@ async def get_product_movement(
     branch_id: UUID | None = None,
     dead_stock_days: int = 30,
 ) -> list[ProductMovementItem]:
-    today = await _today(db)
+    validate_date_range(date_from, date_to)
+    today, _, _, zone = await _business_today_bounds(db, business_id)
+    from_ts, to_ts_next, _ = await _date_bounds(db, business_id, date_from, date_to)
     params: dict = {
         "business_id": business_id,
-        "date_from": date_from,
-        "date_to": date_to,
+        "from_ts": from_ts,
+        "to_ts_next": to_ts_next,
+        "tz_name": str(zone),
     }
     branch_filter = ""
     sale_branch = ""
@@ -1570,7 +1661,7 @@ async def get_product_movement(
                 sl.variation_id,
                 COALESCE(SUM(sl.qty), 0) AS total_qty_sold,
                 COALESCE(SUM({_line_revenue_expr()}), 0) AS total_revenue,
-                MAX(s.sold_at::date) AS last_sale_date
+                (MAX(s.sold_at) AT TIME ZONE :tz_name)::date AS last_sale_date
             FROM sale_lines sl
             INNER JOIN sales s ON s.id = sl.sale_id
                 AND s.business_id = sl.business_id
@@ -1578,7 +1669,7 @@ async def get_product_movement(
                 AND sl.deleted_at IS NULL
                 AND s.deleted_at IS NULL
                 AND {_SALE_ACTIVE}
-                AND s.sold_at::date BETWEEN :date_from AND :date_to
+                AND s.sold_at >= :from_ts AND s.sold_at < :to_ts_next
                 {sale_branch}
             GROUP BY sl.product_id, sl.variation_id
         )
@@ -1634,11 +1725,12 @@ async def get_dead_stock(
     dead_stock_days: int = 30,
     branch_id: UUID | None = None,
 ) -> list[DeadStockItem]:
-    today = await _today(db)
+    today, _, _, zone = await _business_today_bounds(db, business_id)
     cutoff = today - timedelta(days=dead_stock_days)
     params: dict = {
         "business_id": business_id,
         "cutoff": cutoff,
+        "tz_name": str(zone),
     }
     branch_filter = ""
     sale_branch = ""
@@ -1675,7 +1767,7 @@ async def get_dead_stock(
                 sl.product_id,
                 sl.variation_id,
                 s.branch_id,
-                MAX(s.sold_at::date) AS last_sale_date
+                (MAX(s.sold_at) AT TIME ZONE :tz_name)::date AS last_sale_date
             FROM sale_lines sl
             INNER JOIN sales s ON s.id = sl.sale_id
                 AND s.business_id = sl.business_id
@@ -1740,23 +1832,17 @@ async def get_tax_summary(
     date_to: date,
     branch_id: UUID | None = None,
 ) -> TaxSummaryResponse:
+    validate_date_range(date_from, date_to)
+    from_ts, to_ts_next, _ = await _date_bounds(db, business_id, date_from, date_to)
     branch_sql = _branch_clause(branch_id, "s")
     params: dict = {
         "business_id": business_id,
-        "date_from": date_from,
-        "date_to": date_to,
+        "from_ts": from_ts,
+        "to_ts_next": to_ts_next,
     }
     if branch_id is not None:
         params["branch_id"] = branch_id
 
-    sales_totals_sql = f"""
-        SELECT
-            COALESCE(SUM({_line_revenue_expr()}), 0) AS taxable_sales,
-            COALESCE(SUM(sl.tax_amount), 0) AS tax_collected
-        {_base_sale_joins()}
-            {branch_sql}
-            AND s.sold_at::date BETWEEN :date_from AND :date_to
-    """
     rate_sql = f"""
         SELECT
             COALESCE(sl.tax_rate, 0) AS tax_rate,
@@ -1765,7 +1851,7 @@ async def get_tax_summary(
             COUNT(DISTINCT s.id) AS transaction_count
         {_base_sale_joins()}
             {branch_sql}
-            AND s.sold_at::date BETWEEN :date_from AND :date_to
+            AND s.sold_at >= :from_ts AND s.sold_at < :to_ts_next
         GROUP BY sl.tax_rate
         ORDER BY sl.tax_rate
     """
@@ -1786,15 +1872,13 @@ async def get_tax_summary(
             AND pl.deleted_at IS NULL
             AND po.deleted_at IS NULL
             AND po.status != 'cancelled'
-            AND COALESCE(po.ordered_at, po.created_at)::date
-                BETWEEN :date_from AND :date_to
+            AND COALESCE(po.ordered_at, po.created_at) >= :from_ts
+            AND COALESCE(po.ordered_at, po.created_at) < :to_ts_next
             {purchase_branch}
     """
 
-    sales_result = await db.execute(text(sales_totals_sql), params)
     rate_result = await db.execute(text(rate_sql), params)
     purchase_result = await db.execute(text(purchase_sql), params)
-    sales_row = sales_result.one()
     purchase_row = purchase_result.one()
 
     tax_by_rate = [
@@ -1806,12 +1890,14 @@ async def get_tax_summary(
         )
         for row in rate_result
     ]
+    total_taxable_sales = sum((item.total_sales_amount for item in tax_by_rate), _ZERO)
+    total_tax_collected = sum((item.total_tax_amount for item in tax_by_rate), _ZERO)
 
     return TaxSummaryResponse(
         period_start=date_from,
         period_end=date_to,
-        total_taxable_sales=_dec(sales_row.taxable_sales),
-        total_tax_collected=_dec(sales_row.tax_collected),
+        total_taxable_sales=total_taxable_sales,
+        total_tax_collected=total_tax_collected,
         tax_by_rate=tax_by_rate,
         total_taxable_purchases=_dec(purchase_row.taxable_purchases),
         total_tax_paid=_dec(purchase_row.tax_paid),
@@ -1830,12 +1916,30 @@ async def get_recent_transactions(
         params["branch_id"] = branch_id
 
     sql = f"""
+        WITH target_sales AS (
+            SELECT
+                s.id,
+                s.sale_number,
+                s.sale_type,
+                s.status,
+                s.sold_at,
+                s.branch_id,
+                s.customer_id,
+                s.created_by
+            FROM sales s
+            WHERE s.business_id = :business_id
+                AND s.deleted_at IS NULL
+                AND {_SALE_ACTIVE}
+                {branch_sql}
+            ORDER BY s.sold_at DESC
+            LIMIT :limit
+        )
         SELECT
-            s.id AS sale_id,
-            s.sale_number,
-            s.sale_type,
-            s.status,
-            s.sold_at,
+            ts.id AS sale_id,
+            ts.sale_number,
+            ts.sale_type,
+            ts.status,
+            ts.sold_at,
             b.name AS branch_name,
             c.name AS customer_name,
             u.full_name AS cashier_name,
@@ -1845,27 +1949,22 @@ async def get_recent_transactions(
                     FILTER (WHERE sp.payment_method IS NOT NULL),
                 ARRAY[]::text[]
             ) AS payment_methods
-        FROM sales s
-        INNER JOIN branches b ON b.id = s.branch_id
-            AND b.business_id = s.business_id
-        INNER JOIN users u ON u.id = s.created_by
-        LEFT JOIN customers c ON c.id = s.customer_id
-            AND c.business_id = s.business_id
-        LEFT JOIN sale_lines sl ON sl.sale_id = s.id
-            AND sl.business_id = s.business_id
+        FROM target_sales ts
+        INNER JOIN branches b ON b.id = ts.branch_id
+            AND b.business_id = :business_id
+        INNER JOIN users u ON u.id = ts.created_by
+        LEFT JOIN customers c ON c.id = ts.customer_id
+            AND c.business_id = :business_id
+        LEFT JOIN sale_lines sl ON sl.sale_id = ts.id
+            AND sl.business_id = :business_id
             AND sl.deleted_at IS NULL
-        LEFT JOIN sale_payments sp ON sp.sale_id = s.id
-            AND sp.business_id = s.business_id
+        LEFT JOIN sale_payments sp ON sp.sale_id = ts.id
+            AND sp.business_id = :business_id
             AND sp.deleted_at IS NULL
-        WHERE s.business_id = :business_id
-            AND s.deleted_at IS NULL
-            AND {_SALE_ACTIVE}
-            {branch_sql}
         GROUP BY
-            s.id, s.sale_number, s.sale_type, s.status, s.sold_at,
+            ts.id, ts.sale_number, ts.sale_type, ts.status, ts.sold_at,
             b.name, c.name, u.full_name
-        ORDER BY s.sold_at DESC
-        LIMIT :limit
+        ORDER BY ts.sold_at DESC
     """
     result = await db.execute(text(sql), params)
     return [
@@ -1983,38 +2082,50 @@ async def get_enhanced_dashboard(
     business_id: UUID,
     branch_id: UUID | None = None,
 ) -> EnhancedDashboardResponse:
-    today = await _today(db)
-    yesterday = today - timedelta(days=1)
+    cache_key = (business_id, branch_id, "enhanced")
+    cached = _dashboard_cache.get(cache_key)
+    if cached is not None and cached[0] > time.monotonic():
+        return cached[1]
+
+    today, today_from, today_to, zone = await _business_today_bounds(db, business_id)
+    yesterday_from = today_from - timedelta(days=1)
     month_start = today.replace(day=1)
+    month_from = datetime(month_start.year, month_start.month, 1, 0, 0, 0, tzinfo=zone)
+
     branch_sql = _branch_clause(branch_id, "s")
-    params: dict = {"business_id": business_id, "today": today, "yesterday": yesterday}
+    params: dict = {
+        "business_id": business_id,
+        "today_from": today_from,
+        "today_to": today_to,
+        "yesterday_from": yesterday_from,
+        "month_from": month_from,
+    }
     if branch_id is not None:
         params["branch_id"] = branch_id
 
-    month_params = dict(params)
-    month_params["month_start"] = month_start
-
-    today_base = f"""
+    today_sales_sql = f"""
+        SELECT
+            COALESCE(SUM({_line_revenue_expr()}), 0) AS revenue,
+            COALESCE(SUM({_line_cost_expr()}), 0) AS cost,
+            COUNT(DISTINCT s.id) AS transactions
         {_base_sale_joins()}
             {branch_sql}
-            AND s.sold_at::date = :today
+            AND s.sold_at >= :today_from AND s.sold_at < :today_to
     """
-    yesterday_revenue_sql = f"""
-        SELECT COALESCE(SUM({_line_revenue_expr()}), 0)
+    yesterday_sales_sql = f"""
+        SELECT COALESCE(SUM({_line_revenue_expr()}), 0) AS revenue
         {_base_sale_joins()}
             {branch_sql}
-            AND s.sold_at::date = :yesterday
+            AND s.sold_at >= :yesterday_from AND s.sold_at < :today_from
     """
-    month_from = f"""
+    month_sales_sql = f"""
+        SELECT
+            COALESCE(SUM({_line_revenue_expr()}), 0) AS revenue,
+            COALESCE(SUM({_line_cost_expr()}), 0) AS cost
         {_base_sale_joins()}
             {branch_sql}
-            AND s.sold_at::date >= :month_start
+            AND s.sold_at >= :month_from AND s.sold_at < :today_to
     """
-    today_revenue_sql = f"SELECT COALESCE(SUM({_line_revenue_expr()}), 0) {today_base}"
-    today_cost_sql = f"SELECT COALESCE(SUM({_line_cost_expr()}), 0) {today_base}"
-    today_tx_sql = f"SELECT COUNT(DISTINCT s.id) {today_base}"
-    month_revenue_sql = f"SELECT COALESCE(SUM({_line_revenue_expr()}), 0) {month_from}"
-    month_cost_sql = f"SELECT COALESCE(SUM({_line_cost_expr()}), 0) {month_from}"
 
     expense_branch = ""
     if branch_id is not None:
@@ -2027,6 +2138,7 @@ async def get_enhanced_dashboard(
             AND e.expense_date = :today
             {expense_branch}
     """
+    params["today"] = today
 
     low_stock_sql = """
         SELECT COUNT(*)
@@ -2083,12 +2195,17 @@ async def get_enhanced_dashboard(
         ) sub
     """
 
-    today_revenue = await _scalar(db, today_revenue_sql, params)
-    today_cost = await _scalar(db, today_cost_sql, params)
-    today_transactions = await _scalar_int(db, today_tx_sql, params)
-    yesterday_revenue = await _scalar(db, yesterday_revenue_sql, params)
-    month_revenue = await _scalar(db, month_revenue_sql, month_params)
-    month_cost = await _scalar(db, month_cost_sql, month_params)
+    today_res = (await db.execute(text(today_sales_sql), params)).one()
+    yesterday_res = (await db.execute(text(yesterday_sales_sql), params)).one()
+    month_res = (await db.execute(text(month_sales_sql), params)).one()
+
+    today_revenue = _dec(today_res.revenue)
+    today_cost = _dec(today_res.cost)
+    today_transactions = int(today_res.transactions or 0)
+    yesterday_revenue = _dec(yesterday_res.revenue)
+    month_revenue = _dec(month_res.revenue)
+    month_cost = _dec(month_res.cost)
+
     today_expenses = await _scalar(db, today_expenses_sql, params)
     low_stock_alerts = await _scalar_int(db, low_stock_sql, params)
     out_of_stock_count = await _scalar_int(db, out_of_stock_sql, params)
@@ -2104,7 +2221,7 @@ async def get_enhanced_dashboard(
         today_revenue / today_transactions if today_transactions > 0 else _ZERO
     ).quantize(Decimal("0.01"))
 
-    return EnhancedDashboardResponse(
+    response = EnhancedDashboardResponse(
         today_revenue=today_revenue,
         today_transactions=today_transactions,
         today_profit=today_profit,
@@ -2121,3 +2238,5 @@ async def get_enhanced_dashboard(
         cash_in_drawer=cash_drawer.expected_cash,
         recent_transactions=recent,
     )
+    _dashboard_cache[cache_key] = (time.monotonic() + _DASHBOARD_CACHE_TTL, response)
+    return response
