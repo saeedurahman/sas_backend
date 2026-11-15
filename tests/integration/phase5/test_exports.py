@@ -61,8 +61,36 @@ def test_sales_csv_shape(http_client, tenant):
     assert len(rows) == 2
     rec = dict(zip(header, rows[1]))
     assert rec["total"] == "300.00" and rec["paid"] == "150.00" and rec["balance_due"] == "150.00"
+    assert rec["customer"] == "Walk-in"
     assert "Rs" not in r.text and "PKR" not in r.text
     assert len(rec["sold_at"]) == 16  # YYYY-MM-DD HH:MM
+
+
+def test_sale_without_customer_exports_walk_in(http_client, tenant):
+    """When a sale has no customer (counter sale), customer column exports 'Walk-in' in CSV/XLSX/PDF."""
+    from openpyxl import load_workbook
+
+    # CSV
+    r_csv = http_client.get(tenant.url("/export/sales"), headers=tenant.owner_headers, params={"format": "csv"})
+    assert r_csv.status_code == 200
+    rows = _rows(r_csv)
+    header = rows[0]
+    rec = dict(zip(header, rows[1]))
+    assert rec["customer"] == "Walk-in"
+
+    # XLSX
+    r_xlsx = http_client.get(tenant.url("/export/sales"), headers=tenant.owner_headers, params={"format": "xlsx"})
+    assert r_xlsx.status_code == 200
+    wb = load_workbook(io.BytesIO(r_xlsx.content))
+    ws = wb.active
+    xlsx_header = [cell.value for cell in ws[1]]
+    cust_idx = xlsx_header.index("customer") + 1
+    assert ws.cell(row=2, column=cust_idx).value == "Walk-in"
+
+    # PDF
+    r_pdf = http_client.get(tenant.url("/export/sales"), headers=tenant.owner_headers, params={"format": "pdf"})
+    assert r_pdf.status_code == 200
+    assert r_pdf.content.startswith(b"%PDF-")
 
 
 def test_sale_lines_csv(http_client, tenant):

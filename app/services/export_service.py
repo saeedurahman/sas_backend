@@ -100,7 +100,7 @@ async def _fetch_sales_rows(
             s.sale_number,
             s.sold_at,
             b.name AS branch_name,
-            COALESCE(c.name, '') AS customer_name,
+            COALESCE(c.name, 'Walk-in') AS customer_name,
             s.sale_type,
             s.status,
             COALESCE(SUM(sl.qty * sl.unit_price), 0) AS subtotal,

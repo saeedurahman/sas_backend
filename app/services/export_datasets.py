@@ -202,7 +202,7 @@ def _branch_clause(ctx: ExportCtx, column: str) -> str:
 def _sales_sql(ctx: ExportCtx) -> str:
     return f"""
         SELECT s.sale_number, COALESCE(s.client_receipt_no, '') AS client_receipt_no,
-               s.sold_at AS sold_at, b.name AS branch, COALESCE(c.name, '') AS customer,
+               s.sold_at AS sold_at, b.name AS branch, COALESCE(c.name, 'Walk-in') AS customer,
                s.sale_type::text AS sale_type, s.status::text AS status,
                COALESCE(l.subtotal, 0) AS subtotal, COALESCE(l.discount, 0) AS discount,
                COALESCE(l.tax, 0) AS tax,
@@ -340,11 +340,11 @@ def _customers_count_sql(ctx: ExportCtx) -> str:
 
 def _customer_ledger_sql(ctx: ExportCtx) -> str:
     return """
-        SELECT cl.entry_at AS entry_at, c.name AS customer, cl.entry_type::text AS entry_type,
+        SELECT cl.entry_at AS entry_at, COALESCE(c.name, 'Walk-in') AS customer, cl.entry_type::text AS entry_type,
                cl.amount AS amount, COALESCE(cl.reference_type::text, '') AS reference_type,
                COALESCE(s.sale_number, '') AS reference, COALESCE(cl.notes, '') AS notes
         FROM customer_ledger cl
-        JOIN customers c ON c.id = cl.customer_id
+        LEFT JOIN customers c ON c.id = cl.customer_id
         LEFT JOIN sales s ON s.id = cl.reference_id AND cl.reference_type::text = 'sale'
         WHERE cl.business_id = :business_id AND cl.deleted_at IS NULL
           AND cl.entry_at >= :start AND cl.entry_at < :end
