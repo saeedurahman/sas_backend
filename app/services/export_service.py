@@ -21,7 +21,9 @@ _SALES_HEADERS = [
     "Status",
     "Subtotal",
     "Discount",
+    "Net",
     "Tax",
+    "Rounding",
     "Total Amount",
     "Total Paid",
     "Balance Due",
@@ -103,10 +105,12 @@ async def _fetch_sales_rows(
             COALESCE(c.name, 'Walk-in') AS customer_name,
             s.sale_type,
             s.status,
-            COALESCE(SUM(sl.qty * sl.unit_price), 0) AS subtotal,
+            COALESCE(SUM(ROUND(sl.qty * sl.unit_price, 2)), 0) AS subtotal,
             COALESCE(SUM(sl.discount_amount), 0) AS discount,
+            COALESCE(SUM(sl.net_amount), 0) AS net,
             COALESCE(SUM(sl.tax_amount), 0) AS tax,
-            COALESCE(SUM(sl.qty * sl.unit_price - sl.discount_amount + sl.tax_amount), 0)
+            s.rounding_amount AS rounding,
+            COALESCE(SUM(sl.net_amount + sl.tax_amount), 0) + s.rounding_amount
                 AS total_amount,
             COALESCE((
                 SELECT SUM(sp.amount)
@@ -138,7 +142,7 @@ async def _fetch_sales_rows(
             {branch_sql}
         GROUP BY
             s.id, s.sale_number, s.sold_at, b.name, c.name,
-            s.sale_type, s.status, u.full_name
+            s.sale_type, s.status, u.full_name, s.rounding_amount
         ORDER BY s.sold_at DESC
     """
     result = await db.execute(text(sql), params)
@@ -157,7 +161,9 @@ async def _fetch_sales_rows(
                 "status": row.status,
                 "subtotal": _dec(row.subtotal),
                 "discount": _dec(row.discount),
+                "net": _dec(row.net),
                 "tax": _dec(row.tax),
+                "rounding": _dec(row.rounding),
                 "total_amount": total_amount,
                 "total_paid": total_paid,
                 "balance_due": balance_due,
@@ -180,7 +186,9 @@ def _sales_row_to_list(row: dict) -> list:
         row["status"],
         str(row["subtotal"]),
         str(row["discount"]),
+        str(row["net"]),
         str(row["tax"]),
+        str(row["rounding"]),
         str(row["total_amount"]),
         str(row["total_paid"]),
         str(row["balance_due"]),

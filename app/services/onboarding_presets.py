@@ -72,6 +72,19 @@ ONBOARDING_PRESETS_BY_CODE: dict[str, dict[str, bool]] = {
 }
 
 
+# MRP-priced goods carry the tax inside the shelf price: pharmacies and marts/grocery stores.
+# Everyone else (restaurants, retail, ...) adds tax on top. The owner can change it at any time;
+# it only affects new sales.
+PRICES_INCLUDE_TAX_BY_CODE: dict[str, bool] = {
+    "pharmacy": True,
+    "mart": True,
+}
+
+
+def default_prices_include_tax(business_type_code: str) -> bool:
+    return PRICES_INCLUDE_TAX_BY_CODE.get(business_type_code, False)
+
+
 def build_onboarding_config_json(business_type_code: str) -> dict[str, Any]:
     """
     Build initial config_json for a new tenant from classification code.

@@ -62,11 +62,8 @@ from app.services.register_service import (
 )
 from app.services.settlement import settle_payments
 from app.services.tax_service import resolve_line_tax_rates
-from app.services.pricing_engine import (
-    calculate_line_total,
-    calculate_sale_totals,
-    determine_sale_status,
-)
+from app.services.pricing_engine import determine_sale_status, price_cart
+from app.services.tax_settings import load_tax_settings
 from app.services.return_service import get_returned_qty_by_sale_line_ids
 from app.services.stock_service import (
     _now,
@@ -164,13 +161,10 @@ async def get_sales(
     skip: int = 0,
     limit: int = 50,
 ) -> tuple[list[dict], int]:
-    line_total = (
-        SaleLine.qty * SaleLine.unit_price
-        - SaleLine.discount_amount
-        + SaleLine.tax_amount
-    )
+    line_total = SaleLine.net_amount + SaleLine.tax_amount
+    # Exact (net + tax) of the lines, plus the sale's rounding step.
     total_amount_subq = (
-        select(func.coalesce(func.sum(line_total), 0))
+        select(func.coalesce(func.sum(line_total), 0) + Sale.rounding_amount)
         .where(
             SaleLine.sale_id == Sale.id,
             SaleLine.business_id == business_id,
@@ -367,6 +361,7 @@ async def compute_sale_pricing(
 ) -> SalePricePreviewResponse:
     """Pricing-only path shared by sale preview and create_sale."""
     await verify_branch(db, data.branch_id, business_id)
+    cfg = await load_tax_settings(db, business_id)
     # Customer price list + server-side pricing of lines sent without a unit_price.
     await apply_sale_price_rules(db, business_id, data)
     await _enforce_sale_pricing_permissions(
@@ -440,12 +435,10 @@ async def compute_sale_pricing(
     # Tax comes from the product's tax_rate_id; a client rate only counts for
     # users holding sales.override_tax.
     tax_rates = await resolve_line_tax_rates(
-        db, business_id, list(data.lines), permission_keys
+        db, business_id, list(data.lines), permission_keys, cfg
     )
 
-    preview_lines: list[SalePricePreviewLineResponse] = []
-    computed_lines: list[dict] = []
-
+    engine_lines: list[dict] = []
     for line_index, line_data in enumerate(data.lines):
         scheme_inputs = (
             scheme_line_discounts[line_index]
@@ -456,36 +449,54 @@ async def compute_sale_pricing(
             line_data,
             scheme_inputs,
         )
-        amounts = calculate_line_total(
-            qty=line_data.qty,
-            unit_price=line_data.unit_price,
-            discount_pct=discount_pct,
-            discount_amount=discount_amount,
-            tax_rate=tax_rates[line_index],
-        )
-        computed_lines.append(amounts)
-        preview_lines.append(
-            SalePricePreviewLineResponse(
-                product_id=line_data.product_id,
-                variation_id=line_data.variation_id,
-                qty=line_data.qty,
-                unit_price=line_data.unit_price,
-                line_order=line_data.line_order,
-                line_subtotal=amounts["line_subtotal"],
-                discount_pct=line_data.discount_pct,
-                discount_amount=amounts["effective_discount"],
-                tax_rate=tax_rates[line_index],
-                tax_amount=amounts["tax_amount"],
-                line_total=amounts["line_total"],
-            )
+        engine_lines.append(
+            {
+                "qty": line_data.qty,
+                "unit_price": line_data.unit_price,
+                "discount_pct": discount_pct,
+                "discount_amount": discount_amount,
+                "tax_rate": tax_rates[line_index],
+            }
         )
 
-    totals = calculate_sale_totals(computed_lines)
+    computed_lines, totals = price_cart(
+        engine_lines,
+        inclusive=cfg.effective_inclusive,
+        rounding_mode=cfg.rounding_mode,
+        cart_discount=data.cart_discount_amount,
+    )
+    preview_lines = [
+        SalePricePreviewLineResponse(
+            product_id=line_data.product_id,
+            variation_id=line_data.variation_id,
+            qty=line_data.qty,
+            unit_price=line_data.unit_price,
+            line_order=line_data.line_order,
+            line_subtotal=amounts["line_subtotal"],
+            discount_pct=line_data.discount_pct,
+            discount_amount=amounts["effective_discount"],
+            tax_rate=tax_rates[line_index],
+            net_amount=amounts["net_amount"],
+            tax_amount=amounts["tax_amount"],
+            line_total=amounts["line_total"],
+        )
+        for line_index, (line_data, amounts) in enumerate(
+            zip(data.lines, computed_lines, strict=True)
+        )
+    ]
+
     return SalePricePreviewResponse(
         discount_scheme_id=data.discount_scheme_id,
+        tax_enabled=cfg.enabled,
+        tax_inclusive=cfg.effective_inclusive,
+        tax_rounding_mode=cfg.rounding_mode,
+        tax_label=cfg.label,
         subtotal=totals["subtotal"],
         total_discount=totals["total_discount"],
+        net_amount=totals["net_amount"],
         total_tax=totals["total_tax"],
+        exact_total=totals["exact_total"],
+        rounding_amount=totals["rounding_amount"],
         total_amount=totals["total_amount"],
         lines=preview_lines,
     )
@@ -590,6 +601,7 @@ async def create_sale(
                     "short_qty": short_qty,
                     "consumed_from_layers_qty": consumed_from_layers,
                     "effective_discount": preview_line.discount_amount,
+                    "net_amount": preview_line.net_amount,
                     "tax_rate": preview_line.tax_rate,
                     "tax_amount": preview_line.tax_amount,
                 }
@@ -610,6 +622,10 @@ async def create_sale(
             sold_at=sold_at,
             notes=data.notes,
             discount_scheme_id=data.discount_scheme_id,
+            tax_inclusive=pricing.tax_inclusive,
+            tax_rounding_mode=pricing.tax_rounding_mode,
+            rounding_amount=pricing.rounding_amount,
+            tax_label=pricing.tax_label,
             created_by=created_by,
             created_at=now,
             updated_at=now,
@@ -629,6 +645,7 @@ async def create_sale(
                 unit_price=line_data.unit_price,
                 discount_pct=line_data.discount_pct,
                 discount_amount=snapshot["effective_discount"],
+                net_amount=snapshot["net_amount"],
                 tax_rate=snapshot["tax_rate"],
                 tax_amount=snapshot["tax_amount"],
                 cost_per_unit=snapshot["cost_per_unit"],
@@ -766,15 +783,8 @@ async def _log_sale_audit(
 
 
 def _sale_invoice_total(sale: Sale) -> Decimal:
-    total = _ZERO
-    for line in sale.lines:
-        if line.deleted_at is None:
-            total += (
-                line.qty * line.unit_price
-                - line.discount_amount
-                + line.tax_amount
-            )
-    return _round2(total)
+    """Grand total as recorded: line net + tax plus the stored rounding amount."""
+    return _round2(sale.total_amount)
 
 
 def _sale_has_credit_payment(sale: Sale) -> bool:

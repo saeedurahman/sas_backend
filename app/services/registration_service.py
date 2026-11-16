@@ -16,10 +16,14 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from app.core.config import settings
 from app.models.business import Branch, Business, BusinessConfig, BusinessType
 from app.models.product import PriceList
+from app.models.settings import AppSetting
 from app.models.user import Role, User, UserRole
 from app.schemas.auth import RegisterBusinessRequest
 from app.services.auth_service import hash_password
-from app.services.onboarding_presets import build_onboarding_config_row
+from app.services.onboarding_presets import (
+    build_onboarding_config_row,
+    default_prices_include_tax,
+)
 from app.services.role_permission_seed import ensure_standard_roles_and_permissions
 
 
@@ -135,6 +139,13 @@ async def register_new_business(
         preset = build_onboarding_config_row(data.business_type_code)
         config_json = preset.pop("config_json")
         config_json["slug"] = slug
+        prices_include_tax = (
+            data.prices_include_tax
+            if data.prices_include_tax is not None
+            else default_prices_include_tax(data.business_type_code)
+        )
+        preset["default_tax_inclusive"] = prices_include_tax
+        config_json["default_tax_inclusive"] = prices_include_tax
 
         config = BusinessConfig(
             business_id=business.id,
@@ -193,6 +204,26 @@ async def register_new_business(
             business.id,
             created_by=user.id,
         )
+
+        # Tax/price settings are explicit from day one. No default tax rate: the owner adds
+        # their own rates (tax.default_rate_id stays unset).
+        for key, value in (
+            ("tax.enabled", True),
+            ("tax.prices_include_tax", prices_include_tax),
+            ("tax.rounding_mode", "none"),
+            ("tax.show_breakdown_on_receipt", True),
+            ("tax.label", "GST"),
+        ):
+            db.add(
+                AppSetting(
+                    business_id=business.id,
+                    setting_key=key,
+                    setting_value={"value": value},
+                    created_by=user.id,
+                    created_at=now,
+                    updated_at=now,
+                )
+            )
 
         role_result = await db.execute(
             select(Role).where(

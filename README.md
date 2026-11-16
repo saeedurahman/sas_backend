@@ -574,6 +574,143 @@ the next online sign-in; a revoked device is refused on its next contact.
 `tests/unit/test_lease.py`, `tests/unit/test_sync_units.py`, `tests/integration/sync/`,
 `tests/concurrency/test_sync_concurrency.py` (all run against `TEST_DATABASE_URL`, like the rest of the suite).
 
+## Tax and price settings
+
+Per-business settings (stored in `app_settings`, business-wide; read with `GET /settings`, written with
+`PUT /settings` / `PUT /settings/bulk`, permission `settings.manage`). `GET /settings` always returns every key
+below with its default filled in. No tax rate is hardcoded anywhere: rates come from the business's own
+`/tax-rates`.
+
+```json
+{
+  "tax.enabled": true,
+  "tax.prices_include_tax": false,
+  "tax.rounding_mode": "none",
+  "tax.show_breakdown_on_receipt": true,
+  "tax.label": "GST",
+  "tax.default_rate_id": null,
+  "ui.hide_zero_decimals": false
+}
+```
+
+A row is `{"setting_key": "tax.rounding_mode", "setting_value": {"value": "nearest_5"}}`. Validation (422):
+booleans must be real booleans, `tax.rounding_mode` is `none | nearest_1 | nearest_5 | nearest_10`,
+`tax.label` is 1-30 characters, `tax.default_rate_id` must be one of the business's tax rates (or `null`).
+Existing businesses get `enabled=true`, `prices_include_tax=false`, `rounding_mode=none`.
+Changing `tax.prices_include_tax` or `tax.rounding_mode` writes an `audit_logs` row (`table_name='app_settings'`,
+old value, `new_values={event:"tax_setting_changed", setting_key, value, changed_by, applies_to:"new_sales_only"}`).
+A change only applies to **new** sales; every sale and return stores the mode it was made with.
+All of these keys (and `ui.hide_zero_decimals`, which is display only) are in the sync snapshot
+(`settings` entity, `app_settings`); any settings change bumps the business change sequence.
+
+Registration (`POST /auth/register`) accepts an optional `prices_include_tax`. Default by business type:
+`pharmacy` and `mart` (grocery/general store) = true, everything else (retail, restaurant, ...) = false.
+`tax.enabled` starts true with no default rate.
+
+### Which rate a line gets
+
+1. tax disabled -> 0
+2. product marked `is_tax_exempt` -> 0
+3. product's own tax rate (`tax_rate_id`) if set
+4. otherwise the business default POS rate (`tax.default_rate_id`), otherwise 0
+
+(`sales.override_tax` still lets a permitted user override the rate on a sale.)
+
+### Formulas (`app/services/pricing_engine.py`, Decimal only, half-up to 2 dp)
+
+Line, with `gross_in = qty x price`, `d` = discount (percent, fixed or cart share; never below 0 for the line):
+
+| | exclusive (default) | inclusive |
+|-|-|-|
+| net | `gross_in - d` | `gross - tax` |
+| tax | `round2(net x rate / 100)` | `round2(gross x rate / (100 + rate))` |
+| line total (gross) | `net + tax` | `gross_in - d` |
+
+`net + tax == gross` exactly in both modes. A cart-level fixed discount is spread proportionally over the lines
+(each share rounded to the cent, the last line takes the remainder, no share negative or above its line) and then
+priced like a line discount. Modifier prices are part of the unit price, so they follow the product's mode.
+With rate 0 or tax disabled both modes give identical totals.
+
+Sale: `exact_total = sum(net) + sum(tax)`; `total_amount = exact_total + rounding_amount`.
+
+Rounding (`tax.rounding_mode`) touches **only** the invoice grand total, half-up to the step (1, 5 or 10);
+`rounding_amount = total_amount - exact_total` is signed (negative when rounded down) and stored on the sale. Per-line
+values are never rounded to whole rupees. Payments are compared with `total_amount`; credit, ledger, register, FIFO
+and reports use the recorded amounts.
+
+Examples (price 6, rate 17):
+
+| mode | qty | net | tax | total |
+|-|-|-|-|-|
+| exclusive | 1 / 2 / 3 | 6.00 / 12.00 / 18.00 | 1.02 / 2.04 / 3.06 | 7.02 / 14.04 / 21.06 |
+| inclusive | 1 | 5.13 | 0.87 | 6.00 |
+| inclusive, qty 3, `nearest_5` | 3 | 15.38 | 2.62 | exact 18.00, rounding +2.00, total 20.00 |
+| exclusive, qty 3, `nearest_5` | 3 | 18.00 | 3.06 | exact 21.06, rounding -1.06, total 20.00 |
+
+### Returns and voids
+
+A return uses the sale's own snapshot (`tax_inclusive`, `tax_rounding_mode`, `tax_label`) and the original line
+net/tax, prorated by quantity (the return that clears a line takes the remainder). Rounding applies to the refund
+total only; the return that clears the whole sale refunds exactly what is left of the original rounded total, so a
+full return (or partials adding up to it) refunds exactly the original `total_amount`. A void reverses what was
+recorded.
+
+### Offline replay
+
+`sale.create` ops may carry `tax_inclusive`, `tax_rounding_mode`, `tax_label`, `rounding_amount`, `total_amount`
+(and an informational `settings_version`). The server recomputes with the engine and flags, never rejects:
+`tax_mismatch`, `rounding_mismatch`, `total_mismatch`, `settings_mismatch` (device settings differ from the
+current ones). Without a mode in the payload, the settings in effect at `occurred_at` are used (rebuilt from the
+audit log).
+
+### API shapes
+
+Sale / `GET /sales/{id}` additions:
+
+```json
+{ "tax_inclusive": false, "tax_rounding_mode": "nearest_5", "tax_label": "GST",
+  "subtotal": "18.00", "total_discount": "0", "net_amount": "18.00", "total_tax": "3.06",
+  "exact_total": "21.06", "rounding_amount": "-1.06", "total_amount": "20.00",
+  "lines": [{ "net_amount": "18.00", "tax_rate": "17.000", "tax_amount": "3.06" }] }
+```
+
+`POST /sales/price-preview` returns the same totals plus `tax_enabled`. Returns carry `tax_inclusive`,
+`tax_rounding_mode`, `tax_label`, `rounding_amount`, line `net_amount`. `GET /invoice/{id}` (and the public
+`/r/{token}` receipt, thermal and PDF) add to `summary`:
+
+```json
+{ "tax_inclusive": true, "tax_label": "GST", "tax_rounding_mode": "nearest_5", "show_tax_breakdown": true,
+  "net_amount": "15.38", "total_tax": "2.62", "exact_total": "18.00", "rounding_amount": "2.00",
+  "total_amount": "20.00",
+  "tax_breakdown": [{ "tax_label": "GST", "tax_rate": "17.000", "net_amount": "15.38", "tax_amount": "2.62" }] }
+```
+
+`show_tax_breakdown` = tax enabled and `tax.show_breakdown_on_receipt` and tax > 0. The receipt prints
+business name, NTN, address, phone, items, subtotal, discount, tax rows per rate ("GST 17%"), a Rounding line
+when non-zero, the grand total, payments and change, and "Prices include tax" once in inclusive mode.
+
+`GET /settings/tax-preview?price=6&qty=3&rate=17&discount=0` (permission `sales.create`) breaks one line
+down with the current settings:
+
+```json
+{ "tax_enabled": true, "tax_inclusive": false, "tax_rounding_mode": "none", "tax_label": "GST",
+  "tax_rate": "17", "qty": "3", "unit_price": "6", "subtotal": "18.00", "discount_amount": "0.00",
+  "net_amount": "18.00", "tax_amount": "3.06", "exact_total": "21.06", "rounding_amount": "0.00",
+  "total_amount": "21.06" }
+```
+
+### Reports and exports
+
+Revenue is net sales everywhere (dashboard, sales summary, profit and loss, exports), so they agree. The sales
+summary adds `total_gross` (net + tax), `total_rounding` and `total_collected`. The tax summary groups by
+label and rate (`tax_by_rate[].tax_label`). Profit and loss = net sales minus COGS. Export datasets `sales`
+(subtotal, discount, net, tax, rounding, total, paid, balance_due, tax_mode, tax_label) and `sale_lines`
+(net, tax_rate, tax, tax_label, line_total) are available in CSV, XLSX and PDF.
+
+### Tests
+
+`tests/unit/test_pricing_engine_tax.py` (engine, property-style random carts) and `tests/integration/tax/`.
+
 ## Support endpoints (Phase 5)
 
 ### Receipts by link

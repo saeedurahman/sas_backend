@@ -26,7 +26,9 @@ from app.services.fifo_service import (
     get_fallback_cost_per_unit,
     restore_sale_line_inventory,
 )
+from app.services.pricing_engine import round_total
 from app.services.register_service import require_caller_shift
+from app.services.tax_settings import load_tax_settings
 from app.services.stock_service import (
     _now,
     create_stock_movement,
@@ -162,13 +164,14 @@ def _share(total: Decimal, qty: Decimal, line_qty: Decimal) -> Decimal:
 
 async def _already_returned_amounts(
     db: AsyncSession, business_id: UUID, sale_line_id: UUID
-) -> tuple[Decimal, Decimal, Decimal]:
-    """(qty, discount, tax) already returned against a sale line."""
+) -> tuple[Decimal, Decimal, Decimal, Decimal]:
+    """(qty, discount, tax, net) already returned against a sale line."""
     result = await db.execute(
         select(
             func.coalesce(func.sum(SaleReturnLine.qty), 0),
             func.coalesce(func.sum(SaleReturnLine.discount_amount), 0),
             func.coalesce(func.sum(SaleReturnLine.tax_amount), 0),
+            func.coalesce(func.sum(SaleReturnLine.net_amount), 0),
         )
         .join(SaleReturn, SaleReturnLine.sale_return_id == SaleReturn.id)
         .where(
@@ -178,8 +181,23 @@ async def _already_returned_amounts(
             SaleReturn.deleted_at.is_(None),
         )
     )
-    qty, discount, tax = result.one()
-    return Decimal(str(qty)), Decimal(str(discount)), Decimal(str(tax))
+    qty, discount, tax, net = result.one()
+    return Decimal(str(qty)), Decimal(str(discount)), Decimal(str(tax)), Decimal(str(net))
+
+
+def compute_return_line_net(
+    *,
+    return_qty: Decimal,
+    original_qty: Decimal,
+    original_net: Decimal,
+    returned_qty: Decimal,
+    returned_net: Decimal,
+) -> Decimal:
+    """Net (pre-tax) amount to refund for ``return_qty`` units; same proration and
+    clear-the-line remainder rule as discount and tax, so net + tax never drifts."""
+    if returned_qty + return_qty >= original_qty:
+        return max(original_net - returned_net, _ZERO)
+    return _share(original_net, return_qty, original_qty)
 
 
 def compute_return_line_amounts(
@@ -205,6 +223,34 @@ def compute_return_line_amounts(
     return (
         _share(original_discount, return_qty, original_qty),
         _share(original_tax, return_qty, original_qty),
+    )
+
+
+async def _return_completes_sale(
+    db: AsyncSession,
+    business_id: UUID,
+    sale_id: UUID,
+    pending_qty: dict[UUID, Decimal],
+) -> bool:
+    """True when, with ``pending_qty`` added, every unit of every sale line is returned."""
+    lines = (
+        await db.execute(
+            select(SaleLine.id, SaleLine.qty).where(
+                SaleLine.sale_id == sale_id,
+                SaleLine.business_id == business_id,
+                SaleLine.deleted_at.is_(None),
+            )
+        )
+    ).all()
+    if not lines:
+        return False
+    returned = await get_returned_qty_by_sale_line_ids(
+        db, business_id, [line.id for line in lines]
+    )
+    return all(
+        Decimal(str(returned.get(line.id, _ZERO))) + pending_qty.get(line.id, _ZERO)
+        >= line.qty
+        for line in lines
     )
 
 
@@ -309,7 +355,19 @@ async def create_sale_return(
 
         # -- validate every line, derive its money from the original line -----
         pending_qty: dict[UUID, Decimal] = {}
+        pending_net_by_line: dict[UUID, Decimal] = {}
         prepared: list[dict] = []
+        # The return follows the price mode / rounding the sale was made with; a return
+        # without an original sale uses the current settings.
+        if original_sale is not None:
+            ret_inclusive = original_sale.tax_inclusive
+            ret_rounding_mode = original_sale.tax_rounding_mode
+            ret_tax_label = original_sale.tax_label
+        else:
+            cfg = await load_tax_settings(db, business_id)
+            ret_inclusive = cfg.effective_inclusive
+            ret_rounding_mode = cfg.rounding_mode
+            ret_tax_label = cfg.label
         for line in data.lines:
             if line.sale_line_id is not None:
                 original = original_lines[line.sale_line_id]
@@ -323,7 +381,7 @@ async def create_sale_return(
                         status_code=status.HTTP_400_BAD_REQUEST,
                         detail="variation_id does not match the original sale line",
                     )
-                returned_qty, returned_disc, returned_tax = (
+                returned_qty, returned_disc, returned_tax, returned_net = (
                     await _already_returned_amounts(db, business_id, original.id)
                 )
                 in_request = pending_qty.get(original.id, _ZERO)
@@ -347,6 +405,17 @@ async def create_sale_return(
                     returned_discount=returned_disc,
                     returned_tax=returned_tax,
                 )
+                # Pending lines of this same request already count towards what is
+                # returned, so a repeated line prorates against the remainder.
+                pending_net = pending_net_by_line.get(original.id, _ZERO)
+                net = compute_return_line_net(
+                    return_qty=line.qty,
+                    original_qty=original.qty,
+                    original_net=original.net_amount,
+                    returned_qty=returned_qty + in_request,
+                    returned_net=returned_net + pending_net,
+                )
+                pending_net_by_line[original.id] = pending_net + net
                 pending_qty[original.id] = in_request + line.qty
                 prepared.append(
                     {
@@ -356,6 +425,7 @@ async def create_sale_return(
                         "variation_id": original.variation_id,
                         "unit_price": original.unit_price,
                         "discount": discount,
+                        "net": net,
                         "tax": tax,
                     }
                 )
@@ -365,6 +435,8 @@ async def create_sale_return(
                     await verify_variation(
                         db, line.variation_id, line.product_id, business_id
                     )
+                manual_tax = line.tax_amount or _ZERO
+                gross = (line.qty * line.unit_price).quantize(_CENT, rounding=ROUND_HALF_UP)
                 prepared.append(
                     {
                         "request": line,
@@ -373,16 +445,32 @@ async def create_sale_return(
                         "variation_id": line.variation_id,
                         "unit_price": line.unit_price,
                         "discount": _ZERO,
-                        "tax": line.tax_amount or _ZERO,
+                        # inclusive: the price already contains the tax.
+                        "net": gross - manual_tax if ret_inclusive else gross,
+                        "tax": manual_tax,
                     }
                 )
 
-        total_refund = _ZERO
-        for item in prepared:
-            qty = item["request"].qty
-            total_refund += (
-                qty * item["unit_price"] - item["discount"] + item["tax"]
-            ).quantize(_CENT, rounding=ROUND_HALF_UP)
+        # Net + tax is the refund of a line in both price modes. Rounding only touches
+        # the refund total.
+        exact_refund = sum((i["net"] + i["tax"] for i in prepared), _ZERO)
+        refund_rounding = round_total(exact_refund, ret_rounding_mode)[1]
+        if original_sale is not None and await _return_completes_sale(
+            db, business_id, original_sale.id, pending_qty
+        ):
+            # The return that clears the sale refunds exactly what is still outstanding of
+            # the original rounded total, whatever the earlier partial returns rounded to.
+            earlier_rounding = (
+                await db.execute(
+                    select(func.coalesce(func.sum(SaleReturn.rounding_amount), 0)).where(
+                        SaleReturn.sale_id == original_sale.id,
+                        SaleReturn.business_id == business_id,
+                        SaleReturn.deleted_at.is_(None),
+                    )
+                )
+            ).scalar_one()
+            refund_rounding = original_sale.rounding_amount - Decimal(str(earlier_rounding))
+        total_refund = exact_refund + refund_rounding
 
         # -- refund payments: never more than is owed -------------------------
         paid_out = _ZERO
@@ -433,6 +521,10 @@ async def create_sale_return(
             return_number=return_number,
             returned_at=returned_at,
             reason=data.reason,
+            tax_inclusive=ret_inclusive,
+            tax_rounding_mode=ret_rounding_mode,
+            tax_label=ret_tax_label,
+            rounding_amount=refund_rounding,
             created_by=created_by,
             created_at=now,
             updated_at=now,
@@ -454,6 +546,7 @@ async def create_sale_return(
                 qty=line_data.qty,
                 unit_price=item["unit_price"],
                 discount_amount=item["discount"],
+                net_amount=item["net"],
                 tax_amount=item["tax"],
                 created_by=created_by,
                 created_at=now,
@@ -569,6 +662,8 @@ async def create_sale_return(
                 "event": "return",
                 "return_number": return_number,
                 "total_refund": str(total_refund),
+                "exact_refund": str(exact_refund),
+                "rounding_amount": str(refund_rounding),
                 "cash_out": str(cash_out),
                 "credit_to_account": str(credit_portion),
                 "lines": [

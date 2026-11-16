@@ -459,6 +459,11 @@ def seed():
             sale_line_rows,
             page_size=5000,
         )
+        cur.execute(
+            "UPDATE sale_lines SET net_amount = ROUND(qty * unit_price, 2) - discount_amount "
+            "WHERE business_id = %s",
+            (business_id,),
+        )
 
         print("Inserting 50,000 sale payments...")
         execute_values(

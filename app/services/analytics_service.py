@@ -181,7 +181,9 @@ def _out_of_stock_count_sql(branch_id: UUID | None) -> str:
 
 
 def _line_revenue_expr(alias: str = "sl") -> str:
-    return f"({alias}.qty * {alias}.unit_price) - {alias}.discount_amount"
+    # Net sales: the stored line amount before tax. Excludes tax in both price modes and
+    # never includes the grand-total rounding.
+    return f"{alias}.net_amount"
 
 
 def _line_cost_expr(alias: str = "sl") -> str:
@@ -388,7 +390,7 @@ async def get_sales_summary(
     row = result.one()
 
     returns_sql = f"""
-        SELECT COALESCE(SUM(srl.qty * srl.unit_price + srl.tax_amount), 0)
+        SELECT COALESCE(SUM(srl.net_amount), 0)
         FROM sale_return_lines srl
         INNER JOIN sale_returns sr ON sr.id = srl.sale_return_id
             AND sr.business_id = srl.business_id
@@ -399,6 +401,16 @@ async def get_sales_summary(
             {_branch_clause(branch_id, "sr").replace("s.", "sr.")}
     """
     total_returns = await _scalar(db, returns_sql, params)
+    rounding_sql = f"""
+        SELECT COALESCE(SUM(s.rounding_amount), 0)
+        FROM sales s
+        WHERE s.business_id = :business_id
+            AND s.deleted_at IS NULL
+            AND {_SALE_ACTIVE}
+            {branch_sql}
+            AND s.sold_at >= :from_ts AND s.sold_at < :to_ts_next
+    """
+    total_rounding = await _scalar(db, rounding_sql, params)
 
     total_revenue = _dec(row.total_revenue)
     total_cost = _dec(row.total_cost)
@@ -419,6 +431,9 @@ async def get_sales_summary(
         avg_order_value=avg_order.quantize(Decimal("0.01")),
         total_discount=_dec(row.total_discount),
         total_tax=_dec(row.total_tax),
+        total_gross=total_revenue + _dec(row.total_tax),
+        total_rounding=total_rounding,
+        total_collected=total_revenue + _dec(row.total_tax) + total_rounding,
         total_returns=total_returns,
         net_revenue=total_revenue - total_returns,
     )
@@ -1845,6 +1860,7 @@ async def get_tax_summary(
 
     rate_sql = f"""
         SELECT
+            COALESCE(s.tax_label, 'GST') AS tax_label,
             COALESCE(sl.tax_rate, 0) AS tax_rate,
             COALESCE(SUM({_line_revenue_expr()}), 0) AS total_sales_amount,
             COALESCE(SUM(sl.tax_amount), 0) AS total_tax_amount,
@@ -1852,8 +1868,8 @@ async def get_tax_summary(
         {_base_sale_joins()}
             {branch_sql}
             AND s.sold_at >= :from_ts AND s.sold_at < :to_ts_next
-        GROUP BY sl.tax_rate
-        ORDER BY sl.tax_rate
+        GROUP BY s.tax_label, sl.tax_rate
+        ORDER BY s.tax_label, sl.tax_rate
     """
     purchase_branch = ""
     if branch_id is not None:
@@ -1883,6 +1899,7 @@ async def get_tax_summary(
 
     tax_by_rate = [
         TaxByRateItem(
+            tax_label=row.tax_label,
             tax_rate=_dec(row.tax_rate),
             total_sales_amount=_dec(row.total_sales_amount),
             total_tax_amount=_dec(row.total_tax_amount),

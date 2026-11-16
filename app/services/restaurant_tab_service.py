@@ -42,7 +42,12 @@ from app.services.fifo_service import (
     maybe_notify_fifo_shortfall,
 )
 from app.services.invoice_service import _round2
-from app.services.pricing_engine import calculate_line_total, determine_sale_status
+from app.services.pricing_engine import (
+    calculate_line_total,
+    determine_sale_status,
+    round_total,
+)
+from app.services.tax_settings import load_tax_settings
 from app.services.customer_service import assert_credit_available
 from app.services.register_service import require_caller_shift, verify_open_register_shift
 from app.services.settlement import settle_payments
@@ -217,12 +222,13 @@ def _assert_tab_mutable(sale: Sale) -> None:
         )
 
 
-def _tab_invoice_total(sale: Sale) -> Decimal:
-    total = Decimal("0")
-    for line in sale.lines:
-        if line.deleted_at is None:
-            total += line.qty * line.unit_price - line.discount_amount + line.tax_amount
-    return _round2(total)
+def _tab_invoice_total(sale: Sale) -> tuple[Decimal, Decimal]:
+    """(rounded grand total, rounding amount) for the tab as it stands.
+
+    Line net + tax is exact in both price modes; rounding follows the mode the tab was
+    opened with and only touches the grand total.
+    """
+    return round_total(sale.exact_total, sale.tax_rounding_mode)
 
 
 async def _prepare_tab_line_pricing(
@@ -233,7 +239,10 @@ async def _prepare_tab_line_pricing(
     *,
     price_list_id: UUID | None,
     permission_keys: set[str],
-) -> tuple[Decimal, Decimal, Decimal, str | None, list[dict[str, Any]], Decimal]:
+    inclusive: bool,
+) -> tuple[
+    Decimal, Decimal, Decimal, str | None, list[dict[str, Any]], Decimal, Decimal
+]:
     from app.services.sale_service import _enforce_sale_pricing_permissions
     from app.services.tax_service import resolve_line_tax_rates
 
@@ -247,6 +256,7 @@ async def _prepare_tab_line_pricing(
         (item["price_delta"] for item in modifier_snapshots),
         Decimal("0"),
     )
+    # Modifier prices follow the product's mode: inclusive or exclusive like the unit price.
     effective_unit_price = _round2(line_data.unit_price + modifier_total)
 
     await verify_product(db, line_data.product_id, business_id)
@@ -287,6 +297,7 @@ async def _prepare_tab_line_pricing(
         discount_pct=discount_pct,
         discount_amount=discount_amount,
         tax_rate=effective_tax_rate,
+        inclusive=inclusive,
     )
     encoded_notes = _encode_sale_line_notes(line_data.notes, modifier_snapshots)
     return (
@@ -296,6 +307,7 @@ async def _prepare_tab_line_pricing(
         encoded_notes,
         modifier_snapshots,
         effective_tax_rate,
+        amounts["net_amount"],
     )
 
 
@@ -334,6 +346,7 @@ async def open_tab(
         await get_customer_by_id(db, data.customer_id, business_id)
 
     now = _now()
+    cfg = await load_tax_settings(db, business_id)
     sale_number = await generate_document_number(
         db, business_id, "INV", Sale, Sale.sale_number
     )
@@ -350,6 +363,9 @@ async def open_tab(
             status=SaleStatusEnum.held.value,
             sold_at=now,
             notes=data.notes,
+            tax_inclusive=cfg.effective_inclusive,
+            tax_rounding_mode=cfg.rounding_mode,
+            tax_label=cfg.label,
             created_by=created_by,
             created_at=now,
             updated_at=now,
@@ -413,6 +429,7 @@ async def add_lines_to_tab(
                 encoded_notes,
                 _modifiers,
                 effective_tax_rate,
+                net_amount,
             ) = await _prepare_tab_line_pricing(
                 db,
                 business_id,
@@ -420,6 +437,7 @@ async def add_lines_to_tab(
                 line_data,
                 price_list_id=sale.price_list_id,
                 permission_keys=permission_keys,
+                inclusive=sale.tax_inclusive,
             )
 
             sale_line = SaleLine(
@@ -431,6 +449,7 @@ async def add_lines_to_tab(
                 unit_price=effective_unit_price,
                 discount_pct=line_data.discount_pct,
                 discount_amount=effective_discount,
+                net_amount=net_amount,
                 tax_rate=effective_tax_rate,
                 tax_amount=tax_amount,
                 cost_per_unit=Decimal("0"),
@@ -656,7 +675,8 @@ async def complete_tab(
         )
         sale.register_shift_id = shift.id
 
-        total_amount = _tab_invoice_total(sale)
+        total_amount, rounding_amount = _tab_invoice_total(sale)
+        sale.rounding_amount = rounding_amount
         settlement = settle_payments(total_amount, data.payments)
         if settlement.total_applied < total_amount:
             raise HTTPException(

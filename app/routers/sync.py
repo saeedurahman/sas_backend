@@ -166,9 +166,10 @@ async def flagged_sales(
                 f"""
                 SELECT s.id, s.branch_id, s.sale_number, s.client_receipt_no, s.device_id,
                        s.sold_at, s.synced_at, s.sync_flags, s.status,
-                       COALESCE((SELECT SUM(l.qty * l.unit_price - l.discount_amount + l.tax_amount)
+                       COALESCE((SELECT SUM(l.net_amount + l.tax_amount)
                                    FROM sale_lines l
-                                  WHERE l.sale_id = s.id AND l.deleted_at IS NULL), 0) AS total_amount,
+                                  WHERE l.sale_id = s.id AND l.deleted_at IS NULL), 0)
+                         + s.rounding_amount AS total_amount,
                        COALESCE(u.full_name, '') AS cashier_name
                   FROM sales s LEFT JOIN users u ON u.id = s.created_by
                  WHERE {clause}

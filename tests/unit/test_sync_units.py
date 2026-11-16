@@ -207,6 +207,7 @@ def test_error_codes_are_stable_strings():
         "price_mismatch", "tax_mismatch", "oversold", "credit_limit_exceeded",
         "cost_estimated", "shift_mismatch", "subscription_expired",
         "modifier_price_mismatch", "unknown_modifier",
+        "rounding_mismatch", "total_mismatch", "settings_mismatch",
     }
 
 

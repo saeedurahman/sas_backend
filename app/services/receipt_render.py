@@ -44,6 +44,37 @@ def local_stamp(inv: InvoiceData, zone: ZoneInfo) -> str:
     return inv.sold_at.astimezone(zone).strftime("%Y-%m-%d %H:%M")
 
 
+def _rate_text(rate: Decimal) -> str:
+    text = f"{Decimal(rate):.3f}".rstrip("0").rstrip(".")
+    return text or "0"
+
+
+def totals_extra_rows(s) -> list[tuple[str, str]]:
+    """Rows between discount and the grand total: net, tax per rate, rounding.
+
+    Tax rows only when the business shows the breakdown and there is tax; the rounding row
+    only when it is non-zero. In inclusive mode the net is shown so that net + tax = total.
+    """
+    rows: list[tuple[str, str]] = []
+    if s.show_tax_breakdown:
+        if s.tax_inclusive:
+            rows.append(("Net amount", money(s.net_amount)))
+        for item in s.tax_breakdown:
+            rows.append((f"{item.tax_label} {_rate_text(item.tax_rate)}%", money(item.tax_amount)))
+    if s.rounding_amount:
+        sign = "+" if s.rounding_amount > 0 else "-"
+        rows.append(("Rounding", sign + money(abs(s.rounding_amount))))
+    return rows
+
+
+def _contact_lines(inv: InvoiceData) -> tuple[str | None, str | None]:
+    """(address, phone): the branch's, falling back to the business's."""
+    return (
+        inv.branch_address or inv.business.address,
+        inv.branch_phone or inv.business.phone,
+    )
+
+
 def _is_void(inv: InvoiceData) -> bool:
     return inv.status in ("voided", "void", "cancelled", "canceled")
 
@@ -70,8 +101,8 @@ def render_html(inv: InvoiceData, zone: ZoneInfo, pdf_href: str | None = None) -
     totals = f"<tr><td>Subtotal</td><td class='n'>{money(s.subtotal)}</td></tr>"
     if s.total_discount:
         totals += f"<tr><td>Discount</td><td class='n'>&minus;{money(s.total_discount)}</td></tr>"
-    if s.total_tax:
-        totals += f"<tr><td>Tax</td><td class='n'>{money(s.total_tax)}</td></tr>"
+    for label, amount in totals_extra_rows(s):
+        totals += f"<tr><td>{e(label)}</td><td class='n'>{amount}</td></tr>"
     totals += (
         f"<tr class='t'><td>Total ({currency})</td><td class='n'>{money(s.total_amount)}</td></tr>"
         f"<tr><td>Paid</td><td class='n'>{money(s.total_paid)}</td></tr>"
@@ -81,10 +112,16 @@ def render_html(inv: InvoiceData, zone: ZoneInfo, pdf_href: str | None = None) -
     if s.change_given:
         totals += f"<tr><td>Change</td><td class='n'>{money(s.change_given)}</td></tr>"
 
+    includes_tax = (
+        "<div class='c m'>Prices include tax</div>"
+        if s.tax_inclusive and s.total_tax
+        else ""
+    )
     numbers = f"Receipt # {e(inv.sale_number)}"
     if inv.client_receipt_no and inv.client_receipt_no != inv.sale_number:
         numbers += f"<br>Device receipt # {e(inv.client_receipt_no)}"
-    address = " &middot; ".join(e(x) for x in (inv.branch_address, inv.branch_phone) if x)
+    address = " &middot; ".join(e(x) for x in _contact_lines(inv) if x)
+    ntn = f"<div class='c'>NTN: {e(inv.business.tax_id)}</div>" if inv.business.tax_id else ""
     void = "<div class='c'><span class='v'>VOID</span></div>" if _is_void(inv) else ""
     footer = f"<div class='f'>{e(inv.receipt_footer)}</div>" if inv.receipt_footer else ""
     pdf = f"<p class='c'><a href='{e(pdf_href)}'>Download PDF</a></p>" if pdf_href else ""
@@ -95,10 +132,11 @@ def render_html(inv: InvoiceData, zone: ZoneInfo, pdf_href: str | None = None) -
         f"<title>Receipt {e(inv.sale_number)}</title><style>{_PAGE_CSS}</style></head><body>"
         f"<div class='r'><h1>{e(inv.business.name)}</h1>"
         f"<div class='c'>{e(inv.branch_name)}</div>"
+        + ntn
         + (f"<div class='c'>{address}</div>" if address else "")
         + f"{void}<hr><div class='m'>{numbers}<br>{e(local_stamp(inv, zone))}</div><hr>"
         f"<table><tr><th>Item</th><th class='n'>{currency}</th></tr>{''.join(rows)}</table><hr>"
-        f"<table>{totals}</table>"
+        f"<table>{totals}</table>{includes_tax}"
         + (f"<hr><table><tr><th>Payments</th><th></th></tr>{pays}</table>" if pays else "")
         + f"{footer}{pdf}</div></body></html>"
     )
@@ -148,7 +186,9 @@ def render_pdf(inv: InvoiceData, zone: ZoneInfo) -> bytes:
 
     centered(inv.business.name, 12, True)
     centered(inv.branch_name)
-    for extra in (inv.branch_address, inv.branch_phone):
+    if inv.business.tax_id:
+        centered(f"NTN: {inv.business.tax_id}", 8)
+    for extra in _contact_lines(inv):
         if extra:
             centered(extra, 8)
     if _is_void(inv):
@@ -172,14 +212,17 @@ def render_pdf(inv: InvoiceData, zone: ZoneInfo) -> bytes:
     pair("Subtotal", money(s.subtotal))
     if s.total_discount:
         pair("Discount", "-" + money(s.total_discount))
-    if s.total_tax:
-        pair("Tax", money(s.total_tax))
+    for label, amount in totals_extra_rows(s):
+        pair(label, amount)
     pair(f"TOTAL ({inv.business.currency or 'PKR'})", money(s.total_amount), bold=True)
     pair("Paid", money(s.total_paid))
     if s.balance_due:
         pair("Balance due", money(s.balance_due))
     if s.change_given:
         pair("Change", money(s.change_given))
+    if s.tax_inclusive and s.total_tax:
+        pdf.set_font("Helvetica", "", 7)
+        pdf.cell(inner, 4, "Prices include tax", align="C", new_x="LMARGIN", new_y="NEXT")
     if inv.payments:
         rule()
         for p in inv.payments:

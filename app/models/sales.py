@@ -239,6 +239,19 @@ class Sale(Base, AuditMixin, SoftDeleteMixin, SyncMixin):
         sync_status_enum, nullable=False, default="pending"
     )
     created_by: Mapped[uuid.UUID] = mapped_column(Uuid(as_uuid=True), nullable=False)
+    # Tax/price settings snapshot taken when the document was created.
+    tax_inclusive: Mapped[bool] = mapped_column(
+        Boolean, nullable=False, default=False, server_default="false"
+    )
+    tax_rounding_mode: Mapped[str] = mapped_column(
+        Text, nullable=False, default="none", server_default="none"
+    )
+    rounding_amount: Mapped[Decimal] = mapped_column(
+        Numeric(12, 2), nullable=False, default=0, server_default="0"
+    )
+    tax_label: Mapped[str] = mapped_column(
+        Text, nullable=False, default="GST", server_default="GST"
+    )
     # Offline replay: receipt number printed by the device, origin device, review flags.
     client_receipt_no: Mapped[str | None] = mapped_column(String(64), nullable=True)
     device_id: Mapped[str | None] = mapped_column(String(100), nullable=True)
@@ -280,6 +293,53 @@ class Sale(Base, AuditMixin, SoftDeleteMixin, SyncMixin):
         back_populates="sale",
         lazy="selectin",
     )
+
+    def _active_lines(self) -> list["SaleLine"]:
+        return [l for l in self.lines if l.deleted_at is None]
+
+    @property
+    def subtotal(self) -> Decimal:
+        """Sum of qty x unit price before discounts (tax-inclusive in inclusive mode)."""
+        return sum(
+            (
+                (Decimal(str(l.qty)) * Decimal(str(l.unit_price))).quantize(Decimal("0.01"))
+                for l in self._active_lines()
+            ),
+            Decimal("0"),
+        )
+
+    @property
+    def total_discount(self) -> Decimal:
+        return sum(
+            (Decimal(str(l.discount_amount or 0)) for l in self._active_lines()),
+            Decimal("0"),
+        )
+
+    @property
+    def net_amount(self) -> Decimal:
+        return sum(
+            (Decimal(str(l.net_amount or 0)) for l in self._active_lines()),
+            Decimal("0"),
+        )
+
+    @property
+    def total_tax(self) -> Decimal:
+        return sum(
+            (Decimal(str(l.tax_amount or 0)) for l in self._active_lines()),
+            Decimal("0"),
+        )
+
+    @property
+    def exact_total(self) -> Decimal:
+        """Net + tax before the grand-total rounding step."""
+        return self.net_amount + self.total_tax
+
+    @property
+    def total_amount(self) -> Decimal:
+        """What the customer owes: exact total plus the (signed) rounding amount."""
+        return (self.exact_total + Decimal(str(self.rounding_amount or 0))).quantize(
+            Decimal("0.01")
+        )
 
     @property
     def change_given(self) -> Decimal:
@@ -326,6 +386,11 @@ class SaleLine(Base, SoftDeleteMixin, SyncMixin):
     )
     discount_amount: Mapped[Decimal] = mapped_column(
         Numeric(15, 2), nullable=False, default=0
+    )
+    # Line amount before tax (after discount). net_amount + tax_amount is the line gross
+    # in both exclusive and tax-inclusive mode.
+    net_amount: Mapped[Decimal] = mapped_column(
+        Numeric(15, 2), nullable=False, default=0, server_default="0"
     )
     tax_rate: Mapped[Decimal] = mapped_column(Numeric(6, 3), nullable=False, default=0)
     tax_amount: Mapped[Decimal] = mapped_column(
@@ -441,6 +506,19 @@ class SaleReturn(Base, SoftDeleteMixin, SyncMixin):
     returned_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True), nullable=False
     )
+    # Tax/price settings snapshot taken when the document was created.
+    tax_inclusive: Mapped[bool] = mapped_column(
+        Boolean, nullable=False, default=False, server_default="false"
+    )
+    tax_rounding_mode: Mapped[str] = mapped_column(
+        Text, nullable=False, default="none", server_default="none"
+    )
+    rounding_amount: Mapped[Decimal] = mapped_column(
+        Numeric(12, 2), nullable=False, default=0, server_default="0"
+    )
+    tax_label: Mapped[str] = mapped_column(
+        Text, nullable=False, default="GST", server_default="GST"
+    )
     reason: Mapped[str | None] = mapped_column(Text, nullable=True)
     sync_status: Mapped[str] = mapped_column(
         sync_status_enum, nullable=False, default="pending"
@@ -480,7 +558,7 @@ class SaleReturn(Base, SoftDeleteMixin, SyncMixin):
     def total_refund(self) -> Decimal:
         return sum(
             (l.line_refund for l in self.lines if l.deleted_at is None), Decimal("0")
-        )
+        ) + Decimal(str(self.rounding_amount or 0))
 
     @property
     def credit_amount(self) -> Decimal:
@@ -535,6 +613,10 @@ class SaleReturnLine(Base, SoftDeleteMixin, SyncMixin):
     discount_amount: Mapped[Decimal] = mapped_column(
         Numeric(15, 2), nullable=False, default=0, server_default="0"
     )
+    # Refunded amount before tax; net_amount + tax_amount is what the line refunds.
+    net_amount: Mapped[Decimal] = mapped_column(
+        Numeric(15, 2), nullable=False, default=0, server_default="0"
+    )
     tax_amount: Mapped[Decimal] = mapped_column(
         Numeric(15, 2), nullable=False, default=0
     )
@@ -555,9 +637,7 @@ class SaleReturnLine(Base, SoftDeleteMixin, SyncMixin):
     @property
     def line_refund(self) -> Decimal:
         return (
-            Decimal(str(self.qty)) * Decimal(str(self.unit_price))
-            - Decimal(str(self.discount_amount or 0))
-            + Decimal(str(self.tax_amount or 0))
+            Decimal(str(self.net_amount or 0)) + Decimal(str(self.tax_amount or 0))
         ).quantize(Decimal("0.01"))
 
     sale_return: Mapped["SaleReturn"] = relationship(

@@ -21,10 +21,12 @@ from app.schemas.invoice import (
     InvoiceLineItem,
     InvoicePaymentItem,
     InvoiceSummary,
+    InvoiceTaxBreakdownItem,
     ThermalLineItem,
     ThermalReceiptData,
 )
 from app.services.settings_service import get_setting_value
+from app.services.tax_settings import TaxSettings, load_tax_settings
 
 _ZERO = Decimal("0")
 
@@ -91,25 +93,52 @@ async def _get_cashier_name(
     return name or "Unknown"
 
 
+def tax_breakdown_for_lines(lines: list[SaleLine], label: str) -> list[InvoiceTaxBreakdownItem]:
+    """Tax grouped by rate: stored net and tax of the lines that carry tax."""
+    groups: dict[Decimal, list[Decimal]] = {}
+    for line in lines:
+        if line.deleted_at is not None or line.tax_amount == _ZERO:
+            continue
+        acc = groups.setdefault(Decimal(str(line.tax_rate)), [_ZERO, _ZERO])
+        acc[0] += line.net_amount
+        acc[1] += line.tax_amount
+    return [
+        InvoiceTaxBreakdownItem(
+            tax_label=label,
+            tax_rate=rate,
+            net_amount=_round2(net),
+            tax_amount=_round2(tax),
+        )
+        for rate, (net, tax) in sorted(groups.items())
+    ]
+
+
 def _build_summary(
+    sale: Sale,
     lines: list[SaleLine],
     payments: list,
+    cfg: TaxSettings,
 ) -> InvoiceSummary:
     subtotal = _ZERO
     total_discount = _ZERO
+    net_amount = _ZERO
     total_tax = _ZERO
 
     for line in lines:
         if line.deleted_at is not None:
             continue
-        subtotal += line.qty * line.unit_price
+        subtotal += _round2(line.qty * line.unit_price)
         total_discount += line.discount_amount
+        net_amount += line.net_amount
         total_tax += line.tax_amount
 
     subtotal = _round2(subtotal)
     total_discount = _round2(total_discount)
+    net_amount = _round2(net_amount)
     total_tax = _round2(total_tax)
-    total_amount = _round2(subtotal - total_discount + total_tax)
+    exact_total = _round2(net_amount + total_tax)
+    rounding_amount = _round2(_dec(sale.rounding_amount or 0))
+    total_amount = _round2(exact_total + rounding_amount)
 
     total_paid = _ZERO
     for payment in payments:
@@ -123,10 +152,20 @@ def _build_summary(
     change_given = _round2(max(total_paid - total_amount, _ZERO))
 
     return InvoiceSummary(
+        tax_inclusive=sale.tax_inclusive,
+        tax_label=sale.tax_label,
+        tax_rounding_mode=sale.tax_rounding_mode,
+        show_tax_breakdown=bool(
+            cfg.enabled and cfg.show_breakdown_on_receipt and total_tax > _ZERO
+        ),
         subtotal=subtotal,
         total_discount=total_discount,
+        net_amount=net_amount,
         total_tax=total_tax,
+        exact_total=exact_total,
+        rounding_amount=rounding_amount,
         total_amount=total_amount,
+        tax_breakdown=tax_breakdown_for_lines(lines, sale.tax_label),
         total_paid=total_paid,
         balance_due=balance_due,
         change_given=change_given,
@@ -188,9 +227,7 @@ async def get_invoice_data(
             if line.variation.unit is not None:
                 unit_symbol = line.variation.unit.symbol
 
-        line_total = _round2(
-            line.qty * line.unit_price - line.discount_amount + line.tax_amount
-        )
+        line_total = _round2(line.net_amount + line.tax_amount)
         invoice_lines.append(
             InvoiceLineItem(
                 line_order=line.line_order,
@@ -202,6 +239,7 @@ async def get_invoice_data(
                 discount_pct=line.discount_pct,
                 discount_amount=line.discount_amount,
                 tax_rate=line.tax_rate,
+                net_amount=line.net_amount,
                 tax_amount=line.tax_amount,
                 line_total=line_total,
             )
@@ -220,7 +258,8 @@ async def get_invoice_data(
         for p in active_payments
     ]
 
-    summary = _build_summary(active_lines, active_payments)
+    cfg = await load_tax_settings(db, business_id)
+    summary = _build_summary(sale, active_lines, active_payments, cfg)
     cashier_name = await _get_cashier_name(db, sale.created_by)
 
     return InvoiceData(

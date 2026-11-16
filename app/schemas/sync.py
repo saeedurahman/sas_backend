@@ -200,8 +200,29 @@ class SaleCreatePayload(BaseSchema):
     price_list_id: UUID | None = None
     discount_scheme_id: UUID | None = None
     notes: str | None = None
+    # Tax/price settings the device used (from the settings it last pulled). When omitted the
+    # server uses the settings that were active at occurred_at.
+    tax_inclusive: bool | None = None
+    tax_rounding_mode: str | None = None
+    tax_label: str | None = Field(default=None, max_length=30)
+    # Frozen client grand total pieces; recomputed server-side, mismatches are flagged.
+    rounding_amount: Decimal | None = None
+    total_amount: Decimal | None = None
+    # change_seq of the settings the device had pulled (informational).
+    settings_version: int | None = None
     lines: list[SaleLinePayload] = Field(min_length=1)
     payments: list[SalePaymentPayload] = Field(default_factory=list)
+
+    @model_validator(mode="after")
+    def _check_tax_fields(self) -> "SaleCreatePayload":
+        if self.tax_rounding_mode is not None and self.tax_rounding_mode not in (
+            "none",
+            "nearest_1",
+            "nearest_5",
+            "nearest_10",
+        ):
+            raise ValueError("tax_rounding_mode must be none, nearest_1, nearest_5 or nearest_10")
+        return self
 
 
 class SaleVoidPayload(BaseSchema):

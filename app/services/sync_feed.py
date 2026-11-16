@@ -35,6 +35,7 @@ from app.dependencies import (
 )
 from app.models.user import Role, RolePermission, User, UserRole
 from app.services import subscription as sub
+from app.services.tax_settings import load_tax_settings
 
 DEFAULT_LIMIT = 500
 MAX_LIMIT = 1000
@@ -352,7 +353,10 @@ async def _materialise(
                 elif k == "tax.labels" and tax_labels is None:
                     tax_labels = val if isinstance(val, dict) else {}
 
+            tax_cfg = await load_tax_settings(db, user.business_id)
             built[row["id"]] = {
+                # tax.* and ui.hide_zero_decimals so offline devices price like the server.
+                "app_settings": tax_cfg.as_settings_map(),
                 "business_name": business.name,
                 "legal_name": business.legal_name,
                 "currency_code": business.currency_code,
@@ -462,10 +466,11 @@ async def _materialise(
         totals_query = await db.execute(
             text(
                 "SELECT sale_id, "
-                "COALESCE(SUM(qty * unit_price), 0) AS subtotal, "
+                "COALESCE(SUM(ROUND(qty * unit_price, 2)), 0) AS subtotal, "
                 "COALESCE(SUM(discount_amount), 0) AS discount, "
+                "COALESCE(SUM(net_amount), 0) AS net, "
                 "COALESCE(SUM(tax_amount), 0) AS tax, "
-                "COALESCE(SUM(qty * unit_price - discount_amount + tax_amount), 0) AS total "
+                "COALESCE(SUM(net_amount + tax_amount), 0) AS exact_total "
                 "FROM sale_lines "
                 "WHERE business_id = :b AND sale_id = ANY(CAST(:ids AS uuid[])) AND deleted_at IS NULL "
                 "GROUP BY sale_id"
@@ -476,8 +481,9 @@ async def _materialise(
             r.sale_id: {
                 "subtotal": str(Decimal(str(r.subtotal)).quantize(Decimal("0.01"))),
                 "discount": str(Decimal(str(r.discount)).quantize(Decimal("0.01"))),
+                "net": str(Decimal(str(r.net)).quantize(Decimal("0.01"))),
                 "tax": str(Decimal(str(r.tax)).quantize(Decimal("0.01"))),
-                "total": str(Decimal(str(r.total)).quantize(Decimal("0.01"))),
+                "exact_total": str(Decimal(str(r.exact_total)).quantize(Decimal("0.01"))),
             }
             for r in totals_query.all()
         }
@@ -509,9 +515,23 @@ async def _materialise(
         for row in live:
             d = row["data"]
             sale_id = row["id"]
-            totals = totals_by_sale.get(
-                sale_id,
-                {"subtotal": "0.00", "discount": "0.00", "tax": "0.00", "total": "0.00"},
+            totals = dict(
+                totals_by_sale.get(
+                    sale_id,
+                    {
+                        "subtotal": "0.00",
+                        "discount": "0.00",
+                        "net": "0.00",
+                        "tax": "0.00",
+                        "exact_total": "0.00",
+                    },
+                )
+            )
+            rounding = Decimal(str(d.get("rounding_amount") or 0)).quantize(Decimal("0.01"))
+            totals["rounding"] = str(rounding)
+            # What the customer owes: exact (net + tax) plus the rounding step.
+            totals["total"] = str(
+                (Decimal(totals["exact_total"]) + rounding).quantize(Decimal("0.01"))
             )
             cust_id = UUID(str(d["customer_id"])) if d.get("customer_id") else None
             c_obj = cust_info.get(cust_id)
@@ -528,6 +548,10 @@ async def _materialise(
                 "customer_name": c_obj["name"] if c_obj else None,
                 "totals": totals,
                 "total_amount": totals["total"],
+                "tax_inclusive": bool(d.get("tax_inclusive")),
+                "tax_rounding_mode": d.get("tax_rounding_mode") or "none",
+                "rounding_amount": totals["rounding"],
+                "tax_label": d.get("tax_label") or "GST",
                 "payments": payments_by_sale.get(sale_id, []),
                 "created_at": d.get("created_at"),
             }

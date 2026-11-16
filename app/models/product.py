@@ -173,6 +173,10 @@ class Product(Base, AuditMixin, SoftDeleteMixin, SyncMixin):
         nullable=True,
     )
     tax_rate_id: Mapped[uuid.UUID | None] = mapped_column(Uuid(as_uuid=True), nullable=True)
+    # Exempt products never carry tax, even when the business has a default POS tax rate.
+    is_tax_exempt: Mapped[bool] = mapped_column(
+        Boolean, nullable=False, default=False, server_default="false"
+    )
     name: Mapped[str] = mapped_column(String(255), nullable=False)
     sku: Mapped[str | None] = mapped_column(String(100), nullable=True)
     product_type: Mapped[str] = mapped_column(product_type_enum, nullable=False)

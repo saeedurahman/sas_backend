@@ -3,7 +3,7 @@ from decimal import Decimal
 from typing import Any
 from uuid import UUID
 
-from pydantic import field_validator
+from pydantic import Field, field_validator
 
 from app.schemas.base import BaseSchema
 
@@ -36,8 +36,17 @@ class InvoiceLineItem(BaseSchema):
     discount_pct: Decimal
     discount_amount: Decimal
     tax_rate: Decimal
+    net_amount: Decimal = Decimal("0")
     tax_amount: Decimal
+    # Gross of the line (net + tax); equals qty x price - discount in inclusive mode.
     line_total: Decimal
+
+
+class InvoiceTaxBreakdownItem(BaseSchema):
+    tax_label: str
+    tax_rate: Decimal
+    net_amount: Decimal
+    tax_amount: Decimal
 
 
 class InvoicePaymentItem(BaseSchema):
@@ -48,10 +57,21 @@ class InvoicePaymentItem(BaseSchema):
 
 
 class InvoiceSummary(BaseSchema):
+    # Tax/price settings the sale was made with.
+    tax_inclusive: bool = False
+    tax_label: str = "GST"
+    tax_rounding_mode: str = "none"
+    # Display flag from the business settings (tax on + show breakdown + tax > 0).
+    show_tax_breakdown: bool = False
     subtotal: Decimal
     total_discount: Decimal
+    net_amount: Decimal = Decimal("0")
     total_tax: Decimal
+    exact_total: Decimal = Decimal("0")
+    rounding_amount: Decimal = Decimal("0")
+    # Rounded grand total = exact_total + rounding_amount.
     total_amount: Decimal
+    tax_breakdown: list[InvoiceTaxBreakdownItem] = Field(default_factory=list)
     total_paid: Decimal
     balance_due: Decimal
     change_given: Decimal

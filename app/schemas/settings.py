@@ -1,4 +1,5 @@
 from datetime import datetime
+from decimal import Decimal
 from typing import Any
 from uuid import UUID
 
@@ -28,6 +29,25 @@ class SettingResponse(BaseSchema):
     setting_key: str
     setting_value: dict[str, Any]
     updated_at: datetime
+
+
+class TaxPreviewResponse(BaseSchema):
+    """Worked example of one line priced with the business's current tax settings."""
+
+    tax_enabled: bool
+    tax_inclusive: bool
+    tax_rounding_mode: str
+    tax_label: str
+    tax_rate: Decimal
+    qty: Decimal
+    unit_price: Decimal
+    subtotal: Decimal
+    discount_amount: Decimal
+    net_amount: Decimal
+    tax_amount: Decimal
+    exact_total: Decimal
+    rounding_amount: Decimal
+    total_amount: Decimal
 
 
 class NotificationResponse(BaseSchema):

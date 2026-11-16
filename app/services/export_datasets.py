@@ -217,11 +217,14 @@ def _sales_sql(ctx: ExportCtx) -> str:
                s.sold_at AS sold_at, b.name AS branch, COALESCE(c.name, 'Walk-in') AS customer,
                s.sale_type::text AS sale_type, s.status::text AS status,
                COALESCE(l.subtotal, 0) AS subtotal, COALESCE(l.discount, 0) AS discount,
-               COALESCE(l.tax, 0) AS tax,
-               COALESCE(l.subtotal, 0) - COALESCE(l.discount, 0) + COALESCE(l.tax, 0) AS total,
+               COALESCE(l.net, 0) AS net, COALESCE(l.tax, 0) AS tax,
+               s.rounding_amount AS rounding,
+               COALESCE(l.net, 0) + COALESCE(l.tax, 0) + s.rounding_amount AS total,
                COALESCE(p.paid, 0) AS paid,
-               GREATEST(COALESCE(l.subtotal, 0) - COALESCE(l.discount, 0) + COALESCE(l.tax, 0)
+               GREATEST(COALESCE(l.net, 0) + COALESCE(l.tax, 0) + s.rounding_amount
                         - COALESCE(p.paid, 0), 0) AS balance_due,
+               CASE WHEN s.tax_inclusive THEN 'inclusive' ELSE 'exclusive' END AS tax_mode,
+               s.tax_label AS tax_label,
                COALESCE(p.methods, '') AS payment_methods,
                COALESCE(u.full_name, '') AS cashier
         FROM sales s
@@ -229,8 +232,9 @@ def _sales_sql(ctx: ExportCtx) -> str:
         LEFT JOIN customers c ON c.id = s.customer_id
         LEFT JOIN users u ON u.id = s.created_by
         LEFT JOIN LATERAL (
-            SELECT SUM(sl.qty * sl.unit_price) AS subtotal, SUM(sl.discount_amount) AS discount,
-                   SUM(sl.tax_amount) AS tax
+            SELECT SUM(ROUND(sl.qty * sl.unit_price, 2)) AS subtotal,
+                   SUM(sl.discount_amount) AS discount,
+                   SUM(sl.net_amount) AS net, SUM(sl.tax_amount) AS tax
             FROM sale_lines sl
             WHERE sl.business_id = s.business_id AND sl.sale_id = s.id AND sl.deleted_at IS NULL
         ) l ON TRUE
@@ -259,8 +263,9 @@ def _sale_lines_sql(ctx: ExportCtx) -> str:
                p.name AS product, COALESCE(v.name, '') AS variation,
                COALESCE(v.sku, p.sku, '') AS sku,
                sl.qty AS qty, sl.unit_price AS unit_price, sl.discount_amount AS discount,
-               sl.tax_rate AS tax_rate, sl.tax_amount AS tax,
-               sl.qty * sl.unit_price - sl.discount_amount + sl.tax_amount AS line_total,
+               sl.net_amount AS net, sl.tax_rate AS tax_rate, sl.tax_amount AS tax,
+               s.tax_label AS tax_label,
+               sl.net_amount + sl.tax_amount AS line_total,
                sl.cost_per_unit AS cost_per_unit
         FROM sale_lines sl
         JOIN sales s ON s.id = sl.sale_id
@@ -508,6 +513,7 @@ async def _load_tax_summary(db: AsyncSession, ctx: ExportCtx) -> list[dict[str, 
     rows: list[dict[str, Any]] = [
         {
             "section": "sales_by_rate",
+            "tax_label": r.tax_label,
             "tax_rate": r.tax_rate,
             "taxable_amount": r.total_sales_amount,
             "tax_amount": r.total_tax_amount,
@@ -516,9 +522,11 @@ async def _load_tax_summary(db: AsyncSession, ctx: ExportCtx) -> list[dict[str, 
         for r in ts.tax_by_rate
     ]
     rows += [
-        {"section": "total_sales", "tax_rate": None, "taxable_amount": ts.total_taxable_sales,
+        {"section": "total_sales", "tax_label": None, "tax_rate": None,
+         "taxable_amount": ts.total_taxable_sales,
          "tax_amount": ts.total_tax_collected, "transactions": None},
-        {"section": "total_purchases", "tax_rate": None, "taxable_amount": ts.total_taxable_purchases,
+        {"section": "total_purchases", "tax_label": None, "tax_rate": None,
+         "taxable_amount": ts.total_taxable_purchases,
          "tax_amount": ts.total_tax_paid, "transactions": None},
     ]
     return rows
@@ -577,8 +585,8 @@ DATASETS: dict[str, Dataset] = {
             "sales",
             _cols(
                 "sale_number client_receipt_no sold_at:datetime branch customer sale_type status "
-                "subtotal:money discount:money tax:money total:money paid:money balance_due:money "
-                "payment_methods cashier"
+                "subtotal:money discount:money net:money tax:money rounding:money total:money "
+                "paid:money balance_due:money tax_mode tax_label payment_methods cashier"
             ),
             "One row per sale in the date range",
             uses_dates=True, uses_branch=True, sql=_sales_sql, count_sql=_sales_count_sql,
@@ -587,8 +595,8 @@ DATASETS: dict[str, Dataset] = {
             "sale_lines",
             _cols(
                 "sale_number sold_at:datetime branch status product variation sku qty:qty "
-                "unit_price:money discount:money tax_rate:pct tax:money line_total:money "
-                "cost_per_unit:money"
+                "unit_price:money discount:money net:money tax_rate:pct tax:money tax_label "
+                "line_total:money cost_per_unit:money"
             ),
             "One row per sale line in the date range",
             uses_dates=True, uses_branch=True, sql=_sale_lines_sql, count_sql=_sale_lines_count_sql,
@@ -667,7 +675,7 @@ DATASETS: dict[str, Dataset] = {
         ),
         Dataset(
             "tax_summary",
-            _cols("section tax_rate:pct taxable_amount:money tax_amount:money transactions:int"),
+            _cols("section tax_label tax_rate:pct taxable_amount:money tax_amount:money transactions:int"),
             "Tax collected by rate, plus purchase tax paid",
             uses_dates=True, uses_branch=True, extra_permission="reports.financial",
             loader=_load_tax_summary,

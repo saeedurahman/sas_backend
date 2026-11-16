@@ -15,6 +15,9 @@ class RegisterBusinessRequest(BaseSchema):
     owner_password: str
     branch_name: str = Field(default="Main Branch", min_length=1, max_length=255)
     city: str | None = None
+    # Whether shelf prices already include tax. Omit to default by business type
+    # (pharmacy and mart: true, everything else: false).
+    prices_include_tax: bool | None = None
     # Only read when REGISTRATION_CAPTCHA_ENABLED=true.
     captcha_token: str | None = Field(default=None, max_length=4096)
 

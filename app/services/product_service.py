@@ -355,6 +355,7 @@ async def create_product(
             description=data.description,
             image_url=data.image_url,
             shelf_life_days=data.shelf_life_days,
+            is_tax_exempt=data.is_tax_exempt,
             min_stock_level=data.min_stock_level,
             max_stock_level=data.max_stock_level,
             created_by=created_by,
@@ -409,6 +410,8 @@ async def update_product(
         product.image_url = data.image_url
     if data.shelf_life_days is not None:
         product.shelf_life_days = data.shelf_life_days
+    if data.is_tax_exempt is not None:
+        product.is_tax_exempt = data.is_tax_exempt
     if data.min_stock_level is not None:
         product.min_stock_level = data.min_stock_level
     if data.max_stock_level is not None:

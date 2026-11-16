@@ -26,6 +26,10 @@ class SalesSummaryResponse(AnalyticsBaseSchema):
     avg_order_value: Decimal
     total_discount: Decimal
     total_tax: Decimal
+    # Net sales + tax, the rounding step on grand totals, and what customers owed in total.
+    total_gross: Decimal = Decimal("0")
+    total_rounding: Decimal = Decimal("0")
+    total_collected: Decimal = Decimal("0")
     total_returns: Decimal
     net_revenue: Decimal
 
@@ -226,6 +230,7 @@ class DeadStockItem(AnalyticsBaseSchema):
 
 
 class TaxByRateItem(AnalyticsBaseSchema):
+    tax_label: str = "GST"
     tax_rate: Decimal
     total_sales_amount: Decimal
     total_tax_amount: Decimal

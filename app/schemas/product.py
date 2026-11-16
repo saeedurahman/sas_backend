@@ -111,6 +111,7 @@ class CreateProductRequest(BaseSchema):
     tracking_type: TrackingTypeEnum
     is_sellable: bool = True
     is_purchasable: bool = True
+    is_tax_exempt: bool = False
     description: str | None = None
     image_url: str | None = None
     shelf_life_days: int | None = None
@@ -137,6 +138,7 @@ class UpdateProductRequest(BaseSchema):
     is_sellable: bool | None = None
     is_purchasable: bool | None = None
     is_active: bool | None = None
+    is_tax_exempt: bool | None = None
     description: str | None = None
     image_url: str | None = None
     shelf_life_days: int | None = None
@@ -345,6 +347,7 @@ class ProductResponse(ProductAuditSchema):
     is_sellable: bool
     is_purchasable: bool
     is_active: bool
+    is_tax_exempt: bool = False
     description: str | None
     image_url: str | None
     shelf_life_days: int | None

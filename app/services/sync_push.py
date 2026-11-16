@@ -75,7 +75,12 @@ from app.services.fifo_service import (
 )
 from app.services.notification_service import create_notification
 from app.services.price_service import get_product_price
-from app.services.pricing_engine import calculate_line_total, determine_sale_status
+from app.services.pricing_engine import (
+    determine_sale_status,
+    price_cart,
+    round_total,
+)
+from app.services.tax_settings import tax_settings_at
 from app.services.register_service import (
     _calculate_expected_cash,
     _load_shift_transactions,
@@ -110,6 +115,9 @@ FLAG_SHIFT = "shift_mismatch"
 FLAG_SUBSCRIPTION = "subscription_expired"
 FLAG_MODIFIER_PRICE = "modifier_price_mismatch"
 FLAG_UNKNOWN_MODIFIER = "unknown_modifier"
+FLAG_ROUNDING = "rounding_mismatch"
+FLAG_TOTAL = "total_mismatch"
+FLAG_SETTINGS = "settings_mismatch"
 ALL_FLAGS = (
     FLAG_PRICE,
     FLAG_TAX,
@@ -120,6 +128,9 @@ ALL_FLAGS = (
     FLAG_SUBSCRIPTION,
     FLAG_MODIFIER_PRICE,
     FLAG_UNKNOWN_MODIFIER,
+    FLAG_ROUNDING,
+    FLAG_TOTAL,
+    FLAG_SETTINGS,
 )
 
 # Stable error codes.
@@ -570,11 +581,37 @@ async def _h_sale_create(ctx: Ctx, db, p: SaleCreatePayload, op: OpEnvelope) -> 
                 retryable=True,
             ) from None
 
+    # -- settings the sale was priced with: the device's if sent, else those active at
+    #    occurred_at; flagged when they differ from today's ----------------------------
+    cfg_then, cfg_now = await tax_settings_at(db, ctx.business_id, sold_at)
+    sale_inclusive = (
+        p.tax_inclusive if p.tax_inclusive is not None else cfg_then.effective_inclusive
+    )
+    sale_rounding_mode = (
+        p.tax_rounding_mode if p.tax_rounding_mode is not None else cfg_then.rounding_mode
+    )
+    sale_tax_label = p.tax_label or cfg_then.label
+    if (
+        sale_inclusive != cfg_now.effective_inclusive
+        or sale_rounding_mode != cfg_now.rounding_mode
+    ):
+        flag(FLAG_SETTINGS)
+
     # -- frozen money: exactly what the customer was told ------------------------------
-    line_totals = [
-        _round2(l.qty * l.unit_price - l.discount_amount + l.tax_amount) for l in p.lines
-    ]
-    total_amount = sum(line_totals, _ZERO)
+    # Per line, net + tax is the gross in both modes: exclusive adds the frozen tax on top
+    # of qty x price - discount, inclusive already contains it.
+    frozen_net: list[Decimal] = []
+    for l in p.lines:
+        after_discount = _round2(l.qty * l.unit_price - l.discount_amount)
+        frozen_net.append(after_discount - l.tax_amount if sale_inclusive else after_discount)
+    line_totals = [net + l.tax_amount for net, l in zip(frozen_net, p.lines, strict=True)]
+    exact_total = sum(line_totals, _ZERO)
+    client_rounding = (
+        p.rounding_amount
+        if p.rounding_amount is not None
+        else round_total(exact_total, sale_rounding_mode)[1]
+    )
+    total_amount = exact_total + client_rounding
     total_applied = sum((pay.amount for pay in p.payments), _ZERO)
     credit_amount = sum(
         (pay.amount for pay in p.payments if pay.payment_method == PaymentMethodEnum.credit), _ZERO
@@ -583,11 +620,35 @@ async def _h_sale_create(ctx: Ctx, db, p: SaleCreatePayload, op: OpEnvelope) -> 
         raise OpReject(E_PAYLOAD, "customer_id is required for credit payments")
 
     # -- server-side recomputation, recorded as flags only -----------------------------
-    server_rates = await resolve_line_tax_rates(db, ctx.business_id, list(p.lines), frozenset())
-    for line, server_rate in zip(p.lines, server_rates, strict=True):
-        expected = calculate_line_total(
-            line.qty, line.unit_price, line.discount_pct, line.discount_amount, server_rate
-        )
+    server_rates = await resolve_line_tax_rates(
+        db, ctx.business_id, list(p.lines), frozenset(), cfg_then
+    )
+    expected_lines, expected_totals = price_cart(
+        [
+            {
+                "qty": l.qty,
+                "unit_price": l.unit_price,
+                "discount_pct": l.discount_pct,
+                "discount_amount": l.discount_amount,
+                "tax_rate": rate,
+            }
+            for l, rate in zip(p.lines, server_rates, strict=True)
+        ],
+        inclusive=sale_inclusive,
+        rounding_mode=sale_rounding_mode,
+    )
+    # The device's rounding must be what its own mode gives for its own exact total.
+    if p.rounding_amount is not None and (
+        abs(p.rounding_amount - round_total(exact_total, sale_rounding_mode)[1]) > _CENT
+    ):
+        flag(FLAG_ROUNDING)
+    if abs(total_amount - expected_totals["total_amount"]) > _CENT or (
+        p.total_amount is not None and abs(p.total_amount - total_amount) > _CENT
+    ):
+        flag(FLAG_TOTAL)
+    for line, server_rate, expected in zip(
+        p.lines, server_rates, expected_lines, strict=True
+    ):
         if abs(expected["tax_amount"] - line.tax_amount) > _CENT or line.tax_rate != server_rate:
             flag(FLAG_TAX)
         try:
@@ -669,6 +730,10 @@ async def _h_sale_create(ctx: Ctx, db, p: SaleCreatePayload, op: OpEnvelope) -> 
         sold_at=sold_at,
         notes=p.notes,
         discount_scheme_id=p.discount_scheme_id,
+        tax_inclusive=sale_inclusive,
+        tax_rounding_mode=sale_rounding_mode,
+        rounding_amount=client_rounding,
+        tax_label=sale_tax_label,
         sync_status="synced",
         client_receipt_no=p.client_receipt_no,
         device_id=ctx.device_id,
@@ -712,6 +777,7 @@ async def _h_sale_create(ctx: Ctx, db, p: SaleCreatePayload, op: OpEnvelope) -> 
             unit_price=line.unit_price,
             discount_pct=line.discount_pct,
             discount_amount=line.discount_amount,
+            net_amount=frozen_net[index],
             tax_rate=line.tax_rate,
             tax_amount=line.tax_amount,
             cost_per_unit=cost,

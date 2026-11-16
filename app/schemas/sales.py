@@ -221,8 +221,17 @@ class CreateSaleRequest(BaseSchema):
     discount_scheme_id: UUID | None = None
     notes: str | None = None
     sold_at: datetime | None = None
+    # Fixed discount on the whole cart, spread over the lines in proportion to their value.
+    cart_discount_amount: Decimal = Decimal("0")
     lines: list[CreateSaleLineRequest]
     payments: list[CreatePaymentRequest] = Field(default_factory=list)
+
+    @field_validator("cart_discount_amount")
+    @classmethod
+    def validate_cart_discount(cls, value: Decimal) -> Decimal:
+        if value < 0:
+            raise ValueError("cart_discount_amount cannot be negative")
+        return value
 
     @model_validator(mode="after")
     def validate_lines(self) -> "CreateSaleRequest":
@@ -425,15 +434,24 @@ class SalePricePreviewLineResponse(BaseSchema):
     discount_pct: Decimal
     discount_amount: Decimal
     tax_rate: Decimal
+    net_amount: Decimal
     tax_amount: Decimal
     line_total: Decimal
 
 
 class SalePricePreviewResponse(BaseSchema):
     discount_scheme_id: UUID | None
+    tax_enabled: bool = True
+    tax_inclusive: bool = False
+    tax_rounding_mode: str = "none"
+    tax_label: str = "GST"
     subtotal: Decimal
     total_discount: Decimal
+    net_amount: Decimal = Decimal("0")
     total_tax: Decimal
+    exact_total: Decimal = Decimal("0")
+    rounding_amount: Decimal = Decimal("0")
+    # Rounded grand total: what the customer owes (exact_total + rounding_amount).
     total_amount: Decimal
     lines: list[SalePricePreviewLineResponse] = Field(default_factory=list)
 
@@ -449,6 +467,7 @@ class SaleLineResponse(BaseSchema):
     discount_pct: Decimal
     discount_amount: Decimal
     tax_rate: Decimal
+    net_amount: Decimal = Decimal("0")
     tax_amount: Decimal
     cost_per_unit: Decimal
     cost_estimated: bool = False
@@ -478,6 +497,7 @@ class SaleReturnLineResponse(BaseSchema):
     qty: Decimal
     unit_price: Decimal
     discount_amount: Decimal = Decimal("0")
+    net_amount: Decimal = Decimal("0")
     tax_amount: Decimal
 
 
@@ -490,6 +510,10 @@ class SaleReturnResponse(SalesAuditSchema):
     return_number: str
     returned_at: datetime
     reason: str | None
+    tax_inclusive: bool = False
+    tax_rounding_mode: str = "none"
+    tax_label: str = "GST"
+    rounding_amount: Decimal = Decimal("0")
     total_refund: Decimal = Decimal("0")
     credit_amount: Decimal = Decimal("0")
     lines: list[SaleReturnLineResponse] = Field(default_factory=list)
@@ -510,6 +534,16 @@ class SaleResponse(SalesAuditSchema):
     status: str
     sold_at: datetime
     notes: str | None
+    tax_inclusive: bool = False
+    tax_rounding_mode: str = "none"
+    tax_label: str = "GST"
+    subtotal: Decimal = Decimal("0")
+    total_discount: Decimal = Decimal("0")
+    net_amount: Decimal = Decimal("0")
+    total_tax: Decimal = Decimal("0")
+    exact_total: Decimal = Decimal("0")
+    rounding_amount: Decimal = Decimal("0")
+    total_amount: Decimal = Decimal("0")
     change_given: Decimal = Decimal("0")
     lines: list[SaleLineResponse] = Field(default_factory=list)
     payments: list[SalePaymentResponse] = Field(default_factory=list)
