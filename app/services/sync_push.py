@@ -42,6 +42,7 @@ from app.models.enums import (
 )
 from app.models.product import Product, ProductVariation
 from app.models.register import RegisterShift, RegisterTransaction
+from app.models.restaurant import Modifier
 from app.models.sales import Customer, CustomerLedger, Sale, SaleLine, SalePayment
 from app.models.sync import SyncOp
 from app.models.user import User
@@ -82,6 +83,7 @@ from app.services.register_service import (
     get_active_shift_for_user,
     get_cash_register_by_id,
 )
+from app.services.restaurant_tab_service import _encode_sale_line_notes
 from app.services.return_service import create_sale_return
 from app.services.sale_service import void_sale
 from app.services.stock_service import (
@@ -106,13 +108,26 @@ FLAG_CREDIT = "credit_limit_exceeded"
 FLAG_COST = "cost_estimated"
 FLAG_SHIFT = "shift_mismatch"
 FLAG_SUBSCRIPTION = "subscription_expired"
-ALL_FLAGS = (FLAG_PRICE, FLAG_TAX, FLAG_OVERSOLD, FLAG_CREDIT, FLAG_COST, FLAG_SHIFT, FLAG_SUBSCRIPTION)
+FLAG_MODIFIER_PRICE = "modifier_price_mismatch"
+FLAG_UNKNOWN_MODIFIER = "unknown_modifier"
+ALL_FLAGS = (
+    FLAG_PRICE,
+    FLAG_TAX,
+    FLAG_OVERSOLD,
+    FLAG_CREDIT,
+    FLAG_COST,
+    FLAG_SHIFT,
+    FLAG_SUBSCRIPTION,
+    FLAG_MODIFIER_PRICE,
+    FLAG_UNKNOWN_MODIFIER,
+)
 
 # Stable error codes.
 E_MALFORMED = "malformed_op"
 E_PAYLOAD = "malformed_payload"
 E_TOO_LARGE = "payload_too_large"
 E_UNSUPPORTED = "unsupported_op_type"
+E_ONLINE_ONLY = "online_only_operation"
 E_TOO_OLD = "occurred_too_old"
 E_FUTURE = "occurred_in_future"
 E_PERMISSION = "permission_denied"
@@ -133,6 +148,20 @@ E_INTERNAL = "internal_error"
 
 # Only these keep working once the subscription lapsed: the money is already taken.
 LAPSED_ALLOWED = frozenset({"sale.create", "customer.payment", "shift.close"})
+
+# Dine-in / restaurant tab operations stay online-only.
+DINE_IN_OPS = frozenset({
+    "tab.open",
+    "tab.lines",
+    "tab.fire",
+    "tab.complete",
+    "tab.close",
+    "tab.update",
+    "open_tab",
+    "add_tab_lines",
+    "fire_tab",
+    "complete_tab",
+})
 
 OP_PERMISSIONS = {
     "customer.create": "customers.create",
@@ -568,8 +597,33 @@ async def _h_sale_create(ctx: Ctx, db, p: SaleCreatePayload, op: OpEnvelope) -> 
             )
         except HTTPException:
             catalog = None
-        if catalog is not None and _round2(line.unit_price) != _round2(catalog):
-            flag(FLAG_PRICE)
+        if catalog is not None:
+            mod_delta_client = sum((m.price * m.qty for m in line.modifiers), _ZERO)
+            matches_base = _round2(line.unit_price) == _round2(catalog)
+            matches_with_mod = _round2(line.unit_price) == _round2(catalog + mod_delta_client)
+            if not (matches_base or matches_with_mod):
+                flag(FLAG_PRICE)
+
+    mod_ids = {m.modifier_id for line in p.lines for m in line.modifiers if m.modifier_id}
+    known_modifiers: dict[UUID, Modifier] = {}
+    if mod_ids:
+        mods_res = await db.execute(
+            select(Modifier).where(
+                Modifier.id.in_(mod_ids),
+                Modifier.business_id == ctx.business_id,
+                Modifier.deleted_at.is_(None),
+            )
+        )
+        known_modifiers = {m.id: m for m in mods_res.scalars().all()}
+
+    for line in p.lines:
+        for m in line.modifiers:
+            if m.modifier_id is None or m.modifier_id not in known_modifiers:
+                flag(FLAG_UNKNOWN_MODIFIER)
+            else:
+                db_mod = known_modifiers[m.modifier_id]
+                if _round2(m.price) != _round2(db_mod.price_delta):
+                    flag(FLAG_MODIFIER_PRICE)
 
     if credit_amount > _ZERO and customer is not None and customer.credit_limit > _ZERO:
         balance = await get_customer_balance(db, customer.id, ctx.business_id)
@@ -633,6 +687,21 @@ async def _h_sale_create(ctx: Ctx, db, p: SaleCreatePayload, op: OpEnvelope) -> 
     for index, (line, (cost, _consumptions, short)) in enumerate(
         zip(p.lines, snapshots, strict=True)
     ):
+        if line.modifiers:
+            mod_dicts = [
+                {
+                    "modifier_id": str(m.modifier_id) if m.modifier_id else None,
+                    "name": m.name,
+                    "price_delta": str(m.price),
+                    "price": str(m.price),
+                    "qty": str(m.qty),
+                }
+                for m in line.modifiers
+            ]
+            line_notes = _encode_sale_line_notes(line.notes, mod_dicts)
+        else:
+            line_notes = line.notes
+
         sale_line = SaleLine(
             id=line.id or uuid4(),
             business_id=ctx.business_id,
@@ -647,7 +716,7 @@ async def _h_sale_create(ctx: Ctx, db, p: SaleCreatePayload, op: OpEnvelope) -> 
             tax_amount=line.tax_amount,
             cost_per_unit=cost,
             cost_estimated=short > _ZERO,
-            notes=line.notes,
+            notes=line_notes,
             line_order=line.line_order if line.line_order is not None else index,
             sync_status="synced",
             created_by=ctx.user_id,
@@ -1140,6 +1209,11 @@ def _parse_op(raw: Any) -> tuple[OpEnvelope | None, dict[str, Any] | None]:
         first = exc.errors()[0]
         where = ".".join(str(part) for part in first["loc"])
         return None, _result(op_id, "rejected", error=_error(E_MALFORMED, f"{where}: {first['msg']}"))
+    if op.type in DINE_IN_OPS or op.type.startswith(("tab.", "dine_in.", "table.", "kot.")):
+        return None, _result(
+            op.op_id, "rejected",
+            error=_error(E_ONLINE_ONLY, "Dine-in and tab operations are online-only"),
+        )
     if op.type not in HANDLERS:
         message = (
             "Held orders are not synced"

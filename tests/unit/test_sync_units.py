@@ -197,15 +197,16 @@ def test_error_codes_are_stable_strings():
     assert {
         sync_push.E_MALFORMED, sync_push.E_PAYLOAD, sync_push.E_TOO_LARGE, sync_push.E_UNSUPPORTED,
         sync_push.E_TOO_OLD, sync_push.E_FUTURE, sync_push.E_PERMISSION, sync_push.E_UNKNOWN_PRODUCT,
-        sync_push.E_DUP_RECEIPT, sync_push.E_REUSED,
+        sync_push.E_DUP_RECEIPT, sync_push.E_REUSED, sync_push.E_ONLINE_ONLY,
     } == {
         "malformed_op", "malformed_payload", "payload_too_large", "unsupported_op_type",
         "occurred_too_old", "occurred_in_future", "permission_denied", "unknown_product",
-        "duplicate_receipt", "idempotency_key_reused",
+        "duplicate_receipt", "idempotency_key_reused", "online_only_operation",
     }
     assert set(sync_push.ALL_FLAGS) == {
         "price_mismatch", "tax_mismatch", "oversold", "credit_limit_exceeded",
         "cost_estimated", "shift_mismatch", "subscription_expired",
+        "modifier_price_mismatch", "unknown_modifier",
     }
 
 

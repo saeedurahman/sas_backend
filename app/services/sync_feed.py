@@ -121,6 +121,11 @@ _BOOKKEEPING = [
 ]
 
 _CATALOG_PERMS = ("products.view", "sales.create", "sales.view", "inventory.view")
+_RESTAURANT_MOD_PERMS = ("restaurant.modifiers.view", "restaurant.modifiers.manage", "sales.create")
+_RESTAURANT_FLOOR_PERMS = ("restaurant.floor_plans.view", "restaurant.floor_plans.manage", "sales.create")
+_RESTAURANT_TABLE_PERMS = ("restaurant.tables.view", "restaurant.tables.manage", "sales.create")
+_REGISTER_SHIFT_PERMS = ("shifts.open", "shifts.close", "sales.create")
+_SALE_PERMS = ("sales.view", "sales.create")
 
 
 @dataclass(frozen=True)
@@ -154,8 +159,26 @@ ENTITIES: tuple[Entity, ...] = (
     Entity("discount_scheme", "discount_schemes", ("discounts.view", "sales.create")),
     Entity("stock_level", "stock_levels", ("inventory.view", "sales.create"),
            branch_col="branch_id", exclude=("variation_key",)),
+    Entity("modifier_group", "modifier_groups", _RESTAURANT_MOD_PERMS),
+    Entity("modifier", "modifiers", _RESTAURANT_MOD_PERMS),
+    Entity("product_modifier_group", "product_modifier_groups", _RESTAURANT_MOD_PERMS),
+    Entity("floor_plan", "floor_plans", _RESTAURANT_FLOOR_PERMS, branch_col="branch_id"),
+    Entity("table", "tables", _RESTAURANT_TABLE_PERMS, branch_col="branch_id"),
+    Entity("register_shift", "register_shifts", _REGISTER_SHIFT_PERMS, branch_col="branch_id", builder="register_shift"),
+    Entity("sale_summary", "sales", _SALE_PERMS, branch_col="branch_id", builder="sale_summary"),
+    Entity("customer_balance", "customers", ("customers.view", "sales.create"), builder="customer_balance"),
 )
 ENTITY_BY_NAME = {e.name: e for e in ENTITIES}
+# Aliases for convenience / backward-compatibility
+ENTITY_BY_NAME["modifier_groups"] = ENTITY_BY_NAME["modifier_group"]
+ENTITY_BY_NAME["modifiers"] = ENTITY_BY_NAME["modifier"]
+ENTITY_BY_NAME["product_modifier_groups"] = ENTITY_BY_NAME["product_modifier_group"]
+ENTITY_BY_NAME["floor_plans"] = ENTITY_BY_NAME["floor_plan"]
+ENTITY_BY_NAME["tables"] = ENTITY_BY_NAME["table"]
+ENTITY_BY_NAME["dining_table"] = ENTITY_BY_NAME["table"]
+ENTITY_BY_NAME["dining_tables"] = ENTITY_BY_NAME["table"]
+ENTITY_BY_NAME["register_shifts"] = ENTITY_BY_NAME["register_shift"]
+ENTITY_BY_NAME["sales"] = ENTITY_BY_NAME["sale_summary"]
 
 # Served to a business whose subscription blocks everything: just what the expired screen needs.
 RESTRICTED_ENTITIES = ("settings",)
@@ -239,6 +262,16 @@ async def _select_rows(
             )
             params["branches"] = scope.branches
             params["self_id"] = scope.user_id
+    if entity.name == "register_shift":
+        where.append("t.opened_by = :self_user_id")
+        params["self_user_id"] = scope.user_id
+        cutoff = datetime.now(timezone.utc) - timedelta(days=settings.sync_history_days)
+        where.append("t.created_at >= :history_cutoff")
+        params["history_cutoff"] = cutoff
+    elif entity.name == "sale_summary":
+        cutoff = datetime.now(timezone.utc) - timedelta(days=settings.sync_history_days)
+        where.append("t.sold_at >= :history_cutoff")
+        params["history_cutoff"] = cutoff
     exclude = [*_BOOKKEEPING, *entity.exclude]
     sql = (
         f"SELECT t.id, t.change_seq AS seq, (t.deleted_at IS NOT NULL) AS is_deleted, "
@@ -263,7 +296,7 @@ async def _materialise(
     ids = [r["id"] for r in live]
     built: dict[UUID, dict[str, Any]] = {}
 
-    if entity.builder == "customer":
+    if entity.builder in ("customer", "customer_balance"):
         balances = (
             await db.execute(
                 text(
@@ -275,27 +308,74 @@ async def _materialise(
             )
         ).all()
         by_customer = {row.customer_id: Decimal(str(row.balance)) for row in balances}
-        for row in live:
-            row["data"]["balance"] = str(by_customer.get(row["id"], Decimal("0")).quantize(Decimal("0.01")))
-        return rows
+        if entity.builder == "customer":
+            for row in live:
+                bal = by_customer.get(row["id"], Decimal("0")).quantize(Decimal("0.01"))
+                row["data"]["balance"] = str(bal)
+                row["data"]["balance_owed"] = str((-bal).quantize(Decimal("0.01")))
+            return rows
+        else:
+            for row in live:
+                bal = by_customer.get(row["id"], Decimal("0")).quantize(Decimal("0.01"))
+                built[row["id"]] = {
+                    "id": str(row["id"]),
+                    "customer_id": str(row["id"]),
+                    "balance": str(bal),
+                    "balance_owed": str((-bal).quantize(Decimal("0.01"))),
+                }
 
-    if entity.builder == "settings":
+    elif entity.builder == "settings":
         for row in live:
             data = row["data"]
             business = user.business
             state = sub.compute_state(business)
             contact = sub.contact_from_settings(await sub.load_platform_settings(db))
+            cfg_json = data.get("config_json") or {}
+            receipt_footer = cfg_json.get("receipt_footer")
+            tax_labels = cfg_json.get("tax_labels")
+            app_settings_rows = (
+                await db.execute(
+                    text(
+                        "SELECT setting_key, setting_value FROM app_settings "
+                        "WHERE business_id = :b AND branch_id IS NULL AND deleted_at IS NULL "
+                        "AND setting_key IN ('receipt.footer_text', 'tax.labels')"
+                    ),
+                    {"b": user.business_id},
+                )
+            ).mappings().all()
+            for as_row in app_settings_rows:
+                k = as_row["setting_key"]
+                v = as_row["setting_value"]
+                val = v.get("value") if isinstance(v, dict) and "value" in v else v
+                if k == "receipt.footer_text" and receipt_footer is None:
+                    receipt_footer = str(val) if val is not None else None
+                elif k == "tax.labels" and tax_labels is None:
+                    tax_labels = val if isinstance(val, dict) else {}
+
             built[row["id"]] = {
                 "business_name": business.name,
+                "legal_name": business.legal_name,
                 "currency_code": business.currency_code,
                 "timezone": business.timezone,
+                "phone": business.phone,
+                "tax_id": business.tax_id,
+                "ntn": business.tax_id,
+                "address": business.address_line1,
+                "address_line1": business.address_line1,
+                "address_line2": business.address_line2,
+                "city": business.city,
+                "state": business.state,
+                "postal_code": business.postal_code,
+                "country_code": business.country_code,
+                "receipt_footer": receipt_footer,
+                "tax_labels": tax_labels or {},
                 "default_tax_inclusive": data.get("default_tax_inclusive"),
                 "allow_negative_stock": data.get("allow_negative_stock"),
                 "fifo_costing_enabled": data.get("fifo_costing_enabled"),
                 "receipt_prefix": data.get("receipt_prefix"),
                 "invoice_prefix": data.get("invoice_prefix"),
                 "enable_offline_mode": data.get("enable_offline_mode"),
-                "features": data.get("config_json") or {},
+                "features": cfg_json,
                 "subscription": {
                     "status": state.status,
                     "days_left": state.days_left,
@@ -354,6 +434,102 @@ async def _materialise(
                 "status": member.status,
                 "is_locked": member.is_locked,
                 "permissions_version": permissions_version(member),
+            }
+    elif entity.builder == "register_shift":
+        user_ids = set()
+        for row in live:
+            d = row["data"]
+            if d.get("opened_by"):
+                user_ids.add(UUID(str(d["opened_by"])))
+            if d.get("closed_by"):
+                user_ids.add(UUID(str(d["closed_by"])))
+        user_names = {}
+        if user_ids:
+            un_rows = (
+                await db.execute(
+                    select(User.id, User.full_name).where(User.id.in_(user_ids))
+                )
+            ).all()
+            user_names = {r.id: r.full_name for r in un_rows}
+        for row in live:
+            d = dict(row["data"])
+            op_id = UUID(str(d["opened_by"])) if d.get("opened_by") else None
+            cl_id = UUID(str(d["closed_by"])) if d.get("closed_by") else None
+            d["opened_by_name"] = user_names.get(op_id)
+            d["closed_by_name"] = user_names.get(cl_id)
+            built[row["id"]] = d
+    elif entity.builder == "sale_summary":
+        totals_query = await db.execute(
+            text(
+                "SELECT sale_id, "
+                "COALESCE(SUM(qty * unit_price), 0) AS subtotal, "
+                "COALESCE(SUM(discount_amount), 0) AS discount, "
+                "COALESCE(SUM(tax_amount), 0) AS tax, "
+                "COALESCE(SUM(qty * unit_price - discount_amount + tax_amount), 0) AS total "
+                "FROM sale_lines "
+                "WHERE business_id = :b AND sale_id = ANY(CAST(:ids AS uuid[])) AND deleted_at IS NULL "
+                "GROUP BY sale_id"
+            ),
+            {"b": user.business_id, "ids": [str(i) for i in ids]},
+        )
+        totals_by_sale = {
+            r.sale_id: {
+                "subtotal": str(Decimal(str(r.subtotal)).quantize(Decimal("0.01"))),
+                "discount": str(Decimal(str(r.discount)).quantize(Decimal("0.01"))),
+                "tax": str(Decimal(str(r.tax)).quantize(Decimal("0.01"))),
+                "total": str(Decimal(str(r.total)).quantize(Decimal("0.01"))),
+            }
+            for r in totals_query.all()
+        }
+
+        payments_query = await db.execute(
+            text(
+                "SELECT sale_id, payment_method, amount FROM sale_payments "
+                "WHERE business_id = :b AND sale_id = ANY(CAST(:ids AS uuid[])) AND deleted_at IS NULL "
+                "ORDER BY created_at"
+            ),
+            {"b": user.business_id, "ids": [str(i) for i in ids]},
+        )
+        payments_by_sale: dict[UUID, list[dict[str, str]]] = {i: [] for i in ids}
+        for r in payments_query.all():
+            payments_by_sale[r.sale_id].append({
+                "payment_method": r.payment_method,
+                "amount": str(Decimal(str(r.amount)).quantize(Decimal("0.01"))),
+            })
+
+        cust_ids = [UUID(str(r["data"]["customer_id"])) for r in live if r["data"].get("customer_id")]
+        cust_info = {}
+        if cust_ids:
+            cust_res = await db.execute(
+                text("SELECT id, name, phone FROM customers WHERE id = ANY(CAST(:ids AS uuid[]))"),
+                {"ids": [str(i) for i in cust_ids]},
+            )
+            cust_info = {r.id: {"id": str(r.id), "name": r.name, "phone": r.phone} for r in cust_res.all()}
+
+        for row in live:
+            d = row["data"]
+            sale_id = row["id"]
+            totals = totals_by_sale.get(
+                sale_id,
+                {"subtotal": "0.00", "discount": "0.00", "tax": "0.00", "total": "0.00"},
+            )
+            cust_id = UUID(str(d["customer_id"])) if d.get("customer_id") else None
+            c_obj = cust_info.get(cust_id)
+            built[sale_id] = {
+                "id": str(sale_id),
+                "sale_number": d.get("sale_number"),
+                "number": d.get("sale_number"),
+                "client_receipt_no": d.get("client_receipt_no"),
+                "status": d.get("status"),
+                "sold_at": d.get("sold_at"),
+                "branch_id": d.get("branch_id"),
+                "customer_id": str(cust_id) if cust_id else None,
+                "customer": c_obj,
+                "customer_name": c_obj["name"] if c_obj else None,
+                "totals": totals,
+                "total_amount": totals["total"],
+                "payments": payments_by_sale.get(sale_id, []),
+                "created_at": d.get("created_at"),
             }
 
     for row in rows:

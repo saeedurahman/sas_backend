@@ -125,6 +125,30 @@ class CustomerCreatePayload(BaseSchema):
         return value
 
 
+class SaleLineModifierPayload(BaseSchema):
+    modifier_id: UUID | None = None
+    name: str = Field(min_length=1, max_length=150)
+    price: Decimal = Decimal("0")
+    qty: Decimal = Decimal("1")
+
+    @model_validator(mode="before")
+    @classmethod
+    def _support_price_delta(cls, data: Any) -> Any:
+        if isinstance(data, dict):
+            if "price" not in data and "price_delta" in data:
+                data = dict(data)
+                data["price"] = data["price_delta"]
+        return data
+
+    @model_validator(mode="after")
+    def _check_non_negative(self) -> "SaleLineModifierPayload":
+        if self.price < 0:
+            raise ValueError("price must be >= 0")
+        if self.qty <= 0:
+            raise ValueError("qty must be greater than 0")
+        return self
+
+
 class SaleLinePayload(BaseSchema):
     id: UUID | None = None  # client line id, so a later return can reference the line
     product_id: UUID
@@ -137,6 +161,7 @@ class SaleLinePayload(BaseSchema):
     tax_amount: Decimal = Decimal("0")
     notes: str | None = None
     line_order: int | None = None
+    modifiers: list[SaleLineModifierPayload] = Field(default_factory=list)
 
     @model_validator(mode="after")
     def _check(self) -> "SaleLinePayload":

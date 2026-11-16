@@ -219,14 +219,15 @@ POS devices keep a local copy of the catalog, work offline, and replay what they
 network returns. The server stays authoritative for FIFO costing, ledgers, stock and document
 numbers; the device only ever supplies facts (what was sold, at what price, when).
 
-Apply `alembic upgrade head` (revision `019_offline_sync`). Everything below is under `/api/v1`
+Apply `alembic upgrade head` (latest sync revision `025_offline_sync_gaps`). Everything below is under `/api/v1`
 unless stated; send `Authorization: Bearer ...` except for `/time`.
 
 ### Change feed: `change_seq` and cursors
 
 Every synced table (`products`, `product_variations`, `barcodes`, `categories`, `brands`, `units`,
 `tax_rates`, `price_lists`, `price_list_items`, `customers`, `discount_schemes`, `business_configs`,
-`branches`, `cash_registers`, `users`, `roles`, and the derived `stock_levels`) has a per-business
+`branches`, `cash_registers`, `users`, `roles`, derived `stock_levels`, `modifier_groups`, `modifiers`,
+`product_modifier_groups`, `floor_plans`, `tables`, `register_shifts`, `sales`) has a per-business
 `change_seq`. A deferred trigger stamps it **at COMMIT**, taking the business counter row lock last,
 so sequence order is commit order: a pull can never skip a row that commits late. Deletes are soft
 (`deleted_at`) and show up as tombstones; synced rows are never hard-deleted by the app (a unit test
@@ -235,11 +236,14 @@ enforces it). `stock_levels` is a per product+branch balance kept by a trigger o
 Because stamping happens at commit, two transactions that touch the same unlocked row at commit time can
 deadlock; Postgres aborts one and the sync processor retries the op (up to 3 times).
 
-Entities delivered: `settings` (business name/currency/timezone, a subset of the config, feature flags,
+Entities delivered: `settings` (business name, address, phone, NTN, receipt footer, tax labels, currency/timezone, feature flags,
 subscription status and contact), `branch`, `cash_register`, `role` (with `permission_keys`), `user`
 (`id, name, roles, role_ids, branch_ids, status, is_locked, permissions_version` only), `category`,
 `brand`, `unit`, `tax_rate`, `product`, `product_variation`, `barcode`, `price_list`, `price_list_item`,
-`customer` (with `balance`), `discount_scheme`, `stock_level`. Entities are filtered by the caller's
+`customer` (with `balance` and `balance_owed`), `discount_scheme`, `stock_level`, `modifier_group`, `modifier`,
+`product_modifier_group`, `floor_plan`, `table`, `register_shift` (own shifts, last `SYNC_HISTORY_DAYS` default 30 days),
+`sale_summary` (last `SYNC_HISTORY_DAYS` default 30 days, header/totals/payments summary; full line detail stays online),
+and `customer_balance` (`balance` and `balance_owed`). Entities are filtered by the caller's
 permissions and branch scope. Numbers are exact decimal strings.
 
 #### `GET /sync/pull?since=<cursor>&limit=500&branch_id=<uuid>&device_id=<id>`
@@ -295,6 +299,105 @@ Pass `next_page_token` back as `page_token` until `has_more` is false, then star
 (the same value on every page: the head at the moment the snapshot began; changes made while paging are
 re-delivered by that first pull, and upserts are idempotent).
 
+#### Entity JSON Shapes (Phase 6c Offline Sync Gaps)
+
+##### 1. Restaurant Catalog & Layout Reference Data (Read-Only)
+Synced to offline devices with tombstones (`op: "delete"` on soft-delete). Modifiers are tenant-wide; floor plans and tables are branch-scoped (`branch_id`).
+* `modifier_group`:
+  ```json
+  {"id": "uuid", "business_id": "uuid", "name": "Size", "selection_type": "single|multiple", "min_selections": 1, "max_selections": 1, "is_required": true, "sort_order": 1, "is_active": true, "created_at": "...", "deleted_at": null}
+  ```
+* `modifier`:
+  ```json
+  {"id": "uuid", "business_id": "uuid", "modifier_group_id": "uuid", "name": "Large", "price_delta": "2.50", "sort_order": 2, "is_active": true, "created_at": "...", "deleted_at": null}
+  ```
+* `product_modifier_group`:
+  ```json
+  {"id": "uuid", "business_id": "uuid", "product_id": "uuid", "modifier_group_id": "uuid", "created_at": "...", "deleted_at": null}
+  ```
+* `floor_plan`:
+  ```json
+  {"id": "uuid", "business_id": "uuid", "branch_id": "uuid", "name": "Main Floor", "is_active": true, "created_at": "...", "deleted_at": null}
+  ```
+* `table`:
+  ```json
+  {"id": "uuid", "business_id": "uuid", "branch_id": "uuid", "floor_plan_id": "uuid", "table_number": "T1", "capacity": 4, "pos_x": null, "pos_y": null, "status": "available", "created_at": "...", "deleted_at": null}
+  ```
+
+##### 2. Local History Screens (`SYNC_HISTORY_DAYS`, default 30)
+* `register_shift`: Delivered only for caller's own shifts (`opened_by == user.id`) within the last `SYNC_HISTORY_DAYS`:
+  ```json
+  {"id": "uuid", "business_id": "uuid", "branch_id": "uuid", "cash_register_id": "uuid", "opened_by": "uuid", "closed_by": "uuid|null", "opened_by_name": "Cashier", "closed_by_name": "Manager", "status": "open|closed", "opening_float": "1000.00", "expected_cash": "5500.00", "actual_cash": "5450.00", "cash_difference": "-50.00", "opened_at": "...", "closed_at": "..."}
+  ```
+* `sale_summary`: Recent sales summaries within the last `SYNC_HISTORY_DAYS` (full line items stay online-only):
+  ```json
+  {"id": "uuid", "sale_number": "INV-20261116-0001", "number": "INV-20261116-0001", "client_receipt_no": "T1-000123", "status": "completed", "sold_at": "2026-11-16T10:00:00Z", "branch_id": "uuid", "customer_id": "uuid|null", "customer_name": "Ali Traders", "customer": {"id": "uuid", "name": "Ali Traders", "phone": "0300..."}, "totals": {"subtotal": "500.00", "discount": "0.00", "tax": "25.00", "total": "525.00"}, "total_amount": "525.00", "payments": [{"payment_method": "cash", "amount": "525.00"}], "created_at": "..."}
+  ```
+
+##### 3. Customer Ledger Balance Convention & `balance_owed`
+Customer balance is computed by the server from `customer_ledger` entries (`sum(payments) - sum(credit_sales)`):
+* `balance`: The raw server ledger balance.
+  * `balance < 0` (e.g. `"-250.00"`): **Customer owes money to the shop**.
+  * `balance > 0` (e.g. `"100.00"`): Customer has advance store credit / overpaid.
+  * `balance == 0`: Account is settled.
+* `balance_owed`: Explicit positive owed amount (`-balance`):
+  * `balance_owed > 0` (e.g. `"250.00"`): **Customer owes the shop Rs. 250.00**.
+  * This matches the Flutter credit limit check directly (`balance_owed + new_sale_credit <= credit_limit`).
+  * `balance_owed <= 0`: No outstanding debt.
+* Exposed in both `customer` and standalone `customer_balance` feed entities:
+  ```json
+  {"id": "uuid", "customer_id": "uuid", "balance": "-250.00", "balance_owed": "250.00"}
+  ```
+
+##### 4. Receipt Branding in `settings`
+The `settings` entity change provides all receipt branding fields:
+```json
+{
+  "business_name": "My Supermarket",
+  "address_line1": "123 Main Road",
+  "address": "123 Main Road",
+  "phone": "03001234567",
+  "tax_id": "1234567-8",
+  "ntn": "1234567-8",
+  "receipt_footer": "Thank you for shopping with us!",
+  "tax_labels": {"standard": "GST"},
+  "currency": "PKR",
+  "timezone": "Asia/Karachi",
+  "receipt_prefix": "RCP",
+  "invoice_prefix": "INV",
+  "features": {"enable_restaurant": true, "enable_table_management": true, ...}
+}
+```
+
+##### 5. `sale.create` Modifier Line Payload
+Lines in `sale.create` op accept an optional `modifiers` array and `notes`:
+```json
+{
+  "lines": [
+    {
+      "product_id": "uuid",
+      "qty": "2",
+      "unit_price": "100.00",
+      "discount_amount": "0",
+      "tax_amount": "0",
+      "tax_rate": "0",
+      "notes": "No onions",
+      "modifiers": [
+        {
+          "modifier_id": "uuid|null",
+          "name": "Extra Cheese",
+          "price": "25.00",
+          "qty": "1"
+        }
+      ]
+    }
+  ]
+}
+```
+* Modifiers are persisted into `sale_lines.notes` under the standard JSON format: `restaurant:{"kitchen_notes": "...", "modifiers": [{"modifier_id": "...", "name": "...", "price_delta": "...", "price": "...", "qty": "..."}]}`.
+* Client totals are frozen (what customer paid is recorded). Price differences are flagged as `modifier_price_mismatch`. Unknown modifier IDs are accepted, snapshot name and price preserved, and flagged as `unknown_modifier`.
+* Dine-in / restaurant tab operations (`tab.*`, `dine_in.*`) are strictly online-only: if pushed, the op is rejected with stable error code `online_only_operation` (`retryable: false`).
+
 ### `POST /sync/push`
 
 ```json
@@ -313,7 +416,8 @@ re-delivered by that first pull, and upserts are idempotent).
                  "price_list_id": null, "discount_scheme_id": null, "notes": null,
                  "lines": [{"id": "l1l1...", "product_id": "3b0f...", "variation_id": null, "qty": "2",
                             "unit_price": "100.00", "discount_pct": "0", "discount_amount": "0",
-                            "tax_rate": "5", "tax_amount": "10.00", "notes": null, "line_order": 0}],
+                            "tax_rate": "5", "tax_amount": "10.00", "notes": "Extra spicy", "line_order": 0,
+                            "modifiers": [{"modifier_id": "m1m1...", "name": "Extra Cheese", "price": "25.00", "qty": "1"}]}],
                  "payments": [{"payment_method": "cash", "amount": "150.00", "tendered_amount": "200.00",
                                "change_given": "50.00", "reference_no": null, "paid_at": null},
                               {"payment_method": "credit", "amount": "60.00"}]}}
@@ -381,6 +485,8 @@ and never rejects a sale over a money difference. It recomputes on the server an
 | `oversold` | stock went negative (allowed for replayed sales while `ALLOW_NEGATIVE_STOCK_ON_SYNC=true`) |
 | `credit_limit_exceeded` | the credit portion pushes the customer past their limit |
 | `cost_estimated` | FIFO layers could not cover the quantity; the last known cost was used for the rest |
+| `modifier_price_mismatch` | a line modifier price differs from the catalog modifier price delta |
+| `unknown_modifier` | modifier id is unknown or not linked; accepted with snapshot name/price preserved |
 | `shift_mismatch` | the shift is unknown, belongs to another user or branch, or was not open at `occurred_at`; the sale is kept but no cash is posted into a drawer that is not the caller |
 | `subscription_expired` | accepted while the subscription was expired, suspended or cancelled |
 
@@ -397,6 +503,7 @@ number when the sale is applied; the device number is kept as `client_receipt_no
 | `malformed_op`, `malformed_payload` | no | the op or its payload does not validate |
 | `payload_too_large` | no | over `SYNC_MAX_PAYLOAD_BYTES` |
 | `unsupported_op_type` | no | unknown type, or a held order |
+| `online_only_operation` | no | tab or dine-in operation arrived in `/sync/push` (dine-in ops stay online-only) |
 | `occurred_too_old`, `occurred_in_future` | no | outside the allowed window |
 | `permission_denied` | no | the user lacks the op permission |
 | `branch_forbidden` | no | branch outside the user scope |

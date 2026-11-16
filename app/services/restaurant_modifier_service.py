@@ -8,7 +8,7 @@ from typing import Any
 from uuid import UUID
 
 from fastapi import HTTPException, status
-from sqlalchemy import delete, select
+from sqlalchemy import delete, func, select, update
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.orm import selectinload
@@ -358,6 +358,7 @@ async def get_product_modifier_groups(
         .where(
             ProductModifierGroup.business_id == business_id,
             ProductModifierGroup.product_id == product_id,
+            ProductModifierGroup.deleted_at.is_(None),
             ModifierGroup.business_id == business_id,
             ModifierGroup.deleted_at.is_(None),
         )
@@ -400,21 +401,42 @@ async def replace_product_modifier_groups(
                 detail=f"Unknown modifier groups: {', '.join(missing)}",
             )
 
+    now = _now()
+    # Soft-delete links that are no longer assigned (producing sync tombstones)
     await db.execute(
-        delete(ProductModifierGroup).where(
+        update(ProductModifierGroup)
+        .where(
             ProductModifierGroup.business_id == business_id,
             ProductModifierGroup.product_id == product_id,
+            ProductModifierGroup.modifier_group_id.notin_(unique_group_ids) if unique_group_ids else True,
+            ProductModifierGroup.deleted_at.is_(None),
         )
+        .values(deleted_at=now, deleted_by=created_by)
     )
+
     for group_id in unique_group_ids:
-        db.add(
-            ProductModifierGroup(
-                business_id=business_id,
-                product_id=product_id,
-                modifier_group_id=group_id,
-                created_by=created_by,
+        existing = (
+            await db.execute(
+                select(ProductModifierGroup).where(
+                    ProductModifierGroup.business_id == business_id,
+                    ProductModifierGroup.product_id == product_id,
+                    ProductModifierGroup.modifier_group_id == group_id,
+                )
             )
-        )
+        ).scalar_one_or_none()
+        if existing is not None:
+            if existing.deleted_at is not None:
+                existing.deleted_at = None
+                existing.deleted_by = None
+        else:
+            db.add(
+                ProductModifierGroup(
+                    business_id=business_id,
+                    product_id=product_id,
+                    modifier_group_id=group_id,
+                    created_by=created_by,
+                )
+            )
     await db.commit()
     return await get_product_modifier_groups(db, product_id, business_id)
 

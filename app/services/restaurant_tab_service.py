@@ -79,9 +79,11 @@ def _encode_sale_line_notes(
             "kitchen_notes": kitchen_notes,
             "modifiers": [
                 {
-                    "modifier_id": str(item["modifier_id"]),
+                    "modifier_id": str(item["modifier_id"]) if item.get("modifier_id") else None,
                     "name": item["name"],
-                    "price_delta": str(item["price_delta"]),
+                    "price_delta": str(item.get("price_delta", item.get("price", "0"))),
+                    "price": str(item.get("price", item.get("price_delta", "0"))),
+                    "qty": str(item.get("qty", "1")),
                 }
                 for item in modifiers
             ],
@@ -95,11 +97,16 @@ def decode_sale_line_notes(notes: str | None) -> tuple[str | None, list[dict[str
         payload = json.loads(notes[len(_LINE_NOTES_PREFIX) :])
         modifiers: list[dict[str, Any]] = []
         for item in payload.get("modifiers", []):
+            raw_id = item.get("modifier_id")
+            mod_id = UUID(str(raw_id)) if raw_id and str(raw_id) != "None" else None
+            price_val = item.get("price_delta", item.get("price", "0"))
             modifiers.append(
                 {
-                    "modifier_id": UUID(str(item["modifier_id"])),
+                    "modifier_id": mod_id,
                     "name": item["name"],
-                    "price_delta": Decimal(str(item["price_delta"])),
+                    "price_delta": Decimal(str(price_val)),
+                    "price": Decimal(str(item.get("price", price_val))),
+                    "qty": Decimal(str(item.get("qty", "1"))),
                 }
             )
         return payload.get("kitchen_notes"), modifiers

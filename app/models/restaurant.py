@@ -172,7 +172,7 @@ class Modifier(Base, AuditMixin, SoftDeleteMixin, SyncMixin):
     )
 
 
-class ProductModifierGroup(Base):
+class ProductModifierGroup(Base, SoftDeleteMixin, SyncMixin):
     __tablename__ = "product_modifier_groups"
 
     id: Mapped[uuid.UUID] = mapped_column(
@@ -197,6 +197,12 @@ class ProductModifierGroup(Base):
         DateTime(timezone=True), default=utc_now, nullable=False
     )
     created_by: Mapped[uuid.UUID | None] = mapped_column(
+        Uuid(as_uuid=True), nullable=True
+    )
+    deleted_at: Mapped[datetime | None] = mapped_column(
+        DateTime(timezone=True), nullable=True
+    )
+    deleted_by: Mapped[uuid.UUID | None] = mapped_column(
         Uuid(as_uuid=True), nullable=True
     )
 

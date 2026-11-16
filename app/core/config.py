@@ -168,6 +168,8 @@ class Settings(BaseSettings):
         default=True, validation_alias="ALLOW_NEGATIVE_STOCK_ON_SYNC"
     )
     sync_max_ops: int = Field(default=200, ge=1, validation_alias="SYNC_MAX_OPS")
+    # Days of local history (own shifts, sales summaries) delivered to devices on sync pull.
+    sync_history_days: int = Field(default=30, ge=1, validation_alias="SYNC_HISTORY_DAYS")
     # Largest JSON payload of a single op, in bytes.
     sync_max_payload_bytes: int = Field(
         default=65536, ge=1024, validation_alias="SYNC_MAX_PAYLOAD_BYTES"

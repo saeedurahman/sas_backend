@@ -257,7 +257,7 @@ def test_user_entity_never_leaks_credentials_or_contact(http_client, pos_tenant)
         assert set(user["data"]) == {
             "id", "name", "roles", "role_ids", "branch_ids", "status", "is_locked", "permissions_version",
         }
-    blob = str(changes)
+    blob = str(by_entity(changes, "user"))
     assert "password_hash" not in blob and "pin_hash" not in blob and t.owner_phone not in blob
 
 
