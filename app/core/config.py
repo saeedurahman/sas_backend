@@ -128,6 +128,9 @@ class Settings(BaseSettings):
 
     # --- Platform admin (separate audience + secret from tenant JWTs) -----------
     platform_jwt_secret: str = Field(default="", validation_alias="PLATFORM_JWT_SECRET")
+    platform_encryption_key: str | None = Field(
+        default=None, validation_alias="PLATFORM_ENCRYPTION_KEY"
+    )
     platform_token_expire_minutes: int = Field(
         default=60, ge=1, validation_alias="PLATFORM_TOKEN_EXPIRE_MINUTES"
     )
@@ -291,6 +294,19 @@ class Settings(BaseSettings):
                 problems.append("PLATFORM_JWT_SECRET looks like a placeholder/default value")
             if self.platform_jwt_secret in (self.jwt_secret_key, self.jwt_refresh_secret_key):
                 problems.append("PLATFORM_JWT_SECRET must differ from the tenant JWT secrets")
+            if not self.platform_encryption_key:
+                problems.append(
+                    "PLATFORM_ENCRYPTION_KEY is required in production when platform admin is enabled"
+                )
+            else:
+                try:
+                    from cryptography.fernet import Fernet
+
+                    Fernet(self.platform_encryption_key.encode())
+                except Exception:
+                    problems.append(
+                        "PLATFORM_ENCRYPTION_KEY must be a valid Fernet key (32 url-safe base64-encoded bytes)"
+                    )
         if bool(self.lease_signing_private_key) != bool(self.lease_public_key):
             problems.append("LEASE_SIGNING_PRIVATE_KEY and LEASE_PUBLIC_KEY must be set together")
         if bool(self.license_signing_private_key) != bool(self.license_public_key):

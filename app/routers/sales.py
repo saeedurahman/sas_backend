@@ -214,6 +214,12 @@ async def open_tab_endpoint(
     ),
     db=Depends(get_db),
 ):
+    assert_branch_access(current_user, data.branch_id)
+    if data.register_shift_id is not None:
+        from app.models.register import RegisterShift
+        shift = await db.get(RegisterShift, data.register_shift_id)
+        if shift and shift.business_id == current_user.business_id:
+            assert_branch_access(current_user, shift.branch_id)
     return await open_tab(
         db,
         current_user.business_id,

@@ -19,6 +19,7 @@ from typing import Any
 from urllib.parse import quote
 
 import jwt
+from cryptography.fernet import Fernet, InvalidToken
 from fastapi import HTTPException, status
 from jwt.exceptions import InvalidTokenError
 
@@ -34,6 +35,70 @@ TOTP_ISSUER = "PakPOS Admin"
 
 class PlatformTokenError(Exception):
     pass
+
+
+class PlatformEncryptionError(Exception):
+    pass
+
+
+# ── Encryption at rest (Fernet) ──────────────────────────────────────────────
+
+
+def _get_fernet_key(key: str | None = None) -> bytes:
+    if key:
+        return key.encode() if isinstance(key, str) else key
+    if settings.platform_encryption_key:
+        return settings.platform_encryption_key.encode()
+    # Dev / test fallback derived from JWT secret
+    base_secret = settings.platform_jwt_secret or settings.jwt_secret_key
+    digest = hashlib.sha256(base_secret.encode()).digest()
+    return base64.urlsafe_b64encode(digest)
+
+
+def is_fernet_token(val: str) -> bool:
+    return val.startswith("gAAAAA") and len(val) >= 100
+
+
+def encrypt_totp_secret(secret: str, key: str | None = None) -> str:
+    if is_fernet_token(secret):
+        return secret
+    fernet = Fernet(_get_fernet_key(key))
+    return fernet.encrypt(secret.encode()).decode()
+
+
+def decrypt_totp_secret(val: str, key: str | None = None) -> str:
+    if not is_fernet_token(val):
+        return val
+    fernet = Fernet(_get_fernet_key(key))
+    try:
+        return fernet.decrypt(val.encode()).decode()
+    except InvalidToken as exc:
+        raise PlatformEncryptionError("Failed to decrypt TOTP secret with platform key") from exc
+
+
+# ── Recovery Codes ────────────────────────────────────────────────────────────
+
+
+def generate_recovery_codes(n: int = 10) -> list[str]:
+    """Generate n one-time backup recovery codes formatted like 'a1b2-c3d4'."""
+    return [f"{secrets.token_hex(2)}-{secrets.token_hex(2)}" for _ in range(n)]
+
+
+def hash_recovery_code(admin_id: uuid.UUID, code: str) -> str:
+    code_norm = code.strip().lower().replace("-", "")
+    return hashlib.sha256(f"{admin_id}:{code_norm}".encode()).hexdigest()
+
+
+def verify_and_consume_recovery_code(admin: Any, code: str) -> bool:
+    hashes = list(getattr(admin, "recovery_codes_hashes", None) or [])
+    if not hashes:
+        return False
+    h = hash_recovery_code(admin.id, code)
+    if h in hashes:
+        hashes.remove(h)
+        admin.recovery_codes_hashes = hashes
+        return True
+    return False
 
 
 # ── TOTP ──────────────────────────────────────────────────────────────────────

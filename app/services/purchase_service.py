@@ -457,6 +457,7 @@ async def create_purchase_receipt(
                     reference_id=receipt_line.id,
                     notes=f"Goods receipt {receipt_number}",
                     created_by=created_by,
+                    branch_id=data.branch_id,
                 )
 
         if po is not None:

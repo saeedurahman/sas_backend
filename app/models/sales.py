@@ -86,6 +86,11 @@ class CustomerLedger(Base, SoftDeleteMixin, SyncMixin):
         ForeignKey("businesses.id", ondelete="CASCADE"),
         nullable=False,
     )
+    branch_id: Mapped[uuid.UUID | None] = mapped_column(
+        Uuid(as_uuid=True),
+        ForeignKey("branches.id", ondelete="SET NULL"),
+        nullable=True,
+    )
     customer_id: Mapped[uuid.UUID] = mapped_column(
         Uuid(as_uuid=True),
         ForeignKey("customers.id", ondelete="RESTRICT"),

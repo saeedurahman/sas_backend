@@ -19,7 +19,7 @@ from app.models.enums import (
     SaleStatusEnum,
     StockMovementTypeEnum,
 )
-from app.models.product import Product
+from app.models.product import Product, ProductVariation
 from app.models.register import RegisterTransaction
 from app.models.sales import (
     Customer,
@@ -725,6 +725,7 @@ async def create_sale(
                 created_by=created_by,
                 reference_type=ReferenceTypeEnum.sale,
                 reference_id=sale.id,
+                branch_id=sale.branch_id,
             )
 
         await db.commit()
@@ -888,6 +889,7 @@ async def _reverse_completed_sale_settlements(
             reference_type=ReferenceTypeEnum.sale,
             reference_id=sale.id,
             notes="Sale settlement reversed",
+            branch_id=sale.branch_id,
         )
 
 

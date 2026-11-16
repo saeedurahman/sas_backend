@@ -22,6 +22,7 @@ def _use_test_database() -> None:
     except TestDatabaseConfigError as exc:
         pytest.exit(str(exc), returncode=4)
     os.environ["DATABASE_URL"] = url
+    os.environ.setdefault("PLATFORM_ENCRYPTION_KEY", "7t2M4i5Z_X1-Y3w0v8u6t4s2r0q8p6o4n2m0k8j6h4g=")
 
 
 _use_test_database()

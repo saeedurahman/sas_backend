@@ -45,10 +45,14 @@ from app.licensing.keys import generate_keypair  # noqa: E402
 
 TEST_LICENSE_PRIVATE_KEY, TEST_LICENSE_PUBLIC_KEY = generate_keypair()
 TEST_PLATFORM_JWT_SECRET = "test-platform-jwt-secret-0123456789abcdef-xyz"
+TEST_PLATFORM_ENCRYPTION_KEY = os.environ.get(
+    "PLATFORM_ENCRYPTION_KEY", "7t2M4i5Z_X1-Y3w0v8u6t4s2r0q8p6o4n2m0k8j6h4g="
+)
 
 RELAXED_ENV.update(
     {
         "PLATFORM_JWT_SECRET": TEST_PLATFORM_JWT_SECRET,
+        "PLATFORM_ENCRYPTION_KEY": TEST_PLATFORM_ENCRYPTION_KEY,
         "PLATFORM_ADMIN_RATE_LIMITS": "login_ip=100000/minute,login_account=100000/minute,api=100000/minute",
         "PLATFORM_MAX_LOGIN_ATTEMPTS": "3",
         "PLATFORM_LOCKOUT_MINUTES": "15",

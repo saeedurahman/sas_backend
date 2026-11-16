@@ -198,6 +198,11 @@ class SupplierLedger(Base, SoftDeleteMixin, SyncMixin):
         ForeignKey("businesses.id", ondelete="CASCADE"),
         nullable=False,
     )
+    branch_id: Mapped[uuid.UUID | None] = mapped_column(
+        Uuid(as_uuid=True),
+        ForeignKey("branches.id", ondelete="SET NULL"),
+        nullable=True,
+    )
     supplier_id: Mapped[uuid.UUID] = mapped_column(
         Uuid(as_uuid=True),
         ForeignKey("suppliers.id", ondelete="RESTRICT"),

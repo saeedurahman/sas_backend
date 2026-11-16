@@ -1,9 +1,10 @@
 from decimal import Decimal
 from uuid import UUID
 
-from fastapi import APIRouter, Depends, Query, Request, status
+from fastapi import APIRouter, Depends, HTTPException, Query, Request, status
 from pydantic import BaseModel
 
+from app.branch_scope import assert_branch_access, scoped_branch_query
 from app.core.idempotency import run_idempotent
 from app.database import get_db
 from app.dependencies import require_permission
@@ -90,11 +91,12 @@ async def update_customer_endpoint(
 )
 async def get_balance(
     customer_id: UUID,
+    branch_id: UUID | None = Depends(scoped_branch_query),
     current_user: User = Depends(require_permission("customers.ledger.view")),
     db=Depends(get_db),
 ):
     balance = await get_customer_balance(
-        db, customer_id, current_user.business_id
+        db, customer_id, current_user.business_id, branch_id=branch_id
     )
     return CustomerBalanceResponse(customer_id=customer_id, balance=balance)
 
@@ -106,13 +108,14 @@ async def get_balance(
 )
 async def get_ledger(
     customer_id: UUID,
+    branch_id: UUID | None = Depends(scoped_branch_query),
     skip: int = Query(default=0, ge=0),
     limit: int = Query(default=50, le=200),
     current_user: User = Depends(require_permission("customers.ledger.view")),
     db=Depends(get_db),
 ):
     entries, _ = await get_customer_ledger(
-        db, customer_id, current_user.business_id, skip, limit
+        db, customer_id, current_user.business_id, skip, limit, branch_id=branch_id
     )
     return entries
 
@@ -129,6 +132,17 @@ async def record_customer_payment_endpoint(
     current_user: User = Depends(require_permission("customers.update")),
     db=Depends(get_db),
 ):
+    assert_branch_access(current_user, data.branch_id)
+    if data.register_shift_id is not None:
+        from app.models.register import RegisterShift
+        shift = await db.get(RegisterShift, data.register_shift_id)
+        if shift and shift.business_id == current_user.business_id:
+            assert_branch_access(current_user, shift.branch_id)
+            if data.branch_id is not None and shift.branch_id != data.branch_id:
+                raise HTTPException(
+                    status_code=status.HTTP_400_BAD_REQUEST,
+                    detail="Shift does not belong to specified branch",
+                )
     return await run_idempotent(
         request,
         business_id=current_user.business_id,
@@ -137,10 +151,11 @@ async def record_customer_payment_endpoint(
         response_model=CustomerPaymentResponse,
         success_status=201,
         handler=lambda: record_customer_payment(
-        db,
-        current_user.business_id,
-        customer_id,
-        data,
-        current_user.id,
-    ),
+            db,
+            current_user.business_id,
+            customer_id,
+            data,
+            current_user.id,
+        ),
     )
+

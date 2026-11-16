@@ -10,7 +10,7 @@ from typing import Any
 
 import httpx
 
-from app.core.platform_security import generate_totp_secret, totp_at
+from app.core.platform_security import encrypt_totp_secret, generate_totp_secret, totp_at
 from app.services.auth_service import hash_password
 from tests.helpers.db import db_execute, db_rows, db_scalar
 
@@ -39,14 +39,16 @@ def create_admin_row(root: str, *, email: str | None = None, password: str = PLA
     admin_id = str(uuid.uuid4())
     email = email or f"admin-{uuid.uuid4().hex[:10]}@pakpos.test"
     secret = generate_totp_secret()
+    enc_secret = encrypt_totp_secret(secret)
     db_execute(
         """
         INSERT INTO platform_admins (id, email, name, password_hash, totp_secret)
         VALUES (:id, :email, :name, :hash, :secret)
         """,
-        {"id": admin_id, "email": email, "name": "Test Admin", "hash": hash_password(password), "secret": secret},
+        {"id": admin_id, "email": email, "name": "Test Admin", "hash": hash_password(password), "secret": enc_secret},
     )
     return AdminCtx(id=admin_id, email=email, password=password, totp_secret=secret, root=root)
+
 
 
 def code_for(admin: AdminCtx, *, offset_steps: int = 0) -> str:

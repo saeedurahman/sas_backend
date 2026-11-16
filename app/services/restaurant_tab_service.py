@@ -312,12 +312,17 @@ async def open_tab(
     await assert_no_active_tab_on_table(db, business_id, data.table_id)
 
     if data.register_shift_id is not None:
-        await verify_open_register_shift(
+        shift = await verify_open_register_shift(
             db,
             data.register_shift_id,
             business_id,
             closed_detail="Cannot open tab — shift is not open",
         )
+        if shift.branch_id != data.branch_id:
+            raise HTTPException(
+                status_code=status.HTTP_400_BAD_REQUEST,
+                detail="Shift does not belong to specified branch",
+            )
     if data.customer_id is not None:
         await get_customer_by_id(db, data.customer_id, business_id)
 
@@ -765,6 +770,7 @@ async def complete_tab(
                 created_by=completed_by,
                 reference_type=ReferenceTypeEnum.sale,
                 reference_id=sale.id,
+                branch_id=sale.branch_id,
             )
 
         sale.status = determine_sale_status(total_amount, settlement.total_applied).value

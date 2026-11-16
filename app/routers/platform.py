@@ -14,7 +14,7 @@ from app.core.platform_security import create_platform_token, ensure_configured
 from app.core.rate_limit import enforce_rate_limit
 from app.database import get_db
 from app.models.platform import PlatformAdmin
-from app.platform_deps import get_platform_admin, request_ip
+from app.platform_deps import get_platform_admin, get_platform_token_payload, request_ip
 from app.schemas.platform import (
     AdminCreate,
     AdminCredentials,
@@ -36,10 +36,13 @@ from app.schemas.platform import (
     PaymentResult,
     PlanIn,
     PlanOut,
+    PlatformChangePasswordRequest,
+    PlatformChangePasswordResponse,
     PlatformLoginRequest,
     PlatformSettingsBody,
     PlatformTokenResponse,
     ReasonBody,
+    RecoveryCodesResponse,
     Reset2faResult,
     SubscriptionOut,
     SubscriptionPatch,
@@ -64,7 +67,9 @@ async def platform_login(data: PlatformLoginRequest, request: Request, db=Depend
     limits = settings.platform_rate_limits
     enforce_rate_limit("platform-login-ip", ip, limits["login_ip"])
     enforce_rate_limit("platform-login-account", data.email.strip().lower(), limits["login_account"])
-    admin, token, expires_in = await admins.login(db, data.email, data.password, data.totp_code, ip)
+    admin, token, expires_in = await admins.login(
+        db, data.email, data.password, data.totp_code, ip, recovery_code=data.recovery_code
+    )
     return PlatformTokenResponse(access_token=token, expires_in=expires_in, admin=_admin_out(admin))
 
 
@@ -75,17 +80,56 @@ async def platform_refresh(admin: PlatformAdmin = Admin):
     return PlatformTokenResponse(access_token=token, expires_in=expires_in, admin=_admin_out(admin))
 
 
+@router.post("/auth/change-password", response_model=PlatformChangePasswordResponse)
+async def platform_change_password(
+    data: PlatformChangePasswordRequest,
+    request: Request,
+    admin: PlatformAdmin = Admin,
+    db=Depends(get_db),
+):
+    token, expires_in = await admins.change_admin_password(
+        db,
+        admin,
+        current_password=data.current_password,
+        new_password=data.new_password,
+        ip_address=request_ip(request),
+    )
+    return PlatformChangePasswordResponse(
+        access_token=token,
+        expires_in=expires_in,
+        admin=_admin_out(admin),
+    )
+
+
 @router.post("/auth/logout", response_model=MessageOut)
 async def platform_logout(
-    request: Request, admin: PlatformAdmin = Admin, db=Depends(get_db)
+    request: Request,
+    admin: PlatformAdmin = Admin,
+    token_payload: dict[str, Any] = Depends(get_platform_token_payload),
+    db=Depends(get_db),
 ):
-    """Tokens are stateless; this records the sign-out. Disable/2FA-reset end all sessions."""
-    await admins.record_audit(
-        db, admin, action="auth.logout", entity_type="admin", entity_id=admin.id,
-        entity_label=admin.email, ip_address=request_ip(request),
+    """Server-side token revocation: blacklists the jti until token expiry."""
+    await admins.revoke_platform_token(
+        db,
+        admin,
+        token_payload,
+        ip_address=request_ip(request),
     )
-    await db.commit()
     return MessageOut(message="Signed out")
+
+
+@router.post("/auth/recovery-codes", response_model=RecoveryCodesResponse)
+async def platform_generate_recovery_codes(
+    request: Request,
+    admin: PlatformAdmin = Admin,
+    db=Depends(get_db),
+):
+    codes = await admins.generate_admin_recovery_codes(
+        db,
+        admin,
+        ip_address=request_ip(request),
+    )
+    return RecoveryCodesResponse(recovery_codes=codes)
 
 
 @router.get("/me", response_model=AdminOut)
@@ -237,13 +281,23 @@ async def list_admins(_: PlatformAdmin = Admin, db=Depends(get_db)):
     return [_admin_out(a) for a in await admins.list_admins(db)]
 
 
-@router.post("/admins", response_model=AdminCredentials, status_code=status.HTTP_201_CREATED)
+@router.post(
+    "/admins",
+    response_model=AdminCredentials,
+    status_code=status.HTTP_201_CREATED,
+    response_model_exclude_none=True,
+)
 async def create_admin(
     data: AdminCreate, request: Request, admin: PlatformAdmin = Admin, db=Depends(get_db)
 ):
     created = await admins.create_admin(
-        db, admin, email=data.email, name=data.name, password=data.password,
+        db,
+        admin,
+        email=data.email,
+        name=data.name,
+        password=data.password,
         ip_address=request_ip(request),
+        generate_recovery_codes_flag=data.generate_recovery_codes,
     )
     return AdminCredentials(admin=_admin_out(created), **admins.credentials_for(created))
 
@@ -262,7 +316,11 @@ async def enable_admin(
     return _admin_out(await admins.set_admin_active(db, admin, admin_id, True, request_ip(request)))
 
 
-@router.post("/admins/{admin_id}/reset-2fa", response_model=Reset2faResult)
+@router.post(
+    "/admins/{admin_id}/reset-2fa",
+    response_model=Reset2faResult,
+    response_model_exclude_none=True,
+)
 async def reset_admin_2fa(
     admin_id: UUID, request: Request, admin: PlatformAdmin = Admin, db=Depends(get_db)
 ):

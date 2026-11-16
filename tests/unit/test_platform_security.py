@@ -156,6 +156,9 @@ def test_trial_and_grace_defaults():
 
 
 def test_production_requires_distinct_strong_platform_secret():
+    from cryptography.fernet import Fernet
+
+    valid_key = Fernet.generate_key().decode()
     prod = dict(ENV="production", ALLOWED_ORIGINS="https://a.example", **BASE)
     with pytest.raises(ValueError, match="PLATFORM_JWT_SECRET"):
         Settings(_env_file=None, PLATFORM_JWT_SECRET="short", **prod)
@@ -163,7 +166,10 @@ def test_production_requires_distinct_strong_platform_secret():
         Settings(_env_file=None, PLATFORM_JWT_SECRET="a" * 40, **prod)  # == tenant secret
     with pytest.raises(ValueError, match="set together"):
         Settings(_env_file=None, LICENSE_PUBLIC_KEY="abc", **prod)  # half a key pair
-    Settings(_env_file=None, PLATFORM_JWT_SECRET="Zq7" * 14, **prod)
+    with pytest.raises(ValueError, match="PLATFORM_ENCRYPTION_KEY"):
+        Settings(_env_file=None, PLATFORM_JWT_SECRET="Zq7" * 14, PLATFORM_ENCRYPTION_KEY=None, **prod)
+    Settings(_env_file=None, PLATFORM_JWT_SECRET="Zq7" * 14, PLATFORM_ENCRYPTION_KEY=valid_key, **prod)
+
 
 
 # ── branch scope rules ────────────────────────────────────────────────────────
@@ -211,3 +217,49 @@ def test_deleted_role_assignments_do_not_grant_access():
 def test_time_is_monotonic_enough_for_replay_guard_assumption():
     # the replay guard stores the integer time-step; steps only grow
     assert int(time.time() // 30) > 0
+
+
+def test_encryption_round_trip():
+    secret = ps.generate_totp_secret()
+    encrypted = ps.encrypt_totp_secret(secret)
+    assert ps.is_fernet_token(encrypted)
+    assert encrypted != secret
+    decrypted = ps.decrypt_totp_secret(encrypted)
+    assert decrypted == secret
+
+
+def test_encryption_idempotent():
+    secret = ps.generate_totp_secret()
+    enc1 = ps.encrypt_totp_secret(secret)
+    enc2 = ps.encrypt_totp_secret(enc1)
+    assert enc2 == enc1
+
+
+def test_decrypt_plain_passthrough():
+    assert ps.decrypt_totp_secret("PLAIN_SECRET") == "PLAIN_SECRET"
+
+
+def test_decrypt_with_wrong_key_raises_error():
+    from cryptography.fernet import Fernet
+
+    key1 = Fernet.generate_key().decode()
+    key2 = Fernet.generate_key().decode()
+    secret = ps.generate_totp_secret()
+    encrypted = ps.encrypt_totp_secret(secret, key=key1)
+    with pytest.raises(ps.PlatformEncryptionError):
+        ps.decrypt_totp_secret(encrypted, key=key2)
+
+
+def test_recovery_codes_generation_and_consumption():
+    codes = ps.generate_recovery_codes(10)
+    assert len(codes) == 10
+    admin_id = uuid.uuid4()
+    hashes = [ps.hash_recovery_code(admin_id, c) for c in codes]
+    assert len(set(hashes)) == 10
+    admin = SimpleNamespace(id=admin_id, recovery_codes_hashes=list(hashes))
+    assert ps.verify_and_consume_recovery_code(admin, codes[0]) is True
+    assert len(admin.recovery_codes_hashes) == 9
+    # single use only
+    assert ps.verify_and_consume_recovery_code(admin, codes[0]) is False
+    assert ps.verify_and_consume_recovery_code(admin, "invalid-code") is False
+

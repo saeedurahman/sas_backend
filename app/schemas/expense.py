@@ -154,6 +154,7 @@ class PaginatedExpenseResponse(BaseSchema):
 class SupplierLedgerResponse(BaseSchema):
     id: UUID
     business_id: UUID
+    branch_id: UUID | None = None
     supplier_id: UUID
     entry_type: str
     amount: Decimal
@@ -181,6 +182,7 @@ class SupplierPaymentRequest(BaseSchema):
     payment_method: PaymentMethodEnum
     reference_no: str | None = None
     notes: str | None = None
+    branch_id: UUID | None = None
 
     @field_validator("amount")
     @classmethod

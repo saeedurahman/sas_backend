@@ -426,6 +426,7 @@ async def create_expense(
             reference_type=_EXPENSE_REF_TYPE,
             reference_id=expense.id,
             created_by=created_by,
+            branch_id=data.branch_id,
         )
 
     await db.commit()

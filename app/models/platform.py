@@ -35,7 +35,10 @@ class PlatformAdmin(Base):
     email: Mapped[str] = mapped_column(String(255), nullable=False, unique=True)
     name: Mapped[str] = mapped_column(String(120), nullable=False)
     password_hash: Mapped[str] = mapped_column(String(255), nullable=False)
-    totp_secret: Mapped[str] = mapped_column(String(64), nullable=False)
+    totp_secret: Mapped[str] = mapped_column(String(255), nullable=False)
+    recovery_codes_hashes: Mapped[list[str] | None] = mapped_column(
+        JSONB, nullable=True, default=list
+    )
     is_active: Mapped[bool] = mapped_column(Boolean, nullable=False, default=True)
     # Bumped on disable / password change / 2FA reset: older tokens stop working.
     token_version: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
@@ -213,3 +216,23 @@ class License(Base):
     updated_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True), default=utc_now, onupdate=utc_now, nullable=False
     )
+
+
+class PlatformRevokedToken(Base):
+    """Server-side revoked platform admin tokens (blacklisted by jti until token expiry)."""
+
+    __tablename__ = "platform_revoked_tokens"
+
+    jti: Mapped[str] = mapped_column(String(64), primary_key=True)
+    admin_id: Mapped[uuid.UUID] = mapped_column(
+        Uuid(as_uuid=True),
+        ForeignKey("platform_admins.id", ondelete="CASCADE"),
+        nullable=False,
+    )
+    expires_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), nullable=False
+    )
+    revoked_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), default=utc_now, nullable=False
+    )
+

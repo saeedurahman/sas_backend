@@ -64,6 +64,7 @@ class CreateCustomerPaymentRequest(BaseSchema):
     reference_no: str | None = None
     notes: str | None = None
     register_shift_id: UUID | None = None
+    branch_id: UUID | None = None
 
     @field_validator("amount")
     @classmethod
@@ -367,6 +368,7 @@ class CustomerResponse(SalesAuditSchema):
 class CustomerLedgerResponse(BaseSchema):
     id: UUID
     business_id: UUID
+    branch_id: UUID | None = None
     customer_id: UUID
     entry_type: str
     amount: Decimal

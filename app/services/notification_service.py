@@ -23,6 +23,7 @@ async def get_notifications(
     business_id: UUID,
     user_id: UUID | None = None,
     branch_id: UUID | None = None,
+    allowed_branch_ids: set[UUID] | None = None,
     is_read: bool | None = None,
     notification_type: str | None = None,
     skip: int = 0,
@@ -38,6 +39,11 @@ async def get_notifications(
         )
     if branch_id is not None:
         filters.append(NotificationLog.branch_id == branch_id)
+    elif allowed_branch_ids is not None:
+        filters.append(
+            (NotificationLog.branch_id.is_(None))
+            | (NotificationLog.branch_id.in_(allowed_branch_ids))
+        )
     if is_read is not None:
         filters.append(NotificationLog.is_read == is_read)
     if notification_type is not None:
@@ -200,6 +206,7 @@ async def _recent_alert_exists(
 async def check_low_stock_alerts(
     db: AsyncSession,
     business_id: UUID,
+    allowed_branch_ids: set[UUID] | None = None,
 ) -> list[NotificationLog]:
     result = await db.execute(
         text(
@@ -234,7 +241,10 @@ async def check_low_stock_alerts(
     for row in result:
         product_id = row.product_id
         branch_id = row.branch_id
+        if allowed_branch_ids is not None and branch_id not in allowed_branch_ids:
+            continue
         if await _recent_alert_exists(
+
             db,
             business_id,
             NotificationTypeEnum.low_stock,
@@ -275,6 +285,7 @@ async def check_expiry_alerts(
     db: AsyncSession,
     business_id: UUID,
     days_before: int = 30,
+    allowed_branch_ids: set[UUID] | None = None,
 ) -> list[NotificationLog]:
     result = await db.execute(
         text(
@@ -304,6 +315,8 @@ async def check_expiry_alerts(
     for row in result:
         product_id = row.product_id
         branch_id = row.branch_id
+        if allowed_branch_ids is not None and branch_id not in allowed_branch_ids:
+            continue
         if await _recent_alert_exists(
             db,
             business_id,

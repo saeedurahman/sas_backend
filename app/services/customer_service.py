@@ -189,14 +189,18 @@ async def get_customer_balance(
     db: AsyncSession,
     customer_id: UUID,
     business_id: UUID,
+    branch_id: UUID | None = None,
 ) -> Decimal:
     await get_customer_by_id(db, customer_id, business_id)
+    filters = [
+        CustomerLedger.customer_id == customer_id,
+        CustomerLedger.business_id == business_id,
+        CustomerLedger.deleted_at.is_(None),
+    ]
+    if branch_id is not None:
+        filters.append(CustomerLedger.branch_id == branch_id)
     result = await db.execute(
-        select(func.coalesce(func.sum(CustomerLedger.amount), 0)).where(
-            CustomerLedger.customer_id == customer_id,
-            CustomerLedger.business_id == business_id,
-            CustomerLedger.deleted_at.is_(None),
-        )
+        select(func.coalesce(func.sum(CustomerLedger.amount), 0)).where(*filters)
     )
     return Decimal(str(result.scalar_one()))
 
@@ -207,6 +211,7 @@ async def get_customer_ledger(
     business_id: UUID,
     skip: int = 0,
     limit: int = 50,
+    branch_id: UUID | None = None,
 ) -> tuple[list[CustomerLedger], int]:
     await get_customer_by_id(db, customer_id, business_id)
     filters = [
@@ -214,6 +219,8 @@ async def get_customer_ledger(
         CustomerLedger.business_id == business_id,
         CustomerLedger.deleted_at.is_(None),
     ]
+    if branch_id is not None:
+        filters.append(CustomerLedger.branch_id == branch_id)
     count_result = await db.execute(
         select(func.count()).select_from(CustomerLedger).where(*filters)
     )
@@ -238,10 +245,12 @@ async def create_ledger_entry(
     reference_type: ReferenceTypeEnum | None = None,
     reference_id: UUID | None = None,
     notes: str | None = None,
+    branch_id: UUID | None = None,
 ) -> CustomerLedger:
     now = _now()
     entry = CustomerLedger(
         business_id=business_id,
+        branch_id=branch_id,
         customer_id=customer_id,
         entry_type=entry_type.value,
         amount=amount,
@@ -267,13 +276,20 @@ async def record_customer_payment(
 ) -> CustomerPaymentResponse:
     await get_customer_by_id(db, customer_id, business_id)
 
+    effective_branch_id = data.branch_id
     if data.register_shift_id is not None:
-        await verify_open_register_shift(
+        shift = await verify_open_register_shift(
             db,
             data.register_shift_id,
             business_id,
             closed_detail="Cannot record payment — shift is not open",
         )
+        if data.branch_id is not None and data.branch_id != shift.branch_id:
+            raise HTTPException(
+                status_code=status.HTTP_400_BAD_REQUEST,
+                detail="Shift does not belong to specified branch",
+            )
+        effective_branch_id = data.branch_id or shift.branch_id
 
     now = _now()
     note_parts: list[str] = [
@@ -296,7 +312,9 @@ async def record_customer_payment(
             reference_type=ReferenceTypeEnum.manual,
             reference_id=customer_id,
             notes=ledger_notes,
+            branch_id=effective_branch_id,
         )
+
 
         # register_tx_type_enum has no customer_payment value; cash_in is the
         # correct existing type for cash received into the drawer.

@@ -2,9 +2,11 @@ from uuid import UUID
 
 from fastapi import APIRouter, Depends, HTTPException, Query, status
 
+from app.branch_scope import assert_branch_access, scoped_branch_query
 from app.database import get_db
 from app.dependencies import (
     _user_permission_keys,
+    allowed_branch_ids,
     get_current_user,
     require_permission,
 )
@@ -30,7 +32,7 @@ router = APIRouter(prefix="/settings", tags=["Settings"])
 
 @router.get("", response_model=list[SettingResponse], status_code=status.HTTP_200_OK)
 async def list_settings(
-    branch_id: UUID | None = Query(default=None),
+    branch_id: UUID | None = Depends(scoped_branch_query),
     current_user: User = Depends(get_current_user),
     db=Depends(get_db),
 ):
@@ -46,6 +48,14 @@ async def upsert_setting_endpoint(
     current_user: User = Depends(require_permission("settings.manage")),
     db=Depends(get_db),
 ):
+    allowed = allowed_branch_ids(current_user)
+    if allowed is not None:
+        if data.branch_id is None:
+            raise HTTPException(
+                status_code=status.HTTP_403_FORBIDDEN,
+                detail="Branch-assigned staff cannot modify business-wide settings",
+            )
+        assert_branch_access(current_user, data.branch_id)
     return await upsert_setting(
         db, current_user.business_id, data, current_user.id
     )
@@ -57,6 +67,15 @@ async def bulk_upsert_settings_endpoint(
     current_user: User = Depends(require_permission("settings.manage")),
     db=Depends(get_db),
 ):
+    allowed = allowed_branch_ids(current_user)
+    if allowed is not None:
+        for item in data.items:
+            if item.branch_id is None:
+                raise HTTPException(
+                    status_code=status.HTTP_403_FORBIDDEN,
+                    detail="Branch-assigned staff cannot modify business-wide settings",
+                )
+            assert_branch_access(current_user, item.branch_id)
     return await bulk_upsert_settings(
         db, current_user.business_id, data, current_user.id
     )
@@ -69,7 +88,7 @@ async def bulk_upsert_settings_endpoint(
 )
 async def get_setting_endpoint(
     setting_key: str,
-    branch_id: UUID | None = Query(default=None),
+    branch_id: UUID | None = Depends(scoped_branch_query),
     current_user: User = Depends(get_current_user),
     db=Depends(get_db),
 ):
@@ -102,6 +121,14 @@ async def delete_setting_endpoint(
     current_user: User = Depends(require_permission("settings.manage")),
     db=Depends(get_db),
 ):
+    allowed = allowed_branch_ids(current_user)
+    if allowed is not None:
+        if branch_id is None:
+            raise HTTPException(
+                status_code=status.HTTP_403_FORBIDDEN,
+                detail="Branch-assigned staff cannot modify business-wide settings",
+            )
+        assert_branch_access(current_user, branch_id)
     await delete_setting(
         db,
         current_user.business_id,
@@ -110,3 +137,4 @@ async def delete_setting_endpoint(
         current_user.id,
     )
     return MessageResponse(message="Setting deleted")
+

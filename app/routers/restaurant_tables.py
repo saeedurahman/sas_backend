@@ -2,6 +2,12 @@ from uuid import UUID
 
 from fastapi import APIRouter, Depends, Query, status
 
+from app.branch_scope import (
+    assert_branch_access,
+    guard_record,
+    required_branch_query,
+    scoped_branch_query,
+)
 from app.database import get_db
 from app.dependencies import (
     _user_permission_keys,
@@ -46,7 +52,7 @@ router = APIRouter(prefix="/restaurant", tags=["Restaurant"])
     status_code=status.HTTP_200_OK,
 )
 async def list_floor_plans(
-    branch_id: UUID | None = Query(default=None),
+    branch_id: UUID | None = Depends(scoped_branch_query),
     current_user: User = Depends(require_permission("restaurant.floor_plans.view")),
     _config: BusinessConfig = Depends(require_feature_flag("enable_table_management")),
     db=Depends(get_db),
@@ -69,6 +75,7 @@ async def create_floor_plan_endpoint(
     _config: BusinessConfig = Depends(require_feature_flag("enable_table_management")),
     db=Depends(get_db),
 ):
+    assert_branch_access(current_user, data.branch_id)
     return await create_floor_plan(
         db,
         current_user.business_id,
@@ -81,6 +88,7 @@ async def create_floor_plan_endpoint(
     "/floor-plans/{floor_plan_id}",
     response_model=FloorPlanResponse,
     status_code=status.HTTP_200_OK,
+    dependencies=[Depends(guard_record("floor_plans", "floor_plan_id"))],
 )
 async def get_floor_plan(
     floor_plan_id: UUID,
@@ -99,6 +107,7 @@ async def get_floor_plan(
     "/floor-plans/{floor_plan_id}",
     response_model=FloorPlanResponse,
     status_code=status.HTTP_200_OK,
+    dependencies=[Depends(guard_record("floor_plans", "floor_plan_id"))],
 )
 async def update_floor_plan_endpoint(
     floor_plan_id: UUID,
@@ -120,6 +129,7 @@ async def update_floor_plan_endpoint(
     "/floor-plans/{floor_plan_id}",
     response_model=MessageResponse,
     status_code=status.HTTP_200_OK,
+    dependencies=[Depends(guard_record("floor_plans", "floor_plan_id"))],
 )
 async def delete_floor_plan_endpoint(
     floor_plan_id: UUID,
@@ -136,13 +146,14 @@ async def delete_floor_plan_endpoint(
     return MessageResponse(message="Floor plan deleted")
 
 
+
 @router.get(
     "/tables",
     response_model=list[DiningTableResponse],
     status_code=status.HTTP_200_OK,
 )
 async def list_dining_tables(
-    branch_id: UUID | None = Query(default=None),
+    branch_id: UUID | None = Depends(scoped_branch_query),
     floor_plan_id: UUID | None = Query(default=None),
     table_status: TableStatusEnum | None = Query(default=None, alias="status"),
     current_user: User = Depends(require_permission("restaurant.tables.view")),
@@ -169,6 +180,7 @@ async def create_dining_table_endpoint(
     _config: BusinessConfig = Depends(require_feature_flag("enable_table_management")),
     db=Depends(get_db),
 ):
+    assert_branch_access(current_user, data.branch_id)
     return await create_dining_table(
         db,
         current_user.business_id,
@@ -181,6 +193,7 @@ async def create_dining_table_endpoint(
     "/tables/{table_id}",
     response_model=DiningTableResponse,
     status_code=status.HTTP_200_OK,
+    dependencies=[Depends(guard_record("tables", "table_id"))],
 )
 async def get_dining_table(
     table_id: UUID,
@@ -199,6 +212,7 @@ async def get_dining_table(
     "/tables/{table_id}",
     response_model=DiningTableResponse,
     status_code=status.HTTP_200_OK,
+    dependencies=[Depends(guard_record("tables", "table_id"))],
 )
 async def update_dining_table_endpoint(
     table_id: UUID,
@@ -207,6 +221,10 @@ async def update_dining_table_endpoint(
     _config: BusinessConfig = Depends(require_feature_flag("enable_table_management")),
     db=Depends(get_db),
 ):
+    if data.floor_plan_id is not None:
+        fp = await db.get(FloorPlan, data.floor_plan_id)
+        if fp and fp.business_id == current_user.business_id:
+            assert_branch_access(current_user, fp.branch_id)
     return await update_dining_table(
         db,
         table_id,
@@ -220,6 +238,7 @@ async def update_dining_table_endpoint(
     "/tables/{table_id}/status",
     response_model=DiningTableResponse,
     status_code=status.HTTP_200_OK,
+    dependencies=[Depends(guard_record("tables", "table_id"))],
 )
 async def update_dining_table_status_endpoint(
     table_id: UUID,
@@ -246,6 +265,7 @@ async def update_dining_table_status_endpoint(
     "/tables/{table_id}",
     response_model=MessageResponse,
     status_code=status.HTTP_200_OK,
+    dependencies=[Depends(guard_record("tables", "table_id"))],
 )
 async def delete_dining_table_endpoint(
     table_id: UUID,
@@ -268,7 +288,7 @@ async def delete_dining_table_endpoint(
     status_code=status.HTTP_200_OK,
 )
 async def get_floor_layout_endpoint(
-    branch_id: UUID = Query(...),
+    branch_id: UUID = Depends(required_branch_query),
     current_user: User = Depends(require_permission("restaurant.tables.view")),
     _config: BusinessConfig = Depends(require_feature_flag("enable_table_management")),
     db=Depends(get_db),
@@ -278,3 +298,4 @@ async def get_floor_layout_endpoint(
         current_user.business_id,
         branch_id,
     )
+

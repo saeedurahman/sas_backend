@@ -12,15 +12,21 @@ from sqlalchemy import select, text, update
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import AsyncSession
 
+import uuid
 from app.core.config import settings
 from app.core.platform_security import (
     create_platform_token,
+    decrypt_totp_secret,
+    encrypt_totp_secret,
+    generate_recovery_codes,
     generate_totp_secret,
+    hash_recovery_code,
     provisioning_uri,
+    verify_and_consume_recovery_code,
     verify_totp,
 )
 from app.database import AsyncSessionLocal
-from app.models.platform import PlatformAdmin, PlatformAuditLog
+from app.models.platform import PlatformAdmin, PlatformAuditLog, PlatformRevokedToken
 from app.services.auth_service import hash_password, verify_password
 
 _GENERIC = "Invalid email, password or code"
@@ -140,8 +146,9 @@ async def login(
     db: AsyncSession,
     email: str,
     password: str,
-    totp_code: str,
+    totp_code: str | None,
     ip_address: str | None,
+    recovery_code: str | None = None,
 ) -> tuple[PlatformAdmin, str, int]:
     email = normalize_email(email)
     admin = (
@@ -166,34 +173,47 @@ async def login(
         await _record_failure(admin.id, admin.email, ip_address, "password")
         raise _invalid()
 
-    step = verify_totp(admin.totp_secret, totp_code)
-    if step is None:
-        await _record_failure(admin.id, admin.email, ip_address, "totp")
-        raise _invalid()
+    if recovery_code:
+        if not verify_and_consume_recovery_code(admin, recovery_code):
+            await _record_failure(admin.id, admin.email, ip_address, "recovery_code")
+            raise _invalid()
+        action = "auth.recovery_code_used"
+    else:
+        plain_secret = decrypt_totp_secret(admin.totp_secret)
+        step = verify_totp(plain_secret, totp_code or "")
+        if step is None:
+            await _record_failure(admin.id, admin.email, ip_address, "totp")
+            raise _invalid()
 
-    # A code works once: only a strictly newer time-step may be recorded.
-    accepted = (
-        await db.execute(
-            text(
-                "UPDATE platform_admins SET last_totp_step = :step "
-                "WHERE id = :id AND last_totp_step < :step RETURNING id"
-            ),
-            {"step": step, "id": admin.id},
-        )
-    ).first()
-    if accepted is None:
-        await _record_failure(admin.id, admin.email, ip_address, "totp_replay")
-        raise _invalid()
+        # A code works once: only a strictly newer time-step may be recorded.
+        accepted = (
+            await db.execute(
+                text(
+                    "UPDATE platform_admins SET last_totp_step = :step "
+                    "WHERE id = :id AND last_totp_step < :step RETURNING id"
+                ),
+                {"step": step, "id": admin.id},
+            )
+        ).first()
+        if accepted is None:
+            await _record_failure(admin.id, admin.email, ip_address, "totp_replay")
+            raise _invalid()
+        action = "auth.login"
 
     await db.execute(
         update(PlatformAdmin)
         .where(PlatformAdmin.id == admin.id)
-        .values(failed_login_attempts=0, locked_until=None, last_login=now)
+        .values(
+            failed_login_attempts=0,
+            locked_until=None,
+            last_login=now,
+            recovery_codes_hashes=admin.recovery_codes_hashes,
+        )
     )
     await record_audit(
         db,
         admin,
-        action="auth.login",
+        action=action,
         entity_type="admin",
         entity_id=admin.id,
         entity_label=admin.email,
@@ -208,11 +228,18 @@ async def login(
 # ── management ────────────────────────────────────────────────────────────────
 
 
-def credentials_for(admin: PlatformAdmin) -> dict[str, str]:
-    return {
-        "totp_secret": admin.totp_secret,
-        "provisioning_uri": provisioning_uri(admin.email, admin.totp_secret),
+def credentials_for(admin: PlatformAdmin) -> dict[str, Any]:
+    plain_secret = getattr(admin, "_plain_totp_secret", None)
+    if plain_secret is None:
+        plain_secret = decrypt_totp_secret(admin.totp_secret)
+    recovery_codes = getattr(admin, "_plain_recovery_codes", None)
+    res: dict[str, Any] = {
+        "totp_secret": plain_secret,
+        "provisioning_uri": provisioning_uri(admin.email, plain_secret),
     }
+    if recovery_codes is not None:
+        res["recovery_codes"] = recovery_codes
+    return res
 
 
 async def list_admins(db: AsyncSession) -> list[PlatformAdmin]:
@@ -229,14 +256,23 @@ async def create_admin(
     name: str,
     password: str,
     ip_address: str | None = None,
+    generate_recovery_codes_flag: bool = False,
 ) -> PlatformAdmin:
+    admin_id = uuid.uuid4()
+    plain_secret = generate_totp_secret()
+    enc_secret = encrypt_totp_secret(plain_secret)
+    codes = generate_recovery_codes(10) if generate_recovery_codes_flag else None
     admin = PlatformAdmin(
+        id=admin_id,
         email=normalize_email(email),
         name=name.strip(),
         password_hash=await asyncio.to_thread(hash_password, password),
-        totp_secret=generate_totp_secret(),
+        totp_secret=enc_secret,
+        recovery_codes_hashes=[hash_recovery_code(admin_id, c) for c in codes] if codes else None,
         is_active=True,
     )
+    admin._plain_totp_secret = plain_secret
+    admin._plain_recovery_codes = codes
     db.add(admin)
     try:
         await db.flush()
@@ -257,6 +293,8 @@ async def create_admin(
     )
     await db.commit()
     await db.refresh(admin)
+    admin._plain_totp_secret = plain_secret
+    admin._plain_recovery_codes = codes
     return admin
 
 
@@ -300,14 +338,25 @@ async def set_admin_active(
 
 
 async def reset_admin_2fa(
-    db: AsyncSession, actor: PlatformAdmin, admin_id: UUID, ip_address: str | None = None
+    db: AsyncSession,
+    actor: PlatformAdmin,
+    admin_id: UUID,
+    ip_address: str | None = None,
+    generate_recovery_codes_flag: bool = False,
 ) -> PlatformAdmin:
     admin = await _get_admin(db, admin_id)
-    admin.totp_secret = generate_totp_secret()
+    plain_secret = generate_totp_secret()
+    admin.totp_secret = encrypt_totp_secret(plain_secret)
+    codes = generate_recovery_codes(10) if generate_recovery_codes_flag else None
+    admin.recovery_codes_hashes = (
+        [hash_recovery_code(admin.id, c) for c in codes] if codes else None
+    )
     admin.last_totp_step = 0
     admin.token_version += 1  # old sessions end; they sign in again with the new secret
     admin.failed_login_attempts = 0
     admin.locked_until = None
+    admin._plain_totp_secret = plain_secret
+    admin._plain_recovery_codes = codes
     await record_audit(
         db,
         actor,
@@ -320,4 +369,95 @@ async def reset_admin_2fa(
     )
     await db.commit()
     await db.refresh(admin)
+    admin._plain_totp_secret = plain_secret
+    admin._plain_recovery_codes = codes
     return admin
+
+
+async def change_admin_password(
+    db: AsyncSession,
+    admin: PlatformAdmin,
+    *,
+    current_password: str,
+    new_password: str,
+    ip_address: str | None = None,
+) -> tuple[str, int]:
+    if not await asyncio.to_thread(verify_password, current_password, admin.password_hash):
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST, detail="Current password is incorrect"
+        )
+    if len(new_password) < 12:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="New password must be at least 12 characters",
+        )
+    if current_password == new_password:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="New password must be different from current password",
+        )
+    admin.password_hash = await asyncio.to_thread(hash_password, new_password)
+    admin.token_version += 1  # invalidates all existing sessions/tokens
+    await record_audit(
+        db,
+        admin,
+        action="auth.password_change",
+        entity_type="admin",
+        entity_id=admin.id,
+        entity_label=admin.email,
+        ip_address=ip_address,
+    )
+    await db.commit()
+    await db.refresh(admin)
+    token, expires_in = create_platform_token(admin.id, admin.token_version)
+    return token, expires_in
+
+
+async def revoke_platform_token(
+    db: AsyncSession,
+    admin: PlatformAdmin,
+    token_payload: dict[str, Any],
+    ip_address: str | None = None,
+) -> None:
+    jti = token_payload.get("jti")
+    exp = token_payload.get("exp")
+    if jti and exp:
+        exp_dt = datetime.fromtimestamp(exp, tz=timezone.utc)
+        revoked = PlatformRevokedToken(
+            jti=jti,
+            admin_id=admin.id,
+            expires_at=exp_dt,
+        )
+        db.add(revoked)
+    await record_audit(
+        db,
+        admin,
+        action="auth.logout",
+        entity_type="admin",
+        entity_id=admin.id,
+        entity_label=admin.email,
+        ip_address=ip_address,
+    )
+    await db.commit()
+
+
+async def generate_admin_recovery_codes(
+    db: AsyncSession,
+    admin: PlatformAdmin,
+    ip_address: str | None = None,
+) -> list[str]:
+    codes = generate_recovery_codes(10)
+    admin.recovery_codes_hashes = [hash_recovery_code(admin.id, c) for c in codes]
+    await record_audit(
+        db,
+        admin,
+        action="auth.recovery_codes_generated",
+        entity_type="admin",
+        entity_id=admin.id,
+        entity_label=admin.email,
+        ip_address=ip_address,
+    )
+    await db.commit()
+    await db.refresh(admin)
+    return codes
+

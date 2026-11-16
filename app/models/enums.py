@@ -423,6 +423,7 @@ class AuditActionEnum(str, Enum):
     login = "login"
     logout = "logout"
     sync = "sync"
+    export = "export"
 
 
 audit_action_enum = ENUM(
@@ -433,6 +434,7 @@ audit_action_enum = ENUM(
     "login",
     "logout",
     "sync",
+    "export",
     name="audit_action_enum",
     create_type=False,
 )

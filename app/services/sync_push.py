@@ -808,6 +808,21 @@ async def _h_customer_payment(ctx: Ctx, db, p: CustomerPaymentPayload, op: OpEnv
     if await _exists(db, CustomerLedger, entry_id):
         raise OpReject("id_exists", "A ledger entry with this id already exists", status="conflict")
 
+    branch_id = p.branch_id
+    if p.register_shift_id is not None:
+        shift_record = await db.get(RegisterShift, p.register_shift_id)
+        if shift_record is not None and shift_record.business_id == ctx.business_id:
+            if branch_id is not None and shift_record.branch_id != branch_id:
+                raise OpReject(E_BRANCH, "Shift does not belong to specified branch")
+            branch_id = branch_id or shift_record.branch_id
+    if branch_id is not None:
+        ctx.require_branch(branch_id)
+    elif ctx.branches is not None:
+        if len(ctx.branches) == 1:
+            branch_id = UUID(str(ctx.branches[0]))
+        else:
+            raise OpReject(E_BRANCH, "branch_id is required: you have access to more than one branch")
+
     flags: list[str] = []
     if ctx.lapsed:
         flags.append(FLAG_SUBSCRIPTION)
@@ -824,6 +839,7 @@ async def _h_customer_payment(ctx: Ctx, db, p: CustomerPaymentPayload, op: OpEnv
         CustomerLedger(
             id=entry_id,
             business_id=ctx.business_id,
+            branch_id=branch_id,
             customer_id=p.customer_id,
             entry_type=LedgerEntryTypeEnum.payment.value,
             amount=p.amount,

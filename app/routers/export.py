@@ -6,15 +6,15 @@ import logging
 import time
 from collections.abc import AsyncIterator
 from datetime import date, timedelta
-from uuid import UUID
+from uuid import UUID, uuid4
 
-from fastapi import APIRouter, Depends, HTTPException, Query, status
+from fastapi import APIRouter, Depends, HTTPException, Query, Request, status
 from fastapi.responses import StreamingResponse
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.branch_scope import scoped_branch_query
 from app.core.config import settings
-from app.core.rate_limit import enforce_rate_limit
+from app.core.rate_limit import client_ip, enforce_rate_limit
 from app.database import get_db
 from app.dependencies import (
     apply_business_timezone,
@@ -23,6 +23,7 @@ from app.dependencies import (
 )
 from app.models.user import User
 from app.services import export_datasets as ds
+from app.services.audit_helper import log_audit
 from app.services.business_time import get_business_tz
 
 logger = logging.getLogger("app.export")
@@ -70,6 +71,7 @@ async def list_datasets(
 @router.get("/{dataset}")
 async def export_dataset(
     dataset: str,
+    request: Request,
     format: str = Query(default="csv", description="csv | xlsx | pdf"),
     date_from: date | None = Query(default=None),
     date_to: date | None = Query(default=None),
@@ -113,6 +115,24 @@ async def export_dataset(
         branch_id=branch_id if spec.uses_branch else None,
     )
     prepared = await ds.prepare(db, spec, ctx, fmt=fmt)
+    await log_audit(
+        db,
+        business_id=current_user.business_id,
+        user_id=current_user.id,
+        branch_id=ctx.branch_id,
+        action="export",
+        table_name=spec.name,
+        record_id=uuid4(),
+        new_values={
+            "dataset": spec.name,
+            "format": fmt,
+            "date_from": str(date_from),
+            "date_to": str(date_to),
+            "branch_id": str(branch_id) if branch_id else None,
+            "row_count": prepared.row_count,
+        },
+        ip_address=client_ip(request),
+    )
     # End the request transaction now: the stream opens its own session.
     await db.commit()
 

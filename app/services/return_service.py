@@ -553,6 +553,7 @@ async def create_sale_return(
                 created_by=created_by,
                 reference_type=ReferenceTypeEnum.sale_return,
                 reference_id=sale_return.id,
+                branch_id=sale_return.branch_id,
             )
 
         await log_audit(

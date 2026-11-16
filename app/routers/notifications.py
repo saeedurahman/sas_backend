@@ -3,10 +3,11 @@ from uuid import UUID
 from fastapi import APIRouter, Depends, Query, status
 from pydantic import BaseModel
 
+from app.branch_scope import assert_branch_access, guard_record
 from app.core.config import settings
 from app.core.rate_limit import enforce_rate_limit
 from app.database import get_db
-from app.dependencies import get_current_user, require_permission
+from app.dependencies import allowed_branch_ids, get_current_user, require_permission
 from app.models.user import User
 from app.schemas.auth import MessageResponse
 from app.schemas.settings import (
@@ -41,6 +42,7 @@ class CheckAlertsResponse(BaseModel):
     status_code=status.HTTP_200_OK,
 )
 async def list_notifications(
+    branch_id: UUID | None = Query(default=None),
     is_read: bool | None = Query(default=None),
     notification_type: str | None = Query(default=None),
     skip: int = Query(default=0, ge=0),
@@ -48,10 +50,14 @@ async def list_notifications(
     current_user: User = Depends(require_permission("notifications.view")),
     db=Depends(get_db),
 ):
+    if branch_id is not None:
+        assert_branch_access(current_user, branch_id)
     items, total, unread_count = await get_notifications(
         db,
         current_user.business_id,
         user_id=current_user.id,
+        branch_id=branch_id,
+        allowed_branch_ids=allowed_branch_ids(current_user),
         is_read=is_read,
         notification_type=notification_type,
         skip=skip,
@@ -104,6 +110,7 @@ async def mark_all_read(
     "/{notification_id}",
     response_model=MessageResponse,
     status_code=status.HTTP_200_OK,
+    dependencies=[Depends(guard_record("notification_log", "notification_id"))],
 )
 async def remove_notification(
     notification_id: UUID,
@@ -128,9 +135,11 @@ async def run_alert_checks(
     enforce_rate_limit(
         "check-alerts", str(current_user.id), settings.rate_limit_check_alerts_user
     )
-    low_stock = await check_low_stock_alerts(db, current_user.business_id)
-    expiry = await check_expiry_alerts(db, current_user.business_id)
+    branches = allowed_branch_ids(current_user)
+    low_stock = await check_low_stock_alerts(db, current_user.business_id, allowed_branch_ids=branches)
+    expiry = await check_expiry_alerts(db, current_user.business_id, allowed_branch_ids=branches)
     return CheckAlertsResponse(
         low_stock=len(low_stock),
         expiry=len(expiry),
     )
+

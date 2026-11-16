@@ -190,6 +190,7 @@ class CustomerPaymentPayload(BaseSchema):
     amount: Decimal
     payment_method: PaymentMethodEnum = PaymentMethodEnum.cash
     register_shift_id: UUID | None = None
+    branch_id: UUID | None = None
     reference_no: str | None = Field(default=None, max_length=100)
     notes: str | None = Field(default=None, max_length=500)
 

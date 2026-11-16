@@ -2,6 +2,7 @@ from uuid import UUID
 
 from fastapi import APIRouter, Depends, Query, Request, status
 
+from app.branch_scope import assert_branch_access, scoped_branch_query
 from app.core.idempotency import run_idempotent
 from app.database import get_db
 from app.dependencies import require_permission
@@ -28,11 +29,12 @@ router = APIRouter(prefix="/supplier-ledger", tags=["Supplier Ledger"])
 )
 async def supplier_balance(
     supplier_id: UUID,
+    branch_id: UUID | None = Depends(scoped_branch_query),
     current_user: User = Depends(require_permission("suppliers.ledger.view")),
     db=Depends(get_db),
 ):
     balance = await get_supplier_balance(
-        db, supplier_id, current_user.business_id
+        db, supplier_id, current_user.business_id, branch_id=branch_id
     )
     return SupplierBalanceResponse(supplier_id=supplier_id, balance=balance)
 
@@ -44,13 +46,14 @@ async def supplier_balance(
 )
 async def list_supplier_ledger(
     supplier_id: UUID,
+    branch_id: UUID | None = Depends(scoped_branch_query),
     skip: int = Query(default=0, ge=0),
     limit: int = Query(default=50, le=200),
     current_user: User = Depends(require_permission("suppliers.ledger.view")),
     db=Depends(get_db),
 ):
     entries, total = await get_supplier_ledger(
-        db, supplier_id, current_user.business_id, skip, limit
+        db, supplier_id, current_user.business_id, skip, limit, branch_id=branch_id
     )
     return SupplierLedgerListResponse(
         total=total,
@@ -72,6 +75,7 @@ async def supplier_payment(
     current_user: User = Depends(require_permission("suppliers.ledger.payment")),
     db=Depends(get_db),
 ):
+    assert_branch_access(current_user, data.branch_id)
     return await run_idempotent(
         request,
         business_id=current_user.business_id,
@@ -80,6 +84,7 @@ async def supplier_payment(
         response_model=SupplierLedgerResponse,
         success_status=201,
         handler=lambda: record_supplier_payment(
-        db, current_user.business_id, supplier_id, data, current_user.id
-    ),
+            db, current_user.business_id, supplier_id, data, current_user.id
+        ),
     )
+

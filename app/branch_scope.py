@@ -43,6 +43,13 @@ _RECORD_TABLES: dict[str, tuple[str, ...]] = {
     "purchase_receipts": ("branch_id",),
     "stock_adjustments": ("branch_id",),
     "waste_entries": ("branch_id",),
+    "customer_ledger": ("branch_id",),
+    "supplier_ledger": ("branch_id",),
+    "floor_plans": ("branch_id",),
+    "tables": ("branch_id",),
+    "kot_orders": ("branch_id",),
+    "notification_log": ("branch_id",),
+    "app_settings": ("branch_id",),
 }
 
 _BODY_BRANCH_KEYS = ("branch_id", "source_branch_id")

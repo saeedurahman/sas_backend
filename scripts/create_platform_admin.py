@@ -28,7 +28,14 @@ async def _create(email: str, name: str, password: str) -> int:
 
     try:
         async with AsyncSessionLocal() as db:
-            admin = await admins.create_admin(db, None, email=email, name=name, password=password)
+            admin = await admins.create_admin(
+                db,
+                None,
+                email=email,
+                name=name,
+                password=password,
+                generate_recovery_codes_flag=True,
+            )
             creds = admins.credentials_for(admin)
     except HTTPException as exc:
         print(f"Error: {exc.detail}", file=sys.stderr)
@@ -40,6 +47,10 @@ async def _create(email: str, name: str, password: str) -> int:
     print("\nAdd this to your authenticator app (shown once):")
     print(f"  {creds['provisioning_uri']}")
     print(f"\nOr enter the secret manually: {creds['totp_secret']}")
+    if creds.get("recovery_codes"):
+        print("\nOne-time backup recovery codes (save these in a safe place):")
+        for code in creds["recovery_codes"]:
+            print(f"  {code}")
     return 0
 
 

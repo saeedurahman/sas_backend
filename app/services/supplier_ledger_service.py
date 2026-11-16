@@ -22,14 +22,18 @@ async def get_supplier_balance(
     db: AsyncSession,
     supplier_id: UUID,
     business_id: UUID,
+    branch_id: UUID | None = None,
 ) -> Decimal:
     await get_supplier_by_id(db, supplier_id, business_id)
+    filters = [
+        SupplierLedger.supplier_id == supplier_id,
+        SupplierLedger.business_id == business_id,
+        SupplierLedger.deleted_at.is_(None),
+    ]
+    if branch_id is not None:
+        filters.append(SupplierLedger.branch_id == branch_id)
     result = await db.execute(
-        select(func.coalesce(func.sum(SupplierLedger.amount), 0)).where(
-            SupplierLedger.supplier_id == supplier_id,
-            SupplierLedger.business_id == business_id,
-            SupplierLedger.deleted_at.is_(None),
-        )
+        select(func.coalesce(func.sum(SupplierLedger.amount), 0)).where(*filters)
     )
     balance = result.scalar_one()
     return Decimal(str(balance))
@@ -41,6 +45,7 @@ async def get_supplier_ledger(
     business_id: UUID,
     skip: int = 0,
     limit: int = 50,
+    branch_id: UUID | None = None,
 ) -> tuple[list[SupplierLedger], int]:
     await get_supplier_by_id(db, supplier_id, business_id)
     filters = [
@@ -48,6 +53,8 @@ async def get_supplier_ledger(
         SupplierLedger.business_id == business_id,
         SupplierLedger.deleted_at.is_(None),
     ]
+    if branch_id is not None:
+        filters.append(SupplierLedger.branch_id == branch_id)
     count_result = await db.execute(
         select(func.count()).select_from(SupplierLedger).where(*filters)
     )
@@ -73,10 +80,12 @@ async def create_supplier_ledger_entry(
     reference_id: UUID | None = None,
     notes: str | None = None,
     created_by: UUID | None = None,
+    branch_id: UUID | None = None,
 ) -> SupplierLedger:
     now = _now()
     entry = SupplierLedger(
         business_id=business_id,
+        branch_id=branch_id,
         supplier_id=supplier_id,
         entry_type=entry_type.value,
         amount=amount,
@@ -109,7 +118,9 @@ async def record_supplier_payment(
         data.amount,
         notes=data.notes or data.reference_no,
         created_by=created_by,
+        branch_id=data.branch_id,
     )
     await db.commit()
     await db.refresh(entry)
     return entry
+

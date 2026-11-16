@@ -6,11 +6,13 @@ from fastapi import Depends, HTTPException, Request, status
 from fastapi.security import HTTPAuthorizationCredentials, HTTPBearer
 from sqlalchemy.ext.asyncio import AsyncSession
 
+from typing import Any
+
 from app.core.config import settings
 from app.core.platform_security import PlatformTokenError, decode_platform_token
 from app.core.rate_limit import client_ip, enforce_rate_limit
 from app.database import get_db
-from app.models.platform import PlatformAdmin
+from app.models.platform import PlatformAdmin, PlatformRevokedToken
 
 _bearer = HTTPBearer(auto_error=False, scheme_name="PlatformBearer")
 
@@ -43,8 +45,25 @@ async def get_platform_admin(
     if int(payload.get("tv", 0)) != admin.token_version:
         raise _unauthorized("Token is no longer valid")
 
+    jti = payload.get("jti")
+    if jti:
+        revoked = await db.get(PlatformRevokedToken, jti)
+        if revoked is not None:
+            raise _unauthorized("Token has been revoked")
+
     enforce_rate_limit("platform-api", str(admin.id), settings.platform_rate_limits["api"])
     return admin
+
+
+async def get_platform_token_payload(
+    credentials: HTTPAuthorizationCredentials | None = Depends(_bearer),
+) -> dict[str, Any]:
+    if credentials is None:
+        raise _unauthorized("Not authenticated")
+    try:
+        return decode_platform_token(credentials.credentials)
+    except PlatformTokenError:
+        raise _unauthorized()
 
 
 def request_ip(request: Request) -> str:

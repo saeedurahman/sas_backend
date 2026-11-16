@@ -24,7 +24,31 @@ BusinessStatus = Literal["trial", "active", "grace", "expired", "suspended", "ca
 class PlatformLoginRequest(BaseSchema):
     email: str = Field(min_length=3, max_length=255)
     password: str = Field(min_length=1, max_length=256)
-    totp_code: str = Field(min_length=6, max_length=6)
+    totp_code: str | None = Field(default=None, min_length=6, max_length=6)
+    recovery_code: str | None = Field(default=None, min_length=4, max_length=64)
+
+    @model_validator(mode="after")
+    def _validate_code(self) -> PlatformLoginRequest:
+        if not self.totp_code and not self.recovery_code:
+            raise ValueError("Either totp_code or recovery_code is required")
+        return self
+
+
+class PlatformChangePasswordRequest(BaseSchema):
+    current_password: str = Field(min_length=1, max_length=256)
+    new_password: str = Field(min_length=12, max_length=256)
+
+
+class PlatformChangePasswordResponse(BaseSchema):
+    message: str = "Password changed successfully"
+    access_token: str
+    token_type: str = "bearer"
+    expires_in: int
+    admin: AdminOut
+
+
+class RecoveryCodesResponse(BaseSchema):
+    recovery_codes: list[str]
 
 
 class AdminOut(BaseSchema):
@@ -248,6 +272,7 @@ class AdminCreate(BaseSchema):
     email: EmailStr
     name: str = Field(min_length=1, max_length=120)
     password: str = Field(min_length=12, max_length=256)
+    generate_recovery_codes: bool = False
 
 
 class AdminCredentials(BaseSchema):
@@ -256,11 +281,13 @@ class AdminCredentials(BaseSchema):
     admin: AdminOut
     totp_secret: str
     provisioning_uri: str
+    recovery_codes: list[str] | None = None
 
 
 class Reset2faResult(BaseSchema):
     totp_secret: str
     provisioning_uri: str
+    recovery_codes: list[str] | None = None
 
 
 # ── licenses ──────────────────────────────────────────────────────────────────

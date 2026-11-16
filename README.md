@@ -44,6 +44,7 @@ uvicorn main:app --reload --port 8000
 | `CAPTCHA_VERIFY_URL` / `CAPTCHA_SECRET` | Turnstile URL / empty | Any Turnstile, hCaptcha or reCAPTCHA `siteverify` endpoint |
 | `TRIAL_DAYS` / `GRACE_DAYS` | `14` / `3` | Trial length for new businesses; read-only days after a paid period ends |
 | `PLATFORM_JWT_SECRET` | empty (API disabled) | Signs platform admin tokens; 32+ chars and different from the tenant secrets in production |
+| `PLATFORM_ENCRYPTION_KEY` | empty (derived from secret in dev) | Fernet encryption key for platform TOTP secrets at rest (`scripts/generate_platform_key.py`); required in production |
 | `PLATFORM_TOKEN_EXPIRE_MINUTES` | `60` | Admin token lifetime |
 | `PLATFORM_MAX_LOGIN_ATTEMPTS` / `PLATFORM_LOCKOUT_MINUTES` | `5` / `30` | Persisted admin lockout |
 | `PLATFORM_ADMIN_RATE_LIMITS` | defaults below | `login_ip=10/minute,login_account=5/minute,api=300/minute` overrides |
@@ -163,17 +164,25 @@ responses carry `subscription: {status, days_left}`.
 
 For the separate admin web panel. Not under `/api/v1`. Admin JWT only: separate secret
 (`PLATFORM_JWT_SECRET`), `aud=pakpos-platform`, short expiry (`PLATFORM_TOKEN_EXPIRE_MINUTES`,
-default 60; `POST /platform/auth/refresh` swaps a live token for a fresh one). Sign-in is email +
-password + 6-digit TOTP; a code works once; failures lock the account (persisted in the database)
-after `PLATFORM_MAX_LOGIN_ATTEMPTS`; per-IP, per-account and per-admin rate limits come from
-`PLATFORM_ADMIN_RATE_LIMITS`. Every mutation writes `platform_audit_log` with admin, before/after
-and IP. Disabling an admin or resetting 2FA ends their sessions immediately.
+default 60; `POST /platform/auth/refresh` swaps a live token for a fresh one).
 
-Create the first admin (prints the TOTP provisioning URI once):
+**Hardening and Safety Features:**
+- **Encryption at rest:** TOTP secrets are encrypted at rest with Fernet cryptography using `PLATFORM_ENCRYPTION_KEY` (required in production startup check; generated via `python scripts/generate_platform_key.py`). Secrets are decrypted only in memory when verifying sign-in codes.
+- **Sign-in & 2FA:** Sign-in is email + password + 6-digit TOTP (`POST /platform/auth/login`). TOTP codes cannot be replayed.
+- **Recovery Codes:** 10 one-time backup recovery codes (`xxxx-xxxx` format) are generated at admin creation, 2FA reset, or on demand via `POST /platform/auth/recovery-codes`. Stored SHA-256 hashed in `recovery_codes_hashes`, usable instead of TOTP once each (`auth.recovery_code_used` audit entry).
+- **Single-view provision:** The provisioning URI and recovery codes are returned exactly once upon admin creation or 2FA reset; they cannot be queried back later.
+- **Account Lockout & Rate Limits:** Failed attempts lock the account after `PLATFORM_MAX_LOGIN_ATTEMPTS` for `PLATFORM_LOCKOUT_MINUTES`. Per-IP, per-account, and per-admin rate limits come from `PLATFORM_ADMIN_RATE_LIMITS`.
+- **Change Password:** `POST /platform/auth/change-password` requires the current password, validates min 12 chars, hashes with bcrypt, logs `auth.password_change`, and immediately invalidates all other active sessions via token version increment while issuing a fresh token for the current session.
+- **Real Server-side Logout:** `POST /platform/auth/logout` records the token's `jti` in `platform_revoked_tokens` until its expiry (`auth.logout` audit entry). Every request checks the revocation table, rejecting revoked tokens with `401 Unauthorized`.
+- **Audit Logging:** Every platform authentication event (`auth.login`, `auth.login_failed`, `auth.password_change`, `auth.logout`, `auth.recovery_code_used`, `admin.reset_2fa`) and all resource mutations write to `platform_audit_log` with admin, entity, before/after, and client IP.
+- **Tenant Export Auditing:** Tenant data exports (`GET /export/{dataset}`) record who exported which dataset, format, date range, branch, and row count into `audit_logs` (`action="export"`).
+
+Create the first admin (prints the TOTP provisioning URI and backup recovery codes once):
 
 ```bash
 PLATFORM_ADMIN_PASSWORD='a-long-passphrase' python scripts/create_platform_admin.py --email owner@example.pk --name "Owner"
 ```
+
 
 ### Licenses (one-time / offline edition)
 
