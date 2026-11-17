@@ -616,6 +616,13 @@ Registration (`POST /auth/register`) accepts an optional `prices_include_tax`. D
 
 (`sales.override_tax` still lets a permitted user override the rate on a sale.)
 
+Product API (`POST /products`, `PUT /products/{id}` with `products.update`): `tax_rate_id` (nullable; must be an
+active rate of the same business, `null` on update clears it) and `is_tax_exempt` (bool, default false). Product
+reads return `{"tax_rate_id": "<uuid>|null", "tax_rate": "17.000|null", "is_tax_exempt": false}`. Changes are audited
+(before/after of both fields). The sync `product` entity carries `tax_rate_id` and `is_tax_exempt`. CSV: the
+`products` export and `POST /products/import` have `tax_rate_name` (matched by name within the business, unknown
+or inactive name = row error, blank = unchanged) and `tax_exempt` (`true|false`, blank = unchanged).
+
 ### Formulas (`app/services/pricing_engine.py`, Decimal only, half-up to 2 dp)
 
 Line, with `gross_in = qty x price`, `d` = discount (percent, fixed or cart share; never below 0 for the line):

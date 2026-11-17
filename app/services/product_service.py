@@ -18,6 +18,8 @@ from app.models.product import (
     ProductVariation,
     Unit,
 )
+from app.models.sales import TaxRate
+from app.services.audit_helper import log_audit
 from app.schemas.product import (
     CreateBarcodeRequest,
     CreateProductRequest,
@@ -36,6 +38,43 @@ def _product_detail_options():
         selectinload(Product.variations).selectinload(ProductVariation.unit),
         selectinload(Product.barcodes),
     )
+
+
+async def _verify_tax_rate(db: AsyncSession, tax_rate_id: UUID, business_id: UUID) -> TaxRate:
+    rate = (
+        await db.execute(
+            select(TaxRate).where(
+                TaxRate.id == tax_rate_id,
+                TaxRate.business_id == business_id,
+                TaxRate.deleted_at.is_(None),
+            )
+        )
+    ).scalar_one_or_none()
+    if rate is None:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="Tax rate not found or does not belong to this business",
+        )
+    if not rate.is_active:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST, detail="Tax rate is not active"
+        )
+    return rate
+
+
+async def attach_tax_info(db: AsyncSession, product: Product) -> None:
+    """Set the read-only ``tax_rate`` (percent) used by ProductResponse."""
+    percent = None
+    if product.tax_rate_id is not None:
+        percent = (
+            await db.execute(
+                select(TaxRate.rate).where(
+                    TaxRate.id == product.tax_rate_id,
+                    TaxRate.business_id == product.business_id,
+                )
+            )
+        ).scalar_one_or_none()
+    product.tax_rate = percent
 
 
 async def _check_sku_unique(
@@ -220,6 +259,7 @@ async def get_product_by_id(
             status_code=status.HTTP_404_NOT_FOUND,
             detail="Product not found",
         )
+    await attach_tax_info(db, product)
     return product
 
 
@@ -339,6 +379,8 @@ async def create_product(
             )
         if data.sku:
             await _check_sku_unique(db, business_id, data.sku)
+        if data.tax_rate_id is not None:
+            await _verify_tax_rate(db, data.tax_rate_id, business_id)
 
         product = Product(
             business_id=business_id,
@@ -356,6 +398,7 @@ async def create_product(
             image_url=data.image_url,
             shelf_life_days=data.shelf_life_days,
             is_tax_exempt=data.is_tax_exempt,
+            tax_rate_id=data.tax_rate_id,
             min_stock_level=data.min_stock_level,
             max_stock_level=data.max_stock_level,
             created_by=created_by,
@@ -410,8 +453,32 @@ async def update_product(
         product.image_url = data.image_url
     if data.shelf_life_days is not None:
         product.shelf_life_days = data.shelf_life_days
+    tax_before = {
+        "tax_rate_id": str(product.tax_rate_id) if product.tax_rate_id else None,
+        "is_tax_exempt": product.is_tax_exempt,
+    }
     if data.is_tax_exempt is not None:
         product.is_tax_exempt = data.is_tax_exempt
+    if "tax_rate_id" in data.model_fields_set:
+        if data.tax_rate_id is not None:
+            await _verify_tax_rate(db, data.tax_rate_id, business_id)
+        product.tax_rate_id = data.tax_rate_id
+    tax_after = {
+        "tax_rate_id": str(product.tax_rate_id) if product.tax_rate_id else None,
+        "is_tax_exempt": product.is_tax_exempt,
+    }
+    if tax_after != tax_before:
+        await log_audit(
+            db,
+            business_id=business_id,
+            user_id=updated_by,
+            branch_id=None,
+            action="update",
+            table_name="products",
+            record_id=product.id,
+            old_values=tax_before,
+            new_values=tax_after,
+        )
     if data.min_stock_level is not None:
         product.min_stock_level = data.min_stock_level
     if data.max_stock_level is not None:

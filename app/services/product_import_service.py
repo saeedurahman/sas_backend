@@ -24,6 +24,8 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from app.models.business import Branch
 from app.models.enums import AdjustmentReasonEnum
 from app.models.inventory import StockMovement
+from app.models.sales import TaxRate
+from app.services.audit_helper import log_audit
 from app.models.product import (
     Barcode,
     Category,
@@ -54,6 +56,8 @@ PRODUCT_IMPORT_ALIASES: dict[str, tuple[str, ...]] = {
     "unit": ("uom", "unit_name", "unit_symbol", "base_unit"),
     "cost": ("cost_price", "purchase_price", "buying_price"),
     "price": ("selling_price", "sale_price", "unit_price", "retail_price"),
+    "tax_rate_name": ("tax_rate", "tax_name"),
+    "tax_exempt": ("is_tax_exempt", "exempt"),
     "opening_stock": ("stock", "opening_balance", "opening_qty", "qty", "quantity"),
 }
 
@@ -80,6 +84,10 @@ class _Plan:
     changed_name: bool = False
     changed_category: bool = False
     changed_price: bool = False
+    tax_rate_id: UUID | None = None
+    set_tax_rate: bool = False  # tax_rate_name given in the row
+    tax_exempt: bool | None = None  # None = column empty / absent
+    changed_tax: bool = False
 
 
 def _lc(value: str | None) -> str:
@@ -111,6 +119,17 @@ async def import_products(
             await db.execute(
                 select(Category).where(
                     Category.business_id == business_id, Category.deleted_at.is_(None)
+                )
+            )
+        ).scalars()
+    }
+
+    rates: dict[str, tuple[UUID, bool]] = {
+        _lc(r.name): (r.id, r.is_active)
+        for r in (
+            await db.execute(
+                select(TaxRate).where(
+                    TaxRate.business_id == business_id, TaxRate.deleted_at.is_(None)
                 )
             )
         ).scalars()
@@ -243,6 +262,24 @@ async def import_products(
         ):
             result.error("sku and barcode belong to different products")
 
+        if v.get("tax_rate_name"):
+            hit = rates.get(_lc(v["tax_rate_name"]))
+            if hit is None:
+                result.error(f"unknown tax rate '{v['tax_rate_name']}'")
+            elif not hit[1]:
+                result.error(f"tax rate '{v['tax_rate_name']}' is not active")
+            else:
+                plan.tax_rate_id = hit[0]
+                plan.set_tax_rate = True
+        if v.get("tax_exempt"):
+            flag = _lc(v["tax_exempt"])
+            if flag in ("true", "yes", "y", "1"):
+                plan.tax_exempt = True
+            elif flag in ("false", "no", "n", "0"):
+                plan.tax_exempt = False
+            else:
+                result.error(f"tax_exempt must be true or false, got '{v['tax_exempt']}'")
+
         for field, label in (("price", "price"), ("cost", "cost"), ("opening_stock", "opening_stock")):
             if v.get(field):
                 try:
@@ -305,6 +342,12 @@ async def import_products(
                 changes.append("category")
                 if current is None:
                     result.warnings.append(f"category '{plan.category_name}' will be created")
+        if plan.set_tax_rate and plan.tax_rate_id != product.tax_rate_id:
+            plan.changed_tax = True
+            changes.append("tax rate")
+        if plan.tax_exempt is not None and plan.tax_exempt != product.is_tax_exempt:
+            plan.changed_tax = True
+            changes.append("tax exempt")
         if plan.price is not None and current_price.get(product.id) != plan.price:
             plan.changed_price = True
             changes.append("price")
@@ -380,6 +423,8 @@ async def import_products(
                     is_sellable=True,
                     is_purchasable=True,
                     is_active=True,
+                    tax_rate_id=plan.tax_rate_id if plan.set_tax_rate else None,
+                    is_tax_exempt=bool(plan.tax_exempt),
                     created_by=user_id,
                     created_at=now,
                     updated_at=now,
@@ -407,7 +452,31 @@ async def import_products(
                     product.name = plan.name
                 if plan.changed_category:
                     product.category_id = category_id_for(plan.category_key)
-                if plan.changed_name or plan.changed_category:
+                if plan.changed_tax:
+                    before = {
+                        "tax_rate_id": str(product.tax_rate_id) if product.tax_rate_id else None,
+                        "is_tax_exempt": product.is_tax_exempt,
+                    }
+                    if plan.set_tax_rate:
+                        product.tax_rate_id = plan.tax_rate_id
+                    if plan.tax_exempt is not None:
+                        product.is_tax_exempt = plan.tax_exempt
+                    await log_audit(
+                        db,
+                        business_id=business_id,
+                        user_id=user_id,
+                        branch_id=None,
+                        action="update",
+                        table_name="products",
+                        record_id=product.id,
+                        old_values=before,
+                        new_values={
+                            "tax_rate_id": str(product.tax_rate_id) if product.tax_rate_id else None,
+                            "is_tax_exempt": product.is_tax_exempt,
+                            "source": "import",
+                        },
+                    )
+                if plan.changed_name or plan.changed_category or plan.changed_tax:
                     product.updated_by = user_id
                     product.updated_at = now
                 if plan.add_barcode and plan.barcode:

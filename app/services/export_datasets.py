@@ -294,8 +294,10 @@ def _products_sql(ctx: ExportCtx) -> str:
                COALESCE(bc.barcode, '') AS barcode, COALESCE(cat.name, '') AS category,
                COALESCE(u.symbol, '') AS unit,
                cost.cost AS cost, price.unit_price AS price,
-               COALESCE(stock.qty, 0) AS stock
+               COALESCE(stock.qty, 0) AS stock,
+               COALESCE(tr.name, '') AS tax_rate_name, p.is_tax_exempt::text AS tax_exempt
         FROM products p
+        LEFT JOIN tax_rates tr ON tr.id = p.tax_rate_id AND tr.deleted_at IS NULL
         LEFT JOIN categories cat ON cat.id = p.category_id
         LEFT JOIN units u ON u.id = p.base_unit_id
         LEFT JOIN LATERAL (
@@ -609,7 +611,7 @@ DATASETS: dict[str, Dataset] = {
         ),
         Dataset(
             "products",
-            _cols("name sku barcode category unit cost:money price:money stock:qty"),
+            _cols("name sku barcode category unit cost:money price:money stock:qty tax_rate_name tax_exempt"),
             "Product catalog; the same columns are accepted by POST /products/import "
             "(stock = current stock, import column opening_stock)",
             uses_branch=True, sql=_products_sql, count_sql=_products_count_sql,

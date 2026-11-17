@@ -112,6 +112,8 @@ class CreateProductRequest(BaseSchema):
     is_sellable: bool = True
     is_purchasable: bool = True
     is_tax_exempt: bool = False
+    # Must be an active tax rate of this business.
+    tax_rate_id: UUID | None = None
     description: str | None = None
     image_url: str | None = None
     shelf_life_days: int | None = None
@@ -139,6 +141,8 @@ class UpdateProductRequest(BaseSchema):
     is_purchasable: bool | None = None
     is_active: bool | None = None
     is_tax_exempt: bool | None = None
+    # Send null explicitly to clear the product's own tax rate.
+    tax_rate_id: UUID | None = None
     description: str | None = None
     image_url: str | None = None
     shelf_life_days: int | None = None
@@ -328,6 +332,8 @@ class ProductListResponse(BaseSchema):
     category_id: UUID | None
     brand_id: UUID | None
     image_url: str | None = None
+    tax_rate_id: UUID | None = None
+    is_tax_exempt: bool = False
 
 
 class PaginatedProductResponse(BaseSchema):
@@ -347,6 +353,10 @@ class ProductResponse(ProductAuditSchema):
     is_sellable: bool
     is_purchasable: bool
     is_active: bool
+    # Effective tax info: the product's own rate (percent; null = the business default
+    # applies) and whether it is exempt (exempt => zero tax whatever the rate).
+    tax_rate_id: UUID | None = None
+    tax_rate: Decimal | None = None
     is_tax_exempt: bool = False
     description: str | None
     image_url: str | None

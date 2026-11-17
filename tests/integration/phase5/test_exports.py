@@ -178,7 +178,7 @@ def test_products_export_is_importable(http_client, tenant):
     assert_status(r, 201, label="sku product")
     exported = http_client.get(tenant.url("/export/products"), headers=tenant.owner_headers)
     rows = _rows(exported)
-    assert rows[0] == ["name", "sku", "barcode", "category", "unit", "cost", "price", "stock"]
+    assert rows[0] == ["name", "sku", "barcode", "category", "unit", "cost", "price", "stock", "tax_rate_name", "tax_exempt"]
     keep = [row for row in rows if row[1] == "RT-1"]
     assert keep
     buf = io.StringIO()
