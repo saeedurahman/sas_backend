@@ -216,10 +216,20 @@ async def update_layout(
 ) -> ReceiptLayout:
     layout = await get_layout(db, business_id, layout_id, lock=True)
     before = _audit_view(layout)
-    paper = changes.get("paper", layout.paper)
-    check_design_paper(layout.design, paper)
+    design = changes.get("design") or layout.design
+    paper = changes.get("paper") or layout.paper
+    if design != layout.design and not changes.get("paper"):
+        # Switching design without naming a paper: keep the current one when the new design
+        # prints on it (roll58 <-> roll80 designs), otherwise use the new design's own paper.
+        try:
+            check_design_paper(design, paper)
+        except HTTPException:
+            if design in DESIGNS:
+                paper = DESIGN_PAPER[design]
+    check_design_paper(design, paper)
     if "name" in changes and changes["name"] is not None:
         layout.name = changes["name"].strip()
+    layout.design = design
     layout.paper = paper
     if changes.get("config") is not None:
         layout.config = normalise_config(changes["config"])

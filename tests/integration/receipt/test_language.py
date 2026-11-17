@@ -98,6 +98,75 @@ def test_stored_v1_config_is_upgraded_on_read_and_in_the_feed(http_client, pos_t
     assert wire["data"]["config"]["v"] == 2 and "name_language" not in wire["data"]["config"]["items"]
 
 
+# -- design change on update --------------------------------------------------
+
+
+def test_design_can_change_on_update_and_the_config_is_kept(http_client, pos_tenant):
+    t = pos_tenant
+    layout = _by_design(http_client, t, "thermal_classic")
+    cfg = {**layout["config"], "style": {**layout["config"]["style"], "language": "both"},
+           "footer": {**layout["config"]["footer"], "text_en": "Kept footer"}}
+    # thermal -> thermal: the paper in use stays unless a new one is named
+    r = http_client.put(t.url(f"/receipt-layouts/{layout['id']}"), headers=t.owner_headers,
+                        json={"design": "thermal_compact", "config": cfg})
+    assert_status(r, 200, label="classic -> compact")
+    body = r.json()
+    assert (body["design"], body["paper"]) == ("thermal_compact", "roll80")
+    assert body["config"]["style"]["language"] == "both" and body["config"]["footer"]["text_en"] == "Kept footer"
+    assert db_scalar("SELECT design FROM receipt_layouts WHERE id = :i", {"i": layout["id"]}) == "thermal_compact"
+
+    # thermal -> A4 without a paper: the new design's own paper; config untouched (no config sent)
+    r = http_client.put(t.url(f"/receipt-layouts/{layout['id']}"), headers=t.owner_headers,
+                        json={"design": "a4_tax_invoice"})
+    assert_status(r, 200, label="compact -> a4")
+    body = r.json()
+    assert (body["design"], body["paper"]) == ("a4_tax_invoice", "a4")
+    assert body["config"]["style"]["language"] == "both" and body["config"]["footer"]["text_en"] == "Kept footer"
+
+    # and back, naming a paper explicitly
+    r = http_client.put(t.url(f"/receipt-layouts/{layout['id']}"), headers=t.owner_headers,
+                        json={"design": "thermal_classic", "paper": "roll58"})
+    assert_status(r, 200, label="a4 -> classic roll58")
+    assert (r.json()["design"], r.json()["paper"]) == ("thermal_classic", "roll58")
+
+    # the changed layout renders with its new design (preview + public receipt model)
+    sale = _sale(http_client, t)
+    model = http_client.get(t.url(f"/invoice/{sale['id']}/receipt"), headers=t.owner_headers,
+                            params={"channel": "print"}).json()
+    assert model["layout"]["design"] == "thermal_classic" and model["paper"]["code"] == "roll58"
+
+
+def test_design_change_rejects_bad_combinations_and_keeps_the_layout(http_client, pos_tenant):
+    t = pos_tenant
+    layout = _by_design(http_client, t, "a4_elegant")
+    url = t.url(f"/receipt-layouts/{layout['id']}")
+    for body in (
+        {"design": "nope"},
+        {"design": "thermal_classic", "paper": "a4"},  # thermal design on A4
+        {"design": "a4_tax_invoice", "paper": "roll58"},  # A4 design on a roll
+        {"design": "thermal_classic", "config": {"v": 2, "style": {"language": "fr"}}},  # bad config
+    ):
+        assert_status(http_client.put(url, headers=t.owner_headers, json=body), 422, label=str(body))
+    row = db_rows("SELECT design, paper FROM receipt_layouts WHERE id = :i", {"i": layout["id"]})[0]
+    assert (row["design"], row["paper"]) == ("a4_elegant", "a4")  # nothing half-applied
+    # same design is a no-op change that still validates
+    assert_status(http_client.put(url, headers=t.owner_headers, json={"design": "a4_elegant"}), 200, label="same")
+    # the audit trail records the design change
+    http_client.put(url, headers=t.owner_headers, json={"design": "a4_tax_invoice"})
+    audit = db_scalar(
+        "SELECT count(*) FROM audit_logs WHERE record_id = :i AND table_name = 'receipt_layouts' "
+        "AND action = 'update' AND new_values->>'design' = 'a4_tax_invoice'", {"i": layout["id"]})
+    assert int(audit) == 1
+
+
+def test_design_change_needs_settings_manage(http_client, pos_tenant):
+    t = pos_tenant
+    layout = _by_design(http_client, t, "thermal_classic")
+    r = http_client.put(t.url(f"/receipt-layouts/{layout['id']}"), headers=t.cashier_headers,
+                        json={"design": "thermal_compact"})
+    assert_status(r, 403, label="cashier")
+
+
 # -- invoice endpoints + public page follow the layout language ----------------
 
 

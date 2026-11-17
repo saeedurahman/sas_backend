@@ -932,7 +932,7 @@ The legacy rows are never deleted. The logic is `app/services/receipt_legacy.py`
 |---|---|---|
 | GET | `/receipt-layouts` | list |
 | POST | `/receipt-layouts` | `{"name","design","paper"?,"config"?}` -> 201; 422 on a bad config or a design/paper mismatch |
-| GET/PUT/DELETE | `/receipt-layouts/{id}` | PUT `{"name"?,"paper"?,"config"?,"is_active"?}`; deleting / deactivating a layout that is assigned -> 409 |
+| GET/PUT/DELETE | `/receipt-layouts/{id}` | PUT `{"name"?,"design"?,"paper"?,"config"?,"is_active"?}` (see "Changing the design"); deleting / deactivating a layout that is assigned -> 409 |
 | POST | `/receipt-layouts/{id}/duplicate` | `{"name"?}` -> 201 |
 | GET | `/receipt-layouts/designs` | `{"designs":[{design,paper options,default config...}],"channels":["print","whatsapp","link"]}` |
 | GET | `/receipt-layouts/assignments` | list |
@@ -940,6 +940,14 @@ The legacy rows are never deleted. The logic is `app/services/receipt_legacy.py`
 | POST | `/receipt-layouts/preview` | see below |
 
 Layout response: `{"id","business_id","name","design","paper","config","is_active","created_at","updated_at"}`.
+
+**Changing the design** (`PUT /receipt-layouts/{id}` with `design`): the config schema is the same for every design, so the
+stored config (language, footer, labels, toggles) is kept as is and stays valid; send `config` too to change it in the same
+request (it is validated like any save). `paper` follows the design: name one explicitly, otherwise the current paper is
+kept when the new design prints on it (`roll58` <-> `roll80` between thermal designs) and the new design's own paper is
+used when it does not (thermal -> `a4`, A4 -> `roll80`). An unknown design, a design/paper mismatch or an invalid config is
+422 and nothing is changed. The change is audited (before/after `design` and `paper`). The layout keeps its name and its
+channel assignments.
 
 Assignments: `PUT {"assignments":[{"channel":"whatsapp","branch_id":"<uuid>|null","layout_id":"<uuid>|null"}]}`;
 `GET` rows are `{"id","branch_id","channel","layout_id","updated_at"}`. `branch_id: null` = business default. Resolution

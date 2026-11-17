@@ -28,6 +28,8 @@ class LayoutCreate(BaseSchema):
 
 class LayoutUpdate(BaseSchema):
     name: str | None = Field(default=None, min_length=1, max_length=100)
+    # A layout can switch design; the config (design-independent) is kept unless a new one is sent.
+    design: str | None = None
     paper: str | None = None
     config: dict[str, Any] | None = None
     is_active: bool | None = None
