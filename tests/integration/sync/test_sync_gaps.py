@@ -400,5 +400,6 @@ def test_pull_receipt_branding_in_settings(http_client, pos_tenant):
     assert "phone" in s_data
     assert "tax_id" in s_data
     assert "address_line1" in s_data
-    assert "receipt_footer" in s_data
+    # the footer lives in the receipt layout (receipt_layout entity), not in the settings subset
+    assert "receipt_footer" not in s_data
     assert "tax_labels" in s_data

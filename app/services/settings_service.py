@@ -25,12 +25,14 @@ BUSINESS_SETTINGS = {
     "business.logo_url",
 }
 
-RECEIPT_SETTINGS = {
+# Deprecated since receipt layouts (migration 028): rows may still exist and stay readable
+# (GET /settings), but nothing renders from them; footer, paper, tax and logo live in the layout.
+LEGACY_RECEIPT_SETTINGS = frozenset({
     "receipt.footer_text",
     "receipt.show_tax",
     "receipt.show_logo",
     "receipt.paper_size",
-}
+})
 
 INVENTORY_SETTINGS = {
     "inventory.allow_negative_stock",
@@ -68,7 +70,6 @@ def can_read_all_settings(permission_keys: set[str]) -> bool:
 
 PREDEFINED_SETTING_KEYS = (
     BUSINESS_SETTINGS
-    | RECEIPT_SETTINGS
     | INVENTORY_SETTINGS
     | SALE_SETTINGS
     | NOTIFICATION_SETTINGS

@@ -350,7 +350,8 @@ Customer balance is computed by the server from `customer_ledger` entries (`sum(
   ```
 
 ##### 4. Receipt Branding in `settings`
-The `settings` entity change provides all receipt branding fields:
+The `settings` entity change provides the business identity fields (the receipt footer is NOT here any more: it is
+`footer.text_en` / `footer.text_ur` of the `receipt_layout` entity):
 ```json
 {
   "business_name": "My Supermarket",
@@ -359,7 +360,6 @@ The `settings` entity change provides all receipt branding fields:
   "phone": "03001234567",
   "tax_id": "1234567-8",
   "ntn": "1234567-8",
-  "receipt_footer": "Thank you for shopping with us!",
   "tax_labels": {"standard": "GST"},
   "currency": "PKR",
   "timezone": "Asia/Karachi",
@@ -623,6 +623,24 @@ reads return `{"tax_rate_id": "<uuid>|null", "tax_rate": "17.000|null", "is_tax_
 `products` export and `POST /products/import` have `tax_rate_name` (matched by name within the business, unknown
 or inactive name = row error, blank = unchanged) and `tax_exempt` (`true|false`, blank = unchanged).
 
+Product create is atomic and returns the full product. `POST /products` accepts `barcodes` (product-level) and
+`variations[].barcodes` (`{barcode, barcode_type?, is_primary?}`); the product, its variations and all barcodes are
+saved in one transaction (a duplicate barcode/SKU, two primaries, or a barcode already used = nothing is saved: 409/400).
+Responses (`POST|GET|PUT /products`, `/products/barcode/{code}`) embed `category` as a slim
+`{id, name, parent_id}` (never its `children`), plus `brand`, `base_unit`, `variations[]` (each with `unit` and
+`barcodes`) and `barcodes`. The category tree is served only by `/categories`.
+
+#### Async loading rule (no `MissingGreenlet`)
+
+The async session cannot lazy-load. Every relationship must be declared `lazy="selectin"` or `"noload"`, a response
+schema may only read relationships its service loaded explicitly (`selectinload` in the query), and recursive tree
+schemas (`CategoryResponse`, `ExpenseCategoryResponse`) are only ever an endpoint's own response and are loaded with
+`selectinload(..., recursion_depth=-1)`; embed a brief schema (e.g. `CategoryBrief`) anywhere else. After an update,
+reload with `execution_options(populate_existing=True)` rather than `db.refresh()` (which resets `noload`
+relationships to empty). Guards: `tests/unit/test_async_loading_safety.py` (static), `tests/integration/smoke`
+(API smoke for every nested resource; fails on any 5xx and on `MissingGreenlet` in the server log) and the managed
+test server, which fails its fixture teardown if `MissingGreenlet` was ever logged.
+
 ### Formulas (`app/services/pricing_engine.py`, Decimal only, half-up to 2 dp)
 
 Line, with `gross_in = qty x price`, `d` = discount (percent, fixed or cart share; never below 0 for the line):
@@ -812,7 +830,7 @@ content, at most `UPLOAD_MAX_IMAGE_BYTES`) → `201 {"url": "..."}`. With `CLOUD
 An invoice is a sale rendered with a **layout**. A layout is business data (`receipt_layouts`), assigned per channel
 (`print`, `whatsapp`, `link`) and optionally per branch. ONE render model
 (`build_receipt_model(sale, layout, channel)` in `app/services/receipt_render.py`) feeds the HTML, PDF and WhatsApp
-text renderers and the public `/r/{token}` page. Migration: `027_receipt_layouts` (idempotent, seeds existing businesses).
+text renderers and the public `/r/{token}` page. Migrations: `027_receipt_layouts` (idempotent, seeds existing businesses) and `028_receipt_language` (config v2, legacy options).
 
 Designs: `thermal_classic`, `thermal_compact` (papers `roll58` / `roll80`), `a4_tax_invoice`, `a4_elegant` (paper `a4`).
 Thermal PDFs are exactly 58 / 80 mm wide with an exact height; A4 designs are A4. Every business gets all four layouts;
@@ -822,7 +840,7 @@ Thermal PDFs are exactly 58 / 80 mm wide with an exact height; A4 designs are A4
 
 ```json
 {
-  "v": 1,
+  "v": 2,
   "header": {"show_logo": true, "show_business_name": true, "show_address": true, "show_phone": true,
              "show_ntn": true, "ntn_label": "NTN", "extra_lines": []},
   "meta": {"show_number": true, "number_source": "register", "show_datetime": true, "show_cashier": true,
@@ -830,23 +848,83 @@ Thermal PDFs are exactly 58 / 80 mm wide with an exact height; A4 designs are A4
            "walkin_label": "Walk-in"},
   "items": {"show_name": true, "show_variation": true, "show_sku": false, "show_barcode": false, "show_unit": false,
             "show_qty": true, "show_unit_price": true, "show_line_discount": true, "show_line_total": true,
-            "show_batch": false, "show_expiry": false, "name_language": "primary"},
+            "show_batch": false, "show_expiry": false},
   "totals": {"show_subtotal": true, "show_discount": true, "show_tax_breakdown": true, "show_rounding": true,
              "show_includes_tax_note": true, "show_payments": true, "show_change": true,
              "show_previous_balance": false, "show_balance_after": false},
   "footer": {"text_en": "", "text_ur": "", "show_powered_by": false, "show_qr": true},
   "labels": {"total": {"en": "Total", "ur": "کل"}},
-  "style": {"font_scale": 1.0, "show_dividers": true, "compact_items": false}
+  "style": {"language": "en", "font_scale": 1.0, "show_dividers": true, "compact_items": false}
 }
 ```
 
-* `header.extra_lines`: at most 3 lines. `meta.number_source`: `register` | `official`. `items.name_language`:
-  `primary` | `secondary` | `both`. `style.font_scale`: 0.8-1.4.
+* `header.extra_lines`: at most 3 lines. `meta.number_source`: `register` | `official`. `style.font_scale`: 0.8-1.4.
+* **`style.language`**: `"en"` (default) | `"ur"` | `"both"`. It is the ONE language switch of the layout (see "Language"
+  below). It replaces `items.name_language`, which old configs may still send: it is accepted, ignored and dropped on save.
+* **Config version**: stored/submitted configs are version 2. A version-1 config (or one without `v`) is upgraded when
+  it is read (`GET /receipt-layouts`, the sync feed, rendering) and when it is saved: `items.name_language` is dropped and
+  `style.language` becomes `"both"` when the config had an edited Urdu caption (a `labels.*.ur` that differs from the
+  built-in text) or a `footer.text_ur`, otherwise `"en"`. A config with a `v` above 2 is rejected (422).
 * `labels` is a partial map of `{key: {"en", "ur"}}`; keys must be known (`GET /receipt-layouts/designs` lists the
   defaults for every key: receipt, tax_invoice, invoice, number, date, cashier, customer, item, qty, price, amount, sku,
   barcode, batch, expiry, subtotal, discount, tax, rounding, total, paid, balance_due, change, payment methods, ...).
-  Labels print bilingual ("Total / کل") when both languages exist.
+  Every key has an English and an Urdu default (complete in both languages); an empty `en`/`ur` falls back to it.
+  Other layout texts follow the same language: `header.ntn_label` (the default `NTN` becomes `این ٹی این` in Urdu; a custom
+  label is printed as written), `meta.walkin_label` (same rule), the tax caption of a tax line (`GST`, `VAT`, `Sales Tax`
+  have Urdu captions; any other custom tax name is printed as written), and the `Batch` / `Exp` / `SKU` item captions.
 * Per-design defaults differ (e.g. `thermal_compact`: `compact_items`, `font_scale` 0.9, no cashier/customer/QR).
+
+### Language
+
+`style.language` decides what a receipt says, for print, WhatsApp and the public page alike. The render model resolves
+EVERY caption and the footer to exactly one language, never a mixed "Total / کل":
+
+| `style.language` | captions | footer | product name | direction |
+|---|---|---|---|---|
+| `en` | English only | `footer.text_en`, else "Thank you for shopping with us!" | product name | LTR |
+| `ur` | Urdu only | `footer.text_ur`, else "خریداری کا شکریہ!" (the English text is never used as a fallback) | `name_secondary` if set, else the name | RTL |
+| `both` | two lines: English, then Urdu | two lines: `text_en` (or default), `text_ur` (or default) | name, `name_secondary` on a second line | LTR |
+
+* Model additions: `"language"`, `"rtl"` (true only for `ur`), `"dir"` (`"rtl"` | `"ltr"`), and `"captions"` (`sku`, `batch`,
+  `expiry`, `receipt`, `download_pdf`, on one line). In `both` a label/title is `"Total\nکل"` (a line break between the two).
+* RTL (`ur`): HTML gets `<html lang="ur" dir="rtl">` and a mirrored page (captions right, amounts left, columns reversed),
+  the PDF mirrors the caption/amount rows and the A4 table, and the WhatsApp text prefixes every line with a right-to-left
+  mark (U+200F). `en` and `both` are left-to-right (`lang="en"`).
+* Data is never translated: business name, address, customer, product names, batch numbers, dates and amounts print as
+  stored. Only captions, the footer and the choice between product name / `name_secondary` follow the language.
+* The language belongs to the layout, so each channel (`print`, `whatsapp`, `link`) can differ by assigning a different
+  layout. The public `/r/{token}` page, `GET /invoice/{id}/receipt` (all formats) and `GET /invoice/{id}/thermal` (its
+  `receipt`, `footer` and `paper_size` come from the print layout) all follow it. The "receipt unavailable" error page
+  of an invalid link has no layout and stays English.
+
+### Deprecated receipt settings
+
+Receipt options used to live in `app_settings` / the business config. Since layouts they are DEPRECATED: rows that exist
+stay readable (`GET /settings`, any signed-in POS user for the `receipt.` prefix) but nothing renders from them and the
+sync `settings` entity no longer carries them. Use the layout instead:
+
+| Deprecated key | Replaced by |
+|---|---|
+| `receipt.footer_text` (and business config `receipt_footer`, `receipt.footer`) | `footer.text_en` / `footer.text_ur` |
+| `receipt.paper_size` (`58mm`, `80mm`, `a4`) | layout `paper` / which layout is assigned to `print` |
+| `receipt.show_tax` | `totals.show_tax_breakdown` |
+| `receipt.show_logo` | `header.show_logo` |
+| sync `settings.receipt_footer` | `receipt_layout` entity |
+
+Still server-side and current: `receipt.number_prefix`, `sales.invoice_*`, `inventory.*` (numbering and batch policy) and
+`tax.*` (e.g. `tax.show_breakdown_on_receipt`, which feeds the sale snapshot). Printing-hardware preferences (printer,
+cut, drawer) are local to the device; there are none on the server.
+
+Migration `028_receipt_language` (idempotent; only layouts below config v2 are touched, so a second run changes nothing):
+1. every stored layout config is upgraded to v2 (`name_language` dropped, `style.language` set as described above);
+2. for each business, legacy options are copied ONCE into its seeded layouts (the four built-in names), only where the
+   owner had changed them from the defaults: footer -> `footer.text_en` (Urdu script -> `footer.text_ur`), `58mm` ->
+   `roll58` on the thermal layouts, `receipt.show_tax = false` -> `totals.show_tax_breakdown = false`,
+   `receipt.show_logo = false` -> `header.show_logo = false`; legacy `a4` makes the A4 tax invoice the business default of
+   the `print` channel while it still points at the seeded classic layout. `app_settings` values win over the business
+   config (`receipt_footer`, `receipt` object);
+3. layouts with an edited Urdu caption or an Urdu footer get `style.language = "both"`, all others `"en"`.
+The legacy rows are never deleted. The logic is `app/services/receipt_legacy.py`.
 
 ### API (all `settings.manage`; changes are audited with before/after)
 
@@ -876,7 +954,7 @@ Receipts: `GET /invoice/{sale_id}/receipt?channel=print|whatsapp|link&format=jso
 
 ### Render model (`format=json`)
 
-`{"v":1,"channel","layout":{"id","name","design"},"paper":{"code","width_mm","a4"},"style","currency","is_void",
+`{"v":1,"channel","layout":{"id","name","design"},"paper":{"code","width_mm","a4"},"style","language","rtl","dir","captions","currency","is_void",
 "title","header":{"logo_url","business_name","address","phone","ntn":{"label","value"}|null,"extra_lines"},
 "meta":[{"key","label","value"}],"columns","items":[{"name","name_secondary","sku","barcode","unit","qty","unit_price",
 "discount","line_total","batches":[{"batch_no","expiry","qty"}]}],"totals":[{"key","label","value","strong"}],
@@ -943,5 +1021,6 @@ Export dataset `expiry` (`GET /export/expiry`, `reports.export` + `inventory.vie
 
 ### Receipt tests
 
-`tests/unit/test_receipt_render.py` (render rules, no server) and `tests/integration/receipt/` (layouts API, numbering,
-batches). `tax_id` on `PUT /business/me` now rejects tax-label text such as "GST 17%" (422).
+`tests/unit/test_receipt_render.py` (render rules, no server), `tests/unit/test_receipt_language.py` (language modes, RTL,
+config upgrade, legacy mapping) and `tests/integration/receipt/` (layouts API, numbering, batches, `test_language.py`:
+invoice/public page language and the legacy-options migration). `tax_id` on `PUT /business/me` now rejects tax-label text such as "GST 17%" (422).

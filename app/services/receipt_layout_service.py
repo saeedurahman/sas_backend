@@ -59,6 +59,14 @@ def check_design_paper(design: str, paper: str) -> None:
         raise _unprocessable(f"design {design} needs paper roll58 or roll80")
 
 
+def read_config(raw: dict[str, Any] | None) -> dict[str, Any]:
+    """A stored config as version 2 (old configs are upgraded on read; a corrupt one is returned as is)."""
+    try:
+        return normalise_config(raw)
+    except (ValueError, TypeError):
+        return raw or {}
+
+
 def layout_dict(layout: ReceiptLayout) -> dict[str, Any]:
     return {
         "id": layout.id,
@@ -66,7 +74,7 @@ def layout_dict(layout: ReceiptLayout) -> dict[str, Any]:
         "name": layout.name,
         "design": layout.design,
         "paper": layout.paper,
-        "config": layout.config,
+        "config": read_config(layout.config),
         "is_active": layout.is_active,
         "created_at": layout.created_at,
         "updated_at": layout.updated_at,

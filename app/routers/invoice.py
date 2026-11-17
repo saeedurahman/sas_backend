@@ -205,4 +205,7 @@ async def thermal_receipt(
     data = await get_thermal_receipt_data(db, sale_id, current_user.business_id)
     model, _invoice = await _receipt_model(db, current_user, sale_id, "print", request)
     data.receipt = model
+    # footer and paper follow the print layout (and its language), not the legacy receipt.* settings
+    data.footer = chr(10).join(line for line in model["footer"]["lines"] if line) or data.footer
+    data.paper_size = {"roll58": "58mm", "roll80": "80mm", "a4": "A4"}.get(model["paper"]["code"], data.paper_size)
     return data

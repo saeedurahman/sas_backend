@@ -171,7 +171,7 @@ ENTITIES: tuple[Entity, ...] = (
     Entity("register_shift", "register_shifts", _REGISTER_SHIFT_PERMS, branch_col="branch_id", builder="register_shift"),
     Entity("sale_summary", "sales", _SALE_PERMS, branch_col="branch_id", builder="sale_summary"),
     Entity("customer_balance", "customers", ("customers.view", "sales.create"), builder="customer_balance"),
-    Entity("receipt_layout", "receipt_layouts", None),
+    Entity("receipt_layout", "receipt_layouts", None, builder="receipt_layout"),
     Entity("receipt_layout_assignment", "receipt_layout_assignments", None,
            branch_col="branch_id", branch_nullable=True),
     # Stock per batch/expiry, derived from FIFO layers that still hold stock.
@@ -316,7 +316,15 @@ async def _materialise(
     ids = [r["id"] for r in live]
     built: dict[UUID, dict[str, Any]] = {}
 
-    if entity.builder in ("customer", "customer_balance"):
+    if entity.builder == "receipt_layout":
+        from app.services.receipt_layout_service import read_config
+
+        for row in live:
+            data = dict(row["data"])
+            data["config"] = read_config(data.get("config"))
+            built[row["id"]] = data
+
+    elif entity.builder in ("customer", "customer_balance"):
         balances = (
             await db.execute(
                 text(
@@ -352,14 +360,13 @@ async def _materialise(
             contact = sub.contact_from_settings(await sub.load_platform_settings(db))
             cfg_json = data.get("config_json") or {}
             extra_settings: dict[str, Any] = {}
-            receipt_footer = cfg_json.get("receipt_footer")
             tax_labels = cfg_json.get("tax_labels")
             app_settings_rows = (
                 await db.execute(
                     text(
                         "SELECT setting_key, setting_value FROM app_settings "
                         "WHERE business_id = :b AND branch_id IS NULL AND deleted_at IS NULL "
-                        "AND (setting_key IN ('receipt.footer_text', 'tax.labels') "
+                        "AND (setting_key IN ('tax.labels') "
                         "OR setting_key LIKE 'sales.invoice_%' OR setting_key = 'receipt.number_prefix' "
                         "OR setting_key = 'inventory.pick_policy' OR setting_key = 'inventory.expired_sale')"
                     ),
@@ -370,9 +377,7 @@ async def _materialise(
                 k = as_row["setting_key"]
                 v = as_row["setting_value"]
                 val = v.get("value") if isinstance(v, dict) and "value" in v else v
-                if k == "receipt.footer_text" and receipt_footer is None:
-                    receipt_footer = str(val) if val is not None else None
-                elif k == "tax.labels" and tax_labels is None:
+                if k == "tax.labels" and tax_labels is None:
                     tax_labels = val if isinstance(val, dict) else {}
                 elif k in receipt_settings.DEFAULTS:
                     extra_settings[k] = val
@@ -396,7 +401,6 @@ async def _materialise(
                 "state": business.state,
                 "postal_code": business.postal_code,
                 "country_code": business.country_code,
-                "receipt_footer": receipt_footer,
                 "tax_labels": tax_labels or {},
                 "default_tax_inclusive": data.get("default_tax_inclusive"),
                 "allow_negative_stock": data.get("allow_negative_stock"),

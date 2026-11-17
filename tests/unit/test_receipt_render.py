@@ -153,12 +153,12 @@ def test_batch_expiry_lines_follow_layout():
     assert re.search(r"\b\d{2}/\d{4}\b", on)
 
 
-def test_urdu_and_bilingual_labels():
-    out = _text(_model(items={"name_language": "both"}))
-    assert "پینا" in out
-    secondary = _model(items={"name_language": "secondary"})["items"][0]["name"]
-    assert secondary == "پینا ڈول ایکسٹرا"
-    labels = " ".join(t["label"] for t in _model()["totals"])
+def test_language_drives_names_and_captions():
+    both = _text(_model(style={"language": "both"}))
+    assert "پینا" in both
+    ur_name = _model(style={"language": "ur"})["items"][0]["name"]
+    assert ur_name == "پینا ڈول ایکسٹرا"
+    labels = " ".join(t["label"] for t in _model(style={"language": "both"})["totals"])
     assert "Total" in labels and re.search(r"[؀-ۿ]", labels)
 
 

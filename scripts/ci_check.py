@@ -1,7 +1,7 @@
 """CI gate for the security baseline.
 
     python scripts/ci_check.py                 # static checks + unit tests (no DB)
-    python scripts/ci_check.py --integration   # + security suite (needs TEST_DATABASE_URL, migrated DB)
+    python scripts/ci_check.py --integration   # + security suite + API smoke (needs TEST_DATABASE_URL, migrated DB)
 
 Exit code is non-zero when any check fails.
 """
@@ -134,6 +134,7 @@ def main() -> int:
         "tests/unit/test_subscription_state.py",
         "tests/unit/test_lease.py",
         "tests/unit/test_sync_units.py",
+        "tests/unit/test_async_loading_safety.py",
     )
     if args.integration:
         if USING_PLACEHOLDER_TEST_DB:
@@ -142,6 +143,8 @@ def main() -> int:
             print("FAILED: " + "; ".join(FAILURES))
             return 1
         run_pytest("security integration tests", "tests/security")
+        # Nested response schemas must serialize (no MissingGreenlet / 5xx) on every main resource.
+        run_pytest("nested-response API smoke tests", "tests/integration/smoke")
 
     print()
     if FAILURES:

@@ -30,6 +30,8 @@ from zoneinfo import ZoneInfo
 from app.schemas.invoice import InvoiceData
 from app.services.receipt_layout_config import (
     CHANNELS,
+    DEFAULT_NTN_LABEL,
+    DEFAULT_WALKIN_LABEL,
     LABEL_DEFAULTS,
     LayoutConfig,
     normalise_config,
@@ -83,13 +85,59 @@ def clean_ntn(value: str | None) -> str | None:
     return text
 
 
+def _language(cfg: dict[str, Any]) -> str:
+    return cfg["style"].get("language", "en")
+
+
 def _label(cfg: dict[str, Any], key: str) -> dict[str, str]:
+    """A caption in the layout language: one language for en/ur, two lines (en, then ur) for both."""
     entry = cfg["labels"].get(key) or {}
     en_default, ur_default = LABEL_DEFAULTS.get(key, (key, ""))
     en = entry.get("en") or en_default
     ur = entry.get("ur") or ur_default
-    text = f"{en} / {ur}" if en and ur and en != ur else (en or ur)
+    lang = _language(cfg)
+    if lang == "ur":
+        text = ur or en
+    elif lang == "both":
+        text = f"{en}\n{ur}" if en and ur and en != ur else (en or ur)
+    else:
+        text = en or ur
     return {"en": en, "ur": ur, "text": text}
+
+
+def inline(text: str) -> str:
+    """A caption on one line (two-line captions joined with ' / '), for compact spots."""
+    return " / ".join(part for part in text.split("\n") if part)
+
+
+def with_suffix(text: str, suffix: str) -> str:
+    """Append ``suffix`` to the last line of a (possibly two-line) caption."""
+    return f"{text} {suffix}" if suffix else text
+
+
+def with_value(label: str, value: str) -> list[str]:
+    """``label: value`` lines (one per caption line) for plain-text output."""
+    return [f"{part}: {value}" for part in label.split("\n") if part] or [value]
+
+
+def _tax_caption(cfg: dict[str, Any], tax_label: str) -> str:
+    key = re.sub(r"\s+", "_", tax_label.strip().lower())
+    if key in ("gst", "vat", "sales_tax"):
+        return _label(cfg, key)["text"]
+    return tax_label
+
+
+def _ntn_caption(cfg: dict[str, Any], configured: str) -> str:
+    if configured.strip() in ("", DEFAULT_NTN_LABEL):
+        return _label(cfg, "ntn")["text"]
+    return configured
+
+
+def _walkin_text(cfg: dict[str, Any], configured: str) -> str:
+    text = configured.strip()
+    if text != DEFAULT_WALKIN_LABEL:
+        return text
+    return inline(_label(cfg, "walkin")["text"])
 
 
 def _expiry_text(value: date | None) -> str | None:
@@ -137,6 +185,7 @@ def build_receipt_model(
         parsed.header, parsed.meta, parsed.items, parsed.totals, parsed.footer,
     )
     s = sale.summary
+    lang = _language(cfg)
     public = channel == "link"  # bearer link: never customer, cashier or ledger data
 
     # header
@@ -148,7 +197,8 @@ def build_receipt_model(
         "business_name": sale.business.name if header.show_business_name else None,
         "address": address if header.show_address and address else None,
         "phone": phone if header.show_phone and phone else None,
-        "ntn": {"label": header.ntn_label, "value": ntn_value} if header.show_ntn and ntn_value else None,
+        "ntn": {"label": _ntn_caption(cfg, header.ntn_label), "value": ntn_value}
+        if header.show_ntn and ntn_value else None,
         "extra_lines": [line for line in header.extra_lines if line.strip()],
     }
 
@@ -181,17 +231,17 @@ def build_receipt_model(
                 })
         elif meta_cfg.walkin_label.strip():
             meta.append({"key": "customer", "label": _label(cfg, "customer")["text"],
-                         "value": meta_cfg.walkin_label.strip()})
+                         "value": _walkin_text(cfg, meta_cfg.walkin_label)})
 
     # items
     items: list[dict[str, Any]] = []
     for ln in sale.lines:
         primary = ln.product_name
         secondary = (ln.product_name_secondary or "").strip() or None
-        if items_cfg.name_language == "secondary":
+        if lang == "ur":
             name, second = (secondary or primary), None
-        elif items_cfg.name_language == "both":
-            name, second = primary, secondary
+        elif lang == "both":
+            name, second = primary, (secondary if secondary and secondary != primary else None)
         else:
             name, second = primary, None
         if items_cfg.show_variation and ln.variation_name:
@@ -246,7 +296,7 @@ def build_receipt_model(
         for item in s.tax_breakdown:
             totals.append({
                 "key": "tax",
-                "label": f"{item.tax_label} {_rate_text(item.tax_rate)}%",
+                "label": with_suffix(_tax_caption(cfg, item.tax_label), f"{_rate_text(item.tax_rate)}%"),
                 "value": money(item.tax_amount),
             })
     if totals_cfg.show_rounding and s.rounding_amount:
@@ -255,7 +305,7 @@ def build_receipt_model(
                        "value": sign + money(abs(s.rounding_amount))})
     totals.append({
         "key": "total",
-        "label": f"{_label(cfg, 'total')['text']} ({sale.business.currency or 'PKR'})",
+        "label": with_suffix(_label(cfg, "total")["text"], f"({sale.business.currency or 'PKR'})"),
         "value": money(s.total_amount),
         "strong": True,
     })
@@ -282,15 +332,11 @@ def build_receipt_model(
             payments.append({"key": "balance_after", "label": _label(cfg, "balance_after")["text"],
                              "value": money(sale.customer_balance_after)})
 
-    # footer
-    business_footer = (sale.receipt_footer or "").strip()
-    custom = bool(footer_cfg.text_en.strip() or business_footer)
-    footer_lines = []
-    en = footer_cfg.text_en.strip() or business_footer or _label(cfg, "thank_you")["en"]
-    ur = footer_cfg.text_ur.strip() or ("" if custom else _label(cfg, "thank_you")["ur"])
-    footer_lines.append(en)
-    if ur:
-        footer_lines.append(ur)
+    # footer: the layout's own text per language (the legacy receipt.footer_text setting is not used here);
+    # an unset language falls back to the built-in thank-you caption, never to the other language
+    en = footer_cfg.text_en.strip() or _label(cfg, "thank_you")["en"]
+    ur = footer_cfg.text_ur.strip() or _label(cfg, "thank_you")["ur"]
+    footer_lines = {"en": [en], "ur": [ur], "both": [en, ur]}[lang]
 
     # QR: the public receipt link, only for a synced sale, never on the page it points to
     qr = None
@@ -315,6 +361,16 @@ def build_receipt_model(
             "a4": layout.paper == "a4",
         },
         "style": dict(cfg["style"]),
+        "language": lang,
+        "rtl": lang == "ur",
+        "dir": "rtl" if lang == "ur" else "ltr",
+        "captions": {
+            "sku": inline(_label(cfg, "sku")["text"]),
+            "batch": inline(_label(cfg, "batch")["text"]),
+            "expiry": inline(_label(cfg, "expiry")["text"]),
+            "receipt": inline(_label(cfg, "receipt")["text"]),
+            "download_pdf": inline(_label(cfg, "download_pdf")["text"]),
+        },
         "currency": sale.business.currency or "PKR",
         "is_void": is_void,
         "void_label": _label(cfg, "void")["text"] if is_void else None,
@@ -368,12 +424,19 @@ th{text-align:left;font-size:.8em;color:#666;font-weight:600}
 .title{font-weight:700;text-align:center;margin:6px 0;letter-spacing:.04em}
 .r.a4 .title{text-align:left;font-size:1.4em}
 .pay{margin-top:6px}
+.rtl{direction:rtl;text-align:right}
+.rtl h1,.rtl .title,.rtl .c,.rtl .f,.rtl .q{text-align:center}
+.rtl th{text-align:right}
+.rtl .n{text-align:left;padding-left:0;padding-right:8px}
+.rtl.a4 h1,.rtl.a4 .c,.rtl.a4 .title{text-align:right}
+.rtl .banner{text-align:right}
 """
 
 
 def _span(text: str) -> str:
-    # dir=auto lets Urdu runs lay out right-to-left inside an otherwise left-to-right page
-    return f"<span dir='auto'>{escape(text)}</span>" if text else ""
+    # dir=auto lets Urdu runs lay out right-to-left inside an otherwise left-to-right page;
+    # a two-line (both languages) caption keeps its line break
+    return f"<span dir='auto'>{escape(text).replace(chr(10), '<br>')}</span>" if text else ""
 
 
 def render_html(model: dict[str, Any], *, pdf_href: str | None = None) -> str:
@@ -383,6 +446,8 @@ def render_html(model: dict[str, Any], *, pdf_href: str | None = None) -> str:
     base = 14 if paper != "roll58" else 12.5
     size = f"{base * scale:.1f}"
     classes = ["r", paper]
+    if model.get("rtl"):
+        classes.append("rtl")
     if model["layout"]["design"] == "a4_elegant":
         classes.append("elegant")
     if not model["show_dividers"]:
@@ -402,7 +467,8 @@ def render_html(model: dict[str, Any], *, pdf_href: str | None = None) -> str:
     if h["phone"]:
         head += f"<div class='c'>{e(h['phone'])}</div>"
     if h["ntn"]:
-        head += f"<div class='c'>{e(h['ntn']['label'])}: {e(h['ntn']['value'])}</div>"
+        for ntn_line in with_value(h["ntn"]["label"], h["ntn"]["value"]):
+            head += f"<div class='c'>{_span(ntn_line)}</div>"
     for line in h["extra_lines"]:
         head += f"<div class='c'>{_span(line)}</div>"
     if model["layout"]["design"] == "a4_elegant":
@@ -428,7 +494,7 @@ def render_html(model: dict[str, Any], *, pdf_href: str | None = None) -> str:
             name = _span(it["name"])
             if it["name_secondary"]:
                 name += f"<div class='m'>{_span(it['name_secondary'])}</div>"
-            extra = _item_extra(it)
+            extra = _item_extra(it, model.get('captions'))
             if extra:
                 name += f"<div class='m'>{_span(extra)}</div>"
             cells = [f"<td>{name}</td>"]
@@ -449,7 +515,7 @@ def render_html(model: dict[str, Any], *, pdf_href: str | None = None) -> str:
             detail = _item_detail(it)
             if detail:
                 name += f"<div class='m'>{e(detail)}</div>"
-            extra = _item_extra(it)
+            extra = _item_extra(it, model.get('captions'))
             if extra:
                 name += f"<div class='m'>{_span(extra)}</div>"
             amount = f"<td class='n'>{e(it['line_total'])}</td>" if it["line_total"] is not None else "<td></td>"
@@ -474,11 +540,16 @@ def render_html(model: dict[str, Any], *, pdf_href: str | None = None) -> str:
         f"<div class='q'>{_qr_svg(model['qr']['content'])}<div>{e(model['qr']['content'])}</div></div>"
         if model["qr"] else ""
     )
-    pdf = f"<p class='c'><a href='{e(pdf_href)}'>Download PDF</a></p>" if pdf_href else ""
+    captions = model.get("captions") or {}
+    pdf = (
+        f"<p class='c'><a href='{e(pdf_href)}'>{e(captions.get('download_pdf', 'Download PDF'))}</a></p>"
+        if pdf_href else ""
+    )
     number = next((m["value"] for m in model["meta"] if m["key"] == "number"), "")
-    title = f"Receipt {number}".strip()
+    title = f"{captions.get('receipt', 'Receipt')} {number}".strip()
+    lang_attr = "ur" if model.get("language") == "ur" else "en"
     return (
-        "<!doctype html><html lang='en'><head><meta charset='utf-8'>"
+        f"<!doctype html><html lang='{lang_attr}' dir='{model.get('dir', 'ltr')}'><head><meta charset='utf-8'>"
         "<meta name='viewport' content='width=device-width,initial-scale=1'>"
         "<meta name='robots' content='noindex,nofollow'>"
         f"<title>{e(title)}</title><style>{_PAGE_CSS % {'fonts': _FONTS, 'size': size}}</style></head><body>"
@@ -501,25 +572,26 @@ def _item_detail(it: dict[str, Any]) -> str:
     return " ".join(parts)
 
 
-def _item_extra(it: dict[str, Any]) -> str:
+def _item_extra(it: dict[str, Any], captions: dict[str, str] | None = None) -> str:
     """SKU / barcode / batch-and-expiry caption lines (joined for the HTML renderers)."""
-    return " | ".join(item_extra_lines(it))
+    return " | ".join(item_extra_lines(it, captions))
 
 
-_BATCH_LABELS = {"batch": "Batch", "expiry": "Exp"}
+_DEFAULT_CAPTIONS = {"sku": "SKU", "batch": "Batch", "expiry": "Exp"}
 
 
-def item_extra_lines(it: dict[str, Any]) -> list[str]:
+def item_extra_lines(it: dict[str, Any], captions: dict[str, str] | None = None) -> list[str]:
+    cap = {**_DEFAULT_CAPTIONS, **(captions or {})}
     lines = []
-    ids = [x for x in (f"SKU {it['sku']}" if it["sku"] else None, it["barcode"]) if x]
+    ids = [x for x in (f"{cap['sku']} {it['sku']}" if it["sku"] else None, it["barcode"]) if x]
     if ids:
         lines.append(" ".join(ids))
     for b in it["batches"]:
         bits = []
         if b.get("batch_no"):
-            bits.append(f"{_BATCH_LABELS['batch']}: {b['batch_no']}")
+            bits.append(f"{cap['batch']}: {b['batch_no']}")
         if b.get("expiry"):
-            bits.append(f"{_BATCH_LABELS['expiry']}: {b['expiry']}")
+            bits.append(f"{cap['expiry']}: {b['expiry']}")
         if b.get("qty") and len(it["batches"]) > 1:
             bits.append(f"x{b['qty']}")
         if bits:
@@ -558,11 +630,13 @@ def render_text(model: dict[str, Any]) -> str:
         if value:
             out.append(value)
     if h["ntn"]:
-        out.append(f"{h['ntn']['label']}: {h['ntn']['value']}")
+        out.extend(with_value(h["ntn"]["label"], h["ntn"]["value"]))
     out.extend(h["extra_lines"])
-    out.append(f"*{model['title']}*" + (f" {model['void_label']}" if model["is_void"] else ""))
+    out.extend(f"*{part}*" for part in model["title"].split(chr(10)))
+    if model["is_void"]:
+        out.extend(model["void_label"].split(chr(10)))
     for m in model["meta"]:
-        out.append(f"{m['label']}: {m['value']}")
+        out.extend(with_value(m["label"], m["value"]))
     out.append("--------------------")
     for index, it in enumerate(model["items"], 1):
         out.append(f"{index}. {it['name']}".rstrip())
@@ -573,22 +647,25 @@ def render_text(model: dict[str, Any]) -> str:
             detail = (detail + " = " if detail else "") + it["line_total"]
         if detail:
             out.append(f"   {detail}")
-        for line in item_extra_lines(it):
+        for line in item_extra_lines(it, model.get("captions")):
             out.append(f"   {line}")
     out.append("--------------------")
     for t in model["totals"]:
-        text = f"{t['label']}: {t['value']}"
-        out.append(f"*{text}*" if t.get("strong") else text)
-    out.extend(model["notes"])
+        for text in with_value(t["label"], t["value"]):
+            out.append(f"*{text}*" if t.get("strong") else text)
+    for note in model["notes"]:
+        out.extend(note.split(chr(10)))
     for p in model["payments"]:
-        out.append(f"{p['label']}: {p['value']}")
+        out.extend(with_value(p["label"], p["value"]))
     out.append("--------------------")
     out.extend(line for line in model["footer"]["lines"] if line)
     if model["footer"]["powered_by"]:
-        out.append(model["footer"]["powered_by"])
+        out.extend(model["footer"]["powered_by"].split(chr(10)))
     if model["link"]:
         out.append(model["link"])
-    return "\n".join(out)
+    if model.get("rtl"):  # a right-to-left mark makes chat apps lay every line out right-to-left
+        out = [(chr(0x200F) + line) if line and not line.startswith("http") else line for line in out]
+    return chr(10).join(out)
 
 
 # ── PDF ──────────────────────────────────────────────────────────────────────
@@ -602,7 +679,7 @@ def _shape(text: str) -> str:
     import arabic_reshaper
     from bidi.algorithm import get_display
 
-    return get_display(arabic_reshaper.reshape(text))
+    return chr(10).join(get_display(arabic_reshaper.reshape(part)) for part in text.split(chr(10)))
 
 
 def _new_pdf(width: float, height: float | None, a4: bool):
@@ -636,8 +713,14 @@ def _draw_pdf(pdf, margin: float, model: dict[str, Any]) -> None:
     inner = pdf.w - 2 * margin
     lh = base * 0.45 * scale + 0.6
     compact = bool(model["style"].get("compact_items"))
+    rtl = bool(model.get("rtl"))
+    start = "R" if rtl else "L"  # alignment of running text: mirrored for Urdu
+    captions = model.get("captions")
 
     def setf(size: float = base, bold: bool = False) -> None:
+        # Drawing Urdu leaves the fallback font as the current font while font_family still says
+        # NotoSans, and set_font() returns early for an unchanged family: clear it to force a reselect.
+        pdf.font_family = ""
         pdf.set_font(font, "B" if bold else "", size * scale)
 
     def line_h(size: float = base) -> float:
@@ -645,7 +728,7 @@ def _draw_pdf(pdf, margin: float, model: dict[str, Any]) -> None:
 
     def centered(text: str, size: float = base, bold: bool = False) -> None:
         setf(size, bold)
-        pdf.multi_cell(inner, line_h(size), _shape(text), align="L" if a4 else "C",
+        pdf.multi_cell(inner, line_h(size), _shape(text), align=start if a4 else "C",
                        new_x="LMARGIN", new_y="NEXT")
 
     def rule() -> None:
@@ -662,10 +745,19 @@ def _draw_pdf(pdf, margin: float, model: dict[str, Any]) -> None:
         rw = right_w or min(inner * 0.38, max(18.0, pdf.get_string_width(right) + 2))
         lw = inner - rw
         x0, y0 = pdf.l_margin, pdf.get_y()
-        pdf.multi_cell(lw, line_h(size), _shape(left), new_x="LMARGIN", new_y="NEXT")
-        y1 = pdf.get_y()
-        pdf.set_xy(x0 + lw, y0)
-        pdf.cell(rw, line_h(size), right, align="R")
+        if rtl:  # mirrored: caption on the right edge, value on the left
+            pdf.set_xy(x0 + rw, y0)
+            pdf.multi_cell(lw, line_h(size), _shape(left), align="R", new_x="LMARGIN", new_y="NEXT")
+            y1 = pdf.get_y()
+            setf(size, bold)  # drawing Urdu leaves the fallback font selected
+            pdf.set_xy(x0, y0)
+            pdf.cell(rw, line_h(size), right, align="L")
+        else:
+            pdf.multi_cell(lw, line_h(size), _shape(left), new_x="LMARGIN", new_y="NEXT")
+            y1 = pdf.get_y()
+            setf(size, bold)  # drawing Urdu leaves the fallback font selected
+            pdf.set_xy(x0 + lw, y0)
+            pdf.cell(rw, line_h(size), right, align="R")
         pdf.set_y(max(y1, y0 + line_h(size)))
 
     h = model["header"]
@@ -675,7 +767,7 @@ def _draw_pdf(pdf, margin: float, model: dict[str, Any]) -> None:
         if value:
             centered(value, base * 0.9)
     if h["ntn"]:
-        centered(f"{h['ntn']['label']}: {h['ntn']['value']}", base * 0.9)
+        centered(chr(10).join(with_value(h["ntn"]["label"], h["ntn"]["value"])), base * 0.9)
     for line in h["extra_lines"]:
         centered(line, base * 0.9)
     centered(model["title"], base * (1.3 if a4 else 1.0), True)
@@ -690,34 +782,53 @@ def _draw_pdf(pdf, margin: float, model: dict[str, Any]) -> None:
         cols = model["columns"]
         weights = {"item": 0.46, "qty": 0.14, "price": 0.18, "amount": 0.22}
         total_w = sum(weights[c["key"]] for c in cols)
-        widths = [inner * weights[c["key"]] / total_w for c in cols]
+        shown = list(reversed(cols)) if rtl else list(cols)  # mirrored column order for Urdu
+        widths = [inner * weights[c["key"]] / total_w for c in shown]
+
+        def col_align(key: str) -> str:
+            return start if key == "item" else ("L" if rtl else "R")
+
         setf(base, True)
-        for c, w in zip(cols, widths):
-            pdf.cell(w, line_h() + 1, _shape(c["label"]), border="B", align="L" if c["key"] == "item" else "R")
-        pdf.ln(line_h() + 1.5)
+        head_lines = max(c["label"].count(chr(10)) + 1 for c in cols)
+        head_h = line_h() * head_lines + 1
+        y_head = pdf.get_y()
+        x = pdf.l_margin
+        for c, w in zip(shown, widths):
+            setf(base, True)
+            pdf.set_xy(x, y_head)
+            pdf.multi_cell(w, line_h(), _shape(c["label"]), align=col_align(c["key"]),
+                           new_x="RIGHT", new_y="TOP")
+            x += w
+        pdf.set_draw_color(60, 60, 60)
+        pdf.line(pdf.l_margin, y_head + head_h, pdf.w - margin, y_head + head_h)
+        pdf.set_xy(pdf.l_margin, y_head + head_h + 0.8)
         for it in model["items"]:
             setf(base)
             y0 = pdf.get_y()
-            pdf.set_x(pdf.l_margin)
-            pdf.multi_cell(widths[0], line_h(), _shape(it["name"]), new_x="RIGHT", new_y="TOP")
-            y_after = pdf.get_y()
-            x = pdf.l_margin + widths[0]
-            for c, w in zip(cols[1:], widths[1:]):
+            y_end = y0 + line_h()
+            x = pdf.l_margin
+            for c, w in zip(shown, widths):
+                setf(base)
                 pdf.set_xy(x, y0)
-                if c["key"] == "qty":
-                    text = (it["qty"] or "") + (f" {it['unit']}" if it["unit"] else "")
-                elif c["key"] == "price":
-                    text = it["unit_price"] or ""
+                if c["key"] == "item":
+                    pdf.multi_cell(w, line_h(), _shape(it["name"]), align=start, new_x="RIGHT", new_y="TOP")
+                    y_end = max(y_end, pdf.get_y() + line_h())
                 else:
-                    text = it["line_total"] or ""
-                pdf.cell(w, line_h(), text, align="R")
+                    if c["key"] == "qty":
+                        text = (it["qty"] or "") + (f" {it['unit']}" if it["unit"] else "")
+                    elif c["key"] == "price":
+                        text = it["unit_price"] or ""
+                    else:
+                        text = it["line_total"] or ""
+                    pdf.cell(w, line_h(), text, align=col_align(c["key"]))
                 x += w
-            pdf.set_xy(pdf.l_margin, max(y_after, y0 + line_h()))
-            extras = ([it["name_secondary"]] if it["name_secondary"] else []) + item_extra_lines(it)
+            pdf.set_xy(pdf.l_margin, y_end)
+            extras = ([it["name_secondary"]] if it["name_secondary"] else []) + item_extra_lines(it, captions)
             for extra in extras:
                 setf(base * 0.8)
                 pdf.set_text_color(100, 100, 100)
-                pdf.multi_cell(inner, line_h(base * 0.8), _shape(extra), new_x="LMARGIN", new_y="NEXT")
+                pdf.multi_cell(inner, line_h(base * 0.8), _shape(extra), align=start,
+                               new_x="LMARGIN", new_y="NEXT")
                 pdf.set_text_color(0, 0, 0)
     else:
         for it in model["items"]:
@@ -725,18 +836,20 @@ def _draw_pdf(pdf, margin: float, model: dict[str, Any]) -> None:
             pair(it["name"], amount, bold=False)
             if it["name_secondary"]:
                 setf(base * 0.9)
-                pdf.multi_cell(inner, line_h(base * 0.9), _shape(it["name_secondary"]),
+                pdf.multi_cell(inner, line_h(base * 0.9), _shape(it["name_secondary"]), align=start,
                                new_x="LMARGIN", new_y="NEXT")
             detail = _item_detail(it)
             if detail:
                 setf(base * 0.85)
                 pdf.set_text_color(90, 90, 90)
-                pdf.multi_cell(inner, line_h(base * 0.85), "  " + detail, new_x="LMARGIN", new_y="NEXT")
+                pdf.multi_cell(inner, line_h(base * 0.85), "  " + detail, align=start,
+                               new_x="LMARGIN", new_y="NEXT")
                 pdf.set_text_color(0, 0, 0)
-            for extra in item_extra_lines(it):
+            for extra in item_extra_lines(it, captions):
                 setf(base * 0.8)
                 pdf.set_text_color(90, 90, 90)
-                pdf.multi_cell(inner, line_h(base * 0.8), _shape("  " + extra), new_x="LMARGIN", new_y="NEXT")
+                pdf.multi_cell(inner, line_h(base * 0.8), _shape("  " + extra), align=start,
+                               new_x="LMARGIN", new_y="NEXT")
                 pdf.set_text_color(0, 0, 0)
             if not compact:
                 pdf.ln(0.6)

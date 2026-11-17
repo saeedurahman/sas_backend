@@ -80,6 +80,7 @@ from app.schemas.sales import (
 from app.schemas.product import (
     BarcodeResponse,
     BrandResponse,
+    CategoryBrief,
     CategoryResponse,
     CreateBarcodeRequest,
     CreateBrandRequest,
@@ -202,6 +203,7 @@ __all__ = [
     "BarcodeResponse",
     "ProductLocationResponse",
     "VariationResponse",
+    "CategoryBrief",
     "CategoryResponse",
     "PriceListItemResponse",
     "PriceListResponse",

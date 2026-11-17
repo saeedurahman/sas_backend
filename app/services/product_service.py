@@ -1,12 +1,14 @@
 """Product catalog management services."""
 
+import uuid
 from datetime import datetime, timezone
 from uuid import UUID
 
 from fastapi import HTTPException, status
 from sqlalchemy import func, or_, select
+from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import AsyncSession
-from sqlalchemy.orm import selectinload
+from sqlalchemy.orm import noload, selectinload
 
 from app.models.product import (
     Barcode,
@@ -24,19 +26,41 @@ from app.schemas.product import (
     CreateBarcodeRequest,
     CreateProductRequest,
     CreateVariationRequest,
+    NewBarcodeInput,
     UpdateProductRequest,
     UpdateVariationRequest,
 )
 
 
-def _product_detail_options():
+def _barcode_options():
+    # Barcode.product / Barcode.variation default to lazy="selectin": left alone they re-load
+    # the parents we are already loading (and, under populate_existing, reset them).
+    return (noload(Barcode.product), noload(Barcode.variation))
+
+
+def _variation_options():
     return (
-        selectinload(Product.category).selectinload(Category.children),
+        selectinload(ProductVariation.barcodes).options(*_barcode_options()),
+        selectinload(ProductVariation.unit),
+    )
+
+
+def _product_detail_options():
+    """Everything ProductResponse serializes, loaded explicitly (async: no lazy loads).
+
+    The category is embedded as a slim CategoryBrief, so its self-referential
+    ``children``/``parent`` (mapper default ``selectin``, recursive) are switched off here.
+    """
+    return (
+        selectinload(Product.category).options(
+            noload(Category.children), noload(Category.parent)
+        ),
         selectinload(Product.brand),
         selectinload(Product.base_unit),
-        selectinload(Product.variations).selectinload(ProductVariation.barcodes),
-        selectinload(Product.variations).selectinload(ProductVariation.unit),
-        selectinload(Product.barcodes),
+        # One chain for variations: with populate_existing two chains re-populate the
+        # same rows and the second (noload for the attrs it does not name) wipes the first.
+        selectinload(Product.variations).options(*_variation_options()),
+        selectinload(Product.barcodes).options(*_barcode_options()),
     )
 
 
@@ -227,11 +251,7 @@ async def get_products(
     result = await db.execute(
         select(Product)
         .where(*filters)
-        .options(
-            selectinload(Product.category),
-            selectinload(Product.brand),
-            selectinload(Product.base_unit),
-        )
+        # ProductListResponse carries ids only; no relationship is serialized.
         .order_by(Product.name)
         .offset(skip)
         .limit(limit)
@@ -252,6 +272,8 @@ async def get_product_by_id(
             Product.deleted_at.is_(None),
         )
         .options(*_product_detail_options())
+        # After an update the session still holds the old category/brand/...; re-populate.
+        .execution_options(populate_existing=True)
     )
     product = result.scalar_one_or_none()
     if product is None:
@@ -290,9 +312,12 @@ async def _create_variations(
     variations_data: list[CreateVariationRequest],
     created_by: UUID,
     now: datetime,
-) -> None:
+) -> list[tuple[ProductVariation, list[NewBarcodeInput]]]:
+    """Add the variations to the session; returns (variation, inline barcodes) pairs."""
+    created: list[tuple[ProductVariation, list[NewBarcodeInput]]] = []
     if not variations_data:
         variation = ProductVariation(
+            id=uuid.uuid4(),
             business_id=product.business_id,
             product_id=product.id,
             name="Default",
@@ -304,7 +329,7 @@ async def _create_variations(
             updated_at=now,
         )
         db.add(variation)
-        return
+        return [(variation, [])]
 
     default_assigned = False
     for index, var_data in enumerate(variations_data):
@@ -332,6 +357,7 @@ async def _create_variations(
             )
 
         variation = ProductVariation(
+            id=uuid.uuid4(),
             business_id=product.business_id,
             product_id=product.id,
             name=var_data.name,
@@ -345,6 +371,58 @@ async def _create_variations(
             updated_at=now,
         )
         db.add(variation)
+        created.append((variation, var_data.barcodes))
+    return created
+
+
+async def _create_inline_barcodes(
+    db: AsyncSession,
+    product: Product,
+    product_barcodes: list[NewBarcodeInput],
+    variation_barcodes: list[tuple[ProductVariation, list[NewBarcodeInput]]],
+    created_by: UUID,
+    now: datetime,
+) -> None:
+    """Validate and add every barcode sent with a product-create request.
+
+    Runs inside the create transaction: any failure rolls the whole product back.
+    """
+    entries: list[tuple[NewBarcodeInput, UUID | None]] = [
+        (b, None) for b in product_barcodes
+    ]
+    for variation, barcodes in variation_barcodes:
+        entries.extend((b, variation.id) for b in barcodes)
+    if not entries:
+        return
+
+    values = [b.barcode for b, _ in entries]
+    if len(set(values)) != len(values):
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="Duplicate barcode in request",
+        )
+    if sum(1 for b, _ in entries if b.is_primary) > 1:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="Only one barcode can be primary",
+        )
+    for value in values:
+        await _check_barcode_unique(db, product.business_id, value)
+
+    for b, variation_id in entries:
+        db.add(
+            Barcode(
+                business_id=product.business_id,
+                product_id=product.id,
+                variation_id=variation_id,
+                barcode=b.barcode,
+                barcode_type=b.barcode_type,
+                is_primary=b.is_primary,
+                created_by=created_by,
+                created_at=now,
+                updated_at=now,
+            )
+        )
 
 
 async def create_product(
@@ -410,11 +488,23 @@ async def create_product(
         db.add(product)
         await db.flush()
 
-        await _create_variations(db, product, data.variations, created_by, now)
+        created_variations = await _create_variations(
+            db, product, data.variations, created_by, now
+        )
+        await _create_inline_barcodes(
+            db, product, data.barcodes, created_variations, created_by, now
+        )
         await db.commit()
     except HTTPException:
         await db.rollback()
         raise
+    except IntegrityError:
+        # A concurrent request won the unique race (sku / barcode): nothing was saved.
+        await db.rollback()
+        raise HTTPException(
+            status_code=status.HTTP_409_CONFLICT,
+            detail="SKU or barcode already exists",
+        )
     except Exception:
         await db.rollback()
         raise
@@ -496,6 +586,16 @@ async def update_product(
     return await get_product_by_id(db, product_id, business_id)
 
 
+async def _load_variation(db: AsyncSession, variation_id: UUID) -> ProductVariation:
+    result = await db.execute(
+        select(ProductVariation)
+        .where(ProductVariation.id == variation_id)
+        .options(*_variation_options())
+        .execution_options(populate_existing=True)
+    )
+    return result.scalar_one()
+
+
 async def add_variation(
     db: AsyncSession,
     product_id: UUID,
@@ -529,19 +629,17 @@ async def add_variation(
         created_at=now,
         updated_at=now,
     )
+    variation.id = uuid.uuid4()
     db.add(variation)
-    await db.commit()
-    await db.refresh(variation)
-
-    result = await db.execute(
-        select(ProductVariation)
-        .where(ProductVariation.id == variation.id)
-        .options(
-            selectinload(ProductVariation.barcodes),
-            selectinload(ProductVariation.unit),
+    try:
+        await _create_inline_barcodes(
+            db, product, [], [(variation, data.barcodes)], created_by, now
         )
-    )
-    return result.scalar_one()
+        await db.commit()
+    except Exception:
+        await db.rollback()
+        raise
+    return await _load_variation(db, variation.id)
 
 
 async def update_variation(
@@ -562,10 +660,7 @@ async def update_variation(
             ProductVariation.business_id == business_id,
             ProductVariation.deleted_at.is_(None),
         )
-        .options(
-            selectinload(ProductVariation.barcodes),
-            selectinload(ProductVariation.unit),
-        )
+        .options(*_variation_options())
     )
     variation = result.scalar_one_or_none()
     if variation is None:
@@ -594,8 +689,8 @@ async def update_variation(
     variation.updated_by = updated_by
     variation.updated_at = now
     await db.commit()
-    await db.refresh(variation)
-    return variation
+    # db.refresh() would reset noload relationships (barcodes/unit) to empty; reload explicitly.
+    return await _load_variation(db, variation_id)
 
 
 async def add_barcode(

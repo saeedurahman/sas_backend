@@ -44,7 +44,8 @@ def test_new_business_gets_four_layouts_and_thermal_classic_defaults(http_client
     layouts = _layouts(http_client, t)
     assert {x["design"] for x in layouts} == DESIGNS
     classic = next(x for x in layouts if x["design"] == "thermal_classic")
-    assert classic["config"]["v"] == 1
+    assert classic["config"]["v"] == 2 and classic["config"]["style"]["language"] == "en"
+    assert "name_language" not in classic["config"]["items"]
     rows = _assignments(http_client, t)
     assert {(a["channel"], a["branch_id"], a["layout_id"]) for a in rows} == {
         (ch, None, classic["id"]) for ch in ("print", "whatsapp", "link")

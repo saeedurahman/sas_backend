@@ -42,6 +42,11 @@ async def _generate_unique_slug(
         suffix += 1
 
 
+def _tree_options():
+    """CategoryResponse is recursive: load the whole subtree, not just one level."""
+    return selectinload(Category.children, recursion_depth=-1)
+
+
 async def get_categories(
     db: AsyncSession,
     business_id: UUID,
@@ -53,7 +58,7 @@ async def get_categories(
             Category.business_id == business_id,
             Category.deleted_at.is_(None),
         )
-        .options(selectinload(Category.children))
+        .options(_tree_options())
         .order_by(Category.sort_order, Category.name)
     )
     if parent_id is None:
@@ -76,7 +81,7 @@ async def get_category_by_id(
             Category.business_id == business_id,
             Category.deleted_at.is_(None),
         )
-        .options(selectinload(Category.children))
+        .options(_tree_options())
     )
     category = result.scalar_one_or_none()
     if category is None:

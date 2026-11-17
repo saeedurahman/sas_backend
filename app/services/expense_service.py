@@ -54,6 +54,11 @@ async def _get_active_shift_for_branch(
     return result.scalar_one_or_none()
 
 
+def _tree_options():
+    """ExpenseCategoryResponse is recursive: load the whole subtree, not a fixed depth."""
+    return selectinload(ExpenseCategory.children, recursion_depth=-1)
+
+
 async def get_expense_categories(
     db: AsyncSession,
     business_id: UUID,
@@ -65,11 +70,7 @@ async def get_expense_categories(
             ExpenseCategory.deleted_at.is_(None),
             ExpenseCategory.parent_id.is_(None),
         )
-        .options(
-            selectinload(ExpenseCategory.children).selectinload(
-                ExpenseCategory.children
-            )
-        )
+        .options(_tree_options())
         .order_by(ExpenseCategory.name)
     )
     return list(result.scalars().unique().all())
@@ -87,7 +88,7 @@ async def get_expense_category_by_id(
             ExpenseCategory.business_id == business_id,
             ExpenseCategory.deleted_at.is_(None),
         )
-        .options(selectinload(ExpenseCategory.children))
+        .options(_tree_options())
     )
     category = result.scalar_one_or_none()
     if category is None:

@@ -89,7 +89,18 @@ LABEL_DEFAULTS: dict[str, tuple[str, str]] = {
     "thank_you": ("Thank you for shopping with us!", "خریداری کا شکریہ!"),
     "void": ("VOID", "منسوخ"),
     "powered_by": ("Powered by PakPOS", "PakPOS کے ذریعے"),
+    "ntn": ("NTN", "این ٹی این"),
+    "walkin": ("Walk-in", "واک اِن"),
+    "download_pdf": ("Download PDF", "پی ڈی ایف ڈاؤن لوڈ کریں"),
+    "gst": ("GST", "جی ایس ٹی"),
+    "vat": ("VAT", "ویٹ"),
+    "sales_tax": ("Sales Tax", "سیلز ٹیکس"),
+    "link_unavailable": ("Receipt unavailable", "رسید دستیاب نہیں"),
 }
+LANGUAGES = ("en", "ur", "both")
+CONFIG_VERSION = 2
+DEFAULT_NTN_LABEL = "NTN"
+DEFAULT_WALKIN_LABEL = "Walk-in"
 LABEL_KEYS = frozenset(LABEL_DEFAULTS)
 
 
@@ -139,7 +150,6 @@ class ItemsCfg(_Strict):
     show_line_total: bool = True
     show_batch: bool = False
     show_expiry: bool = False
-    name_language: Literal["primary", "secondary", "both"] = "primary"
 
 
 class TotalsCfg(_Strict):
@@ -167,13 +177,14 @@ class LabelCfg(_Strict):
 
 
 class StyleCfg(_Strict):
+    language: Literal["en", "ur", "both"] = "en"
     font_scale: float = Field(default=1.0, ge=0.8, le=1.4)
     show_dividers: bool = True
     compact_items: bool = False
 
 
 class LayoutConfig(_Strict):
-    v: Literal[1] = 1
+    v: Literal[2] = 2
     header: HeaderCfg = Field(default_factory=HeaderCfg)
     meta: MetaCfg = Field(default_factory=MetaCfg)
     items: ItemsCfg = Field(default_factory=ItemsCfg)
@@ -202,19 +213,56 @@ class LayoutConfig(_Strict):
         return self.model_copy(update={"labels": full})
 
 
+def _edited_urdu(raw: dict[str, Any]) -> bool:
+    footer = raw.get("footer") if isinstance(raw.get("footer"), dict) else {}
+    if str(footer.get("text_ur") or "").strip():
+        return True
+    labels = raw.get("labels") if isinstance(raw.get("labels"), dict) else {}
+    for key, entry in labels.items():
+        ur = entry.get("ur") if isinstance(entry, dict) else None
+        if isinstance(ur, str) and ur.strip() and ur != LABEL_DEFAULTS.get(key, ("", ""))[1]:
+            return True
+    return False
+
+
+def upgrade_config(raw: dict[str, Any] | None) -> dict[str, Any]:
+    """Bring any stored/submitted config to version 2 (a copy; ``raw`` is not modified).
+
+    * ``items.name_language`` is accepted and dropped (the layout language decides which name prints).
+    * A version-1 config (or one without ``v``) that has no ``style.language`` gets ``both`` when it
+      carries an edited Urdu caption or footer, otherwise ``en``.
+    """
+    import copy
+
+    cfg = copy.deepcopy(raw) if isinstance(raw, dict) else {}
+    version = cfg.get("v", 1)
+    if isinstance(version, int) and version > CONFIG_VERSION:
+        raise ValueError(f"unsupported layout config version {version}")
+    items = cfg.get("items")
+    if isinstance(items, dict):
+        items.pop("name_language", None)
+    style = cfg.get("style")
+    if style is None:
+        style = cfg["style"] = {}
+    if isinstance(style, dict) and "language" not in style:
+        style["language"] = "both" if _edited_urdu(cfg) else "en"
+    cfg["v"] = CONFIG_VERSION
+    return cfg
+
+
 def normalise_config(raw: dict[str, Any] | None) -> dict[str, Any]:
-    """Validate ``raw`` and return the full config (all defaults, all labels) as plain JSON."""
-    cfg = LayoutConfig.model_validate(raw or {}).with_defaults()
+    """Validate ``raw`` and return the full config (all defaults, all labels) as plain JSON, version 2."""
+    cfg = LayoutConfig.model_validate(upgrade_config(raw)).with_defaults()
     return cfg.model_dump(mode="json")
 
 
 def default_config(design: str, *, pharmacy: bool = False) -> dict[str, Any]:
-    """Starting config of a design (full JSON, version 1)."""
+    """Starting config of a design (full JSON, version 2)."""
     if design not in DESIGNS:
         raise ValueError(f"unknown design {design!r}")
-    raw: dict[str, Any] = {"v": 1}
+    raw: dict[str, Any] = {"v": CONFIG_VERSION}
     if design == "thermal_compact":
-        raw["style"] = {"compact_items": True, "font_scale": 0.9}
+        raw["style"] = {"compact_items": True, "font_scale": 0.9, "language": "en"}
         raw["meta"] = {"show_cashier": False, "show_customer": False}
         raw["footer"] = {"show_qr": False}
     elif design == "a4_tax_invoice":

@@ -71,6 +71,14 @@ class CreateUnitConversionRequest(BaseSchema):
         return value
 
 
+class NewBarcodeInput(BaseSchema):
+    """A barcode supplied inline while creating a product / variation (same rules as CreateBarcodeRequest)."""
+
+    barcode: str = Field(min_length=4, max_length=100)
+    barcode_type: str = "EAN13"
+    is_primary: bool = False
+
+
 class CreateVariationRequest(BaseSchema):
     # Variation SKU: unique within business (ignore soft-deleted) — enforced in service.
     name: str = Field(min_length=1, max_length=100)
@@ -78,6 +86,8 @@ class CreateVariationRequest(BaseSchema):
     unit_id: UUID | None = None
     is_default: bool = False
     weight_grams: Decimal | None = None
+    # Barcodes created together with this variation (all-or-nothing with the product).
+    barcodes: list[NewBarcodeInput] = Field(default_factory=list)
 
     @field_validator("weight_grams")
     @classmethod
@@ -127,6 +137,9 @@ class CreateProductRequest(BaseSchema):
         default_factory=list,
         description="If empty, service creates a default variation",
     )
+    # Product-level barcodes (not tied to a variation). Variation barcodes go in
+    # ``variations[].barcodes``. Everything is created in one transaction.
+    barcodes: list[NewBarcodeInput] = Field(default_factory=list)
 
     @field_validator("shelf_life_days")
     @classmethod
@@ -287,6 +300,14 @@ class VariationResponse(ProductAuditSchema):
     unit: UnitResponse | None = None
 
 
+class CategoryBrief(BaseSchema):
+    """Slim category reference embedded in product responses (never carries children)."""
+
+    id: UUID
+    name: str
+    parent_id: UUID | None = None
+
+
 class CategoryResponse(ProductAuditSchema):
     id: UUID
     business_id: UUID
@@ -373,7 +394,7 @@ class ProductResponse(ProductAuditSchema):
     name_secondary: str | None = None
     min_stock_level: Decimal | None
     max_stock_level: Decimal | None
-    category: CategoryResponse | None = None
+    category: CategoryBrief | None = None
     brand: BrandResponse | None = None
     base_unit: UnitResponse | None = None
     variations: list[VariationResponse] = Field(default_factory=list)

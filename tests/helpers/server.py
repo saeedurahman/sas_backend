@@ -8,9 +8,11 @@ its own app process against the test database (``TEST_DATABASE_URL``).
 from __future__ import annotations
 
 import os
+import re
 import socket
 import subprocess
 import sys
+import tempfile
 import time
 from contextlib import contextmanager
 from pathlib import Path
@@ -65,6 +67,27 @@ RELAXED_ENV.update(
 )
 
 
+# Safety net for async lazy-loading bugs. A response schema that touches a relationship the
+# service did not eager-load raises MissingGreenlet while FastAPI serializes the response; the
+# client only sees a bare 500, the traceback goes to the server's stderr. Every managed server
+# logs stderr to a file; `greenlet_errors` / the teardown below fail the run if one shows up.
+GREENLET_ERROR = re.compile(r"MissingGreenlet|greenlet_spawn has not been called")
+
+# api base url -> server log file (lets a test inspect the log of the server it talks to)
+SERVER_LOGS: dict[str, Path] = {}
+
+
+def greenlet_errors(log_path: Path, start: int = 0) -> list[str]:
+    """Return log lines (from byte offset ``start``) that report an async lazy-load failure."""
+    try:
+        with open(log_path, "rb") as fh:
+            fh.seek(start)
+            text = fh.read().decode("utf8", "replace")
+    except OSError:
+        return []
+    return [ln.strip() for ln in text.splitlines() if GREENLET_ERROR.search(ln)]
+
+
 def _free_port() -> int:
     with socket.socket() as sock:
         sock.bind(("127.0.0.1", 0))
@@ -79,6 +102,10 @@ def managed_server(env: dict[str, str] | None = None):
     # unreachable URL for the DB-down test).
     test_db = {"DATABASE_URL": require_test_database_url()}
     child_env = {**os.environ, **RELAXED_ENV, **test_db, **(env or {})}
+    log_fh = tempfile.NamedTemporaryFile(
+        prefix="sas-test-server-", suffix=".log", delete=False
+    )
+    log_path = Path(log_fh.name)
     proc = subprocess.Popen(
         [
             sys.executable,
@@ -95,8 +122,9 @@ def managed_server(env: dict[str, str] | None = None):
         cwd=ROOT,
         env=child_env,
         stdout=subprocess.DEVNULL,
-        stderr=subprocess.DEVNULL,
+        stderr=log_fh,
     )
+    log_fh.close()  # the child keeps its own handle
     health = f"http://127.0.0.1:{port}/health"
     try:
         deadline = time.monotonic() + 40
@@ -111,10 +139,23 @@ def managed_server(env: dict[str, str] | None = None):
                 time.sleep(0.3)
         else:
             raise RuntimeError("test server did not become healthy")
-        yield f"http://127.0.0.1:{port}/api/v1"
+        base = f"http://127.0.0.1:{port}/api/v1"
+        SERVER_LOGS[base] = log_path
+        yield base
     finally:
         proc.terminate()
         try:
             proc.wait(timeout=10)
         except subprocess.TimeoutExpired:
             proc.kill()
+        SERVER_LOGS.pop(f"http://127.0.0.1:{port}/api/v1", None)
+        errors = greenlet_errors(log_path)
+        if not errors:
+            log_path.unlink(missing_ok=True)
+        else:
+            # Fails the test/session that owned the server (fixture teardown error).
+            raise AssertionError(
+                "Response serialization hit an async lazy load (MissingGreenlet); "
+                f"eager-load the relationship or use a slimmer response schema. Log: {log_path}\n"
+                + "\n".join(errors[:5])
+            )
