@@ -18,7 +18,7 @@ from app.schemas.sync import (
     SnapshotResponse,
 )
 from app.core.config import settings
-from app.services import sync_feed
+from app.services import receipt_settings, sync_feed
 from app.services.sync_devices import rate_limit_device, touch_device
 from app.services.sync_push import PUSH_PERMISSIONS, process_push
 
@@ -59,12 +59,16 @@ async def pull_changes(
 ):
     business_id, user_id = current_user.business_id, current_user.id
     rate_limit_device("pull", business_id, device_id)
-    await touch_device(
+    short_code = await touch_device(
         db, business_id=business_id, user_id=user_id, device_id=device_id, app_version=app_version
     )
-    return await sync_feed.pull(
+    result = await sync_feed.pull(
         db, current_user, since=since, limit=limit, branch_id=branch_id
     )
+    cfg = await receipt_settings.load_settings(db, business_id)
+    result["device_short_code"] = short_code
+    result["number_prefix"] = cfg[receipt_settings.KEY_NUMBER_PREFIX]
+    return result
 
 
 @router.get(
@@ -111,7 +115,7 @@ async def push_ops(
             },
         )
     rate_limit_device("push", current_user.business_id, data.device_id)
-    await touch_device(
+    short_code = await touch_device(
         db,
         business_id=current_user.business_id,
         user_id=current_user.id,
@@ -121,7 +125,8 @@ async def push_ops(
     )
     results = await process_push(db, current_user, data)
     return PushResponse(
-        batch_id=data.batch_id, server_time=datetime.now(timezone.utc), results=results
+        batch_id=data.batch_id, server_time=datetime.now(timezone.utc), results=results,
+        device_short_code=short_code,
     )
 
 

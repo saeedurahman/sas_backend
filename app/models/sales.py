@@ -3,7 +3,7 @@ from datetime import datetime
 from decimal import Decimal
 from typing import TYPE_CHECKING, Any
 
-from sqlalchemy import Boolean, DateTime, ForeignKey, Integer, Numeric, String, Text, Uuid
+from sqlalchemy import BigInteger, Boolean, DateTime, ForeignKey, Integer, Numeric, String, Text, Uuid
 from sqlalchemy.dialects.postgresql import JSONB
 from sqlalchemy.orm import Mapped, mapped_column, relationship
 
@@ -215,6 +215,8 @@ class Sale(Base, AuditMixin, SoftDeleteMixin, SyncMixin):
         nullable=True,
     )
     sale_number: Mapped[str] = mapped_column(String(50), nullable=False)
+    # Numeric counter behind the official number (NULL for numbers issued before it existed).
+    sale_seq: Mapped[int | None] = mapped_column(BigInteger, nullable=True)
     sale_type: Mapped[str] = mapped_column(
         sale_type_enum, nullable=False, default="pos"
     )

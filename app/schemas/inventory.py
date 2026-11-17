@@ -2,7 +2,7 @@ from datetime import date, datetime
 from decimal import Decimal
 from uuid import UUID
 
-from pydantic import EmailStr, Field, field_validator, model_validator
+from pydantic import AliasChoices, EmailStr, Field, field_validator, model_validator
 
 from app.models.enums import (
     AdjustmentReasonEnum,
@@ -27,7 +27,7 @@ class CreatePurchaseLineRequest(BaseSchema):
     ordered_qty: Decimal
     cost_per_unit: Decimal
     tax_rate: Decimal = Decimal("0")
-    batch_number: str | None = None
+    batch_number: str | None = Field(default=None, validation_alias=AliasChoices("batch_number", "batch_no"))
     expiry_date: date | None = None
 
     @field_validator("ordered_qty")
@@ -78,7 +78,7 @@ class CreateReceiptLineRequest(BaseSchema):
     purchase_line_id: UUID | None = None
     qty_received: Decimal
     cost_per_unit: Decimal
-    batch_number: str | None = None
+    batch_number: str | None = Field(default=None, validation_alias=AliasChoices("batch_number", "batch_no"))
     expiry_date: date | None = None
 
     @field_validator("qty_received")
@@ -118,6 +118,9 @@ class CreateAdjustmentLineRequest(BaseSchema):
     qty_delta: Decimal
     # Ignored: cost is derived from FIFO layers (opening_balance adjustments excepted).
     cost_per_unit: Decimal | None = None
+    # Stock added (qty_delta > 0) opens a layer carrying this batch/expiry.
+    batch_number: str | None = Field(default=None, max_length=100, validation_alias=AliasChoices("batch_number", "batch_no"))
+    expiry_date: date | None = None
     notes: str | None = None
 
     @field_validator("qty_delta")
@@ -192,7 +195,7 @@ class CreateWasteLineRequest(BaseSchema):
     qty: Decimal
     # Ignored: cost is derived from FIFO layers.
     cost_per_unit: Decimal | None = None
-    batch_number: str | None = None
+    batch_number: str | None = Field(default=None, validation_alias=AliasChoices("batch_number", "batch_no"))
     expiry_date: date | None = None
 
     @field_validator("qty")

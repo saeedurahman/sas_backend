@@ -11,13 +11,16 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.orm import selectinload
 
 from app.models.business import Business
-from app.models.product import ProductVariation
-from app.models.sales import Sale, SaleLine
+from app.models.product import Barcode, Product, ProductVariation
+from app.models.receipt_layout import SaleLineBatch
+from app.models.register import CashRegister, RegisterShift
+from app.models.sales import CustomerLedger, Sale, SaleLine
 from app.models.user import User
 from app.schemas.invoice import (
     BusinessInfoForInvoice,
     CustomerInfoForInvoice,
     InvoiceData,
+    InvoiceLineBatch,
     InvoiceLineItem,
     InvoicePaymentItem,
     InvoiceSummary,
@@ -69,7 +72,8 @@ async def _load_sale_for_invoice(
             selectinload(Sale.customer),
             selectinload(Sale.payments),
             selectinload(Sale.lines)
-            .selectinload(SaleLine.product),
+            .selectinload(SaleLine.product)
+            .selectinload(Product.base_unit),
             selectinload(Sale.lines)
             .selectinload(SaleLine.variation)
             .selectinload(ProductVariation.unit),
@@ -91,6 +95,97 @@ async def _get_cashier_name(
     result = await db.execute(select(User.full_name).where(User.id == user_id))
     name = result.scalar_one_or_none()
     return name or "Unknown"
+
+
+def visible_variation_name(name: str | None) -> str | None:
+    """A variation is only worth printing when it has a real name ("Default" is the placeholder)."""
+    if name is None:
+        return None
+    cleaned = name.strip()
+    if not cleaned or cleaned.casefold() == "default":
+        return None
+    return cleaned
+
+
+async def _line_batches(
+    db: AsyncSession, business_id: UUID, line_ids: list[UUID]
+) -> dict[UUID, list[InvoiceLineBatch]]:
+    if not line_ids:
+        return {}
+    rows = (
+        await db.execute(
+            select(SaleLineBatch)
+            .where(SaleLineBatch.business_id == business_id, SaleLineBatch.sale_line_id.in_(line_ids))
+            .order_by(SaleLineBatch.created_at, SaleLineBatch.id)
+        )
+    ).scalars().all()
+    out: dict[UUID, list[InvoiceLineBatch]] = {}
+    for row in rows:
+        out.setdefault(row.sale_line_id, []).append(
+            InvoiceLineBatch(batch_no=row.batch_no, expiry_date=row.expiry_date, qty=row.qty)
+        )
+    return out
+
+
+async def _primary_barcodes(
+    db: AsyncSession, business_id: UUID, product_ids: list[UUID]
+) -> dict[UUID, str]:
+    if not product_ids:
+        return {}
+    rows = (
+        await db.execute(
+            select(Barcode.product_id, Barcode.barcode)
+            .where(
+                Barcode.business_id == business_id,
+                Barcode.product_id.in_(product_ids),
+                Barcode.deleted_at.is_(None),
+            )
+            .order_by(Barcode.is_primary.desc(), Barcode.created_at)
+        )
+    ).all()
+    out: dict[UUID, str] = {}
+    for product_id, code in rows:
+        out.setdefault(product_id, code)
+    return out
+
+
+async def _register_name(db: AsyncSession, business_id: UUID, shift_id: UUID | None) -> str | None:
+    if shift_id is None:
+        return None
+    return (
+        await db.execute(
+            select(CashRegister.name)
+            .join(RegisterShift, RegisterShift.cash_register_id == CashRegister.id)
+            .where(RegisterShift.id == shift_id, RegisterShift.business_id == business_id)
+        )
+    ).scalar_one_or_none()
+
+
+async def _customer_balances(
+    db: AsyncSession, business_id: UUID, sale: Sale
+) -> tuple[Decimal | None, Decimal | None]:
+    """(previous, after) as amounts the customer owes: before this sale, and including it."""
+    if sale.customer_id is None:
+        return None, None
+    rows = (
+        await db.execute(
+            select(CustomerLedger.amount, CustomerLedger.reference_id)
+            .where(
+                CustomerLedger.business_id == business_id,
+                CustomerLedger.customer_id == sale.customer_id,
+                CustomerLedger.deleted_at.is_(None),
+                CustomerLedger.entry_at <= sale.sold_at,
+            )
+        )
+    ).all()
+    own = _ZERO
+    others = _ZERO
+    for amount, reference_id in rows:
+        if reference_id == sale.id:
+            own += Decimal(str(amount))
+        else:
+            others += Decimal(str(amount))
+    return _round2(-others), _round2(-(others + own))
 
 
 def tax_breakdown_for_lines(lines: list[SaleLine], label: str) -> list[InvoiceTaxBreakdownItem]:
@@ -218,21 +313,36 @@ async def get_invoice_data(
     ]
     active_lines.sort(key=lambda ln: ln.line_order)
 
+    batches = await _line_batches(db, business_id, [ln.id for ln in active_lines])
+    barcodes = await _primary_barcodes(db, business_id, [ln.product_id for ln in active_lines])
     invoice_lines: list[InvoiceLineItem] = []
     for line in active_lines:
         unit_symbol: str | None = None
         variation_name: str | None = None
+        allows_decimal = False
         if line.variation is not None:
-            variation_name = line.variation.name
+            variation_name = visible_variation_name(line.variation.name)
             if line.variation.unit is not None:
                 unit_symbol = line.variation.unit.symbol
+                allows_decimal = bool(line.variation.unit.allows_decimal)
+        if unit_symbol is None and line.product.base_unit is not None:
+            unit_symbol = line.product.base_unit.symbol
+            allows_decimal = bool(line.product.base_unit.allows_decimal)
+        sku = line.product.sku
+        if line.variation is not None and line.variation.sku:
+            sku = line.variation.sku
 
         line_total = _round2(line.net_amount + line.tax_amount)
         invoice_lines.append(
             InvoiceLineItem(
                 line_order=line.line_order,
                 product_name=line.product.name,
+                product_name_secondary=line.product.name_secondary,
                 variation_name=variation_name,
+                sku=sku,
+                barcode=barcodes.get(line.product_id),
+                unit_allows_decimal=allows_decimal,
+                batches=batches.get(line.id, []),
                 qty=line.qty,
                 unit=unit_symbol,
                 unit_price=line.unit_price,
@@ -261,6 +371,8 @@ async def get_invoice_data(
     cfg = await load_tax_settings(db, business_id)
     summary = _build_summary(sale, active_lines, active_payments, cfg)
     cashier_name = await _get_cashier_name(db, sale.created_by)
+    register_name = await _register_name(db, business_id, sale.register_shift_id)
+    previous_balance, balance_after = await _customer_balances(db, business_id, sale)
 
     return InvoiceData(
         sale_id=sale.id,
@@ -281,6 +393,10 @@ async def get_invoice_data(
         summary=summary,
         receipt_footer=receipt_footer,
         printed_at=_now(),
+        register_name=register_name,
+        customer_previous_balance=previous_balance,
+        customer_balance_after=balance_after,
+        synced=True,
     )
 
 

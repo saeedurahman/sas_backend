@@ -492,6 +492,30 @@ async def _load_inventory(db: AsyncSession, ctx: ExportCtx) -> list[dict[str, An
     ]
 
 
+async def _load_expiry(db: AsyncSession, ctx: ExportCtx) -> list[dict[str, Any]]:
+    from app.services.expiry_report import expiry_rows
+
+    rows = await expiry_rows(
+        db, ctx.business_id, within_days=90, branch_ids=[ctx.branch_id] if ctx.branch_id else None
+    )
+    return [
+        {
+            "status": "expired" if r["days_to_expiry"] < 0 else "near_expiry",
+            "product": r["product"],
+            "variation": r["variation"] or "",
+            "sku": r["sku"] or "",
+            "branch": r["branch"] or "",
+            "batch_no": r["batch_no"] or "",
+            "expiry_date": r["expiry_date"],
+            "days_to_expiry": r["days_to_expiry"],
+            "qty": r["qty"],
+            "cost_per_unit": r["cost_per_unit"],
+            "value": r["value"],
+        }
+        for r in rows
+    ]
+
+
 async def _load_profit_loss(db: AsyncSession, ctx: ExportCtx) -> list[dict[str, Any]]:
     pl = await analytics.get_profit_loss(db, ctx.business_id, ctx.date_from, ctx.date_to, ctx.branch_id)
     rows = [
@@ -608,6 +632,15 @@ DATASETS: dict[str, Dataset] = {
             _cols("product variation branch qty:qty avg_cost:money total_value:money"),
             "Stock valuation per product and branch, as of now",
             uses_branch=True, extra_permission="inventory.view", loader=_load_inventory,
+        ),
+        Dataset(
+            "expiry",
+            _cols(
+                "status product variation sku branch batch_no expiry_date:date days_to_expiry:int "
+                "qty:qty cost_per_unit:money value:money"
+            ),
+            "Expired stock and stock expiring within 90 days, with value at layer cost",
+            uses_branch=True, extra_permission="inventory.view", loader=_load_expiry,
         ),
         Dataset(
             "products",

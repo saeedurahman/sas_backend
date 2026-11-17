@@ -208,6 +208,7 @@ def test_error_codes_are_stable_strings():
         "cost_estimated", "shift_mismatch", "subscription_expired",
         "modifier_price_mismatch", "unknown_modifier",
         "rounding_mismatch", "total_mismatch", "settings_mismatch",
+        "expired_batch_sold", "batch_mismatch",
     }
 
 

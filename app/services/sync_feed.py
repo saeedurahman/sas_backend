@@ -34,7 +34,7 @@ from app.dependencies import (
     user_roles_for_response,
 )
 from app.models.user import Role, RolePermission, User, UserRole
-from app.services import subscription as sub
+from app.services import receipt_settings, subscription as sub
 from app.services.tax_settings import load_tax_settings
 
 DEFAULT_LIMIT = 500
@@ -137,6 +137,9 @@ class Entity:
     branch_col: str | None = None  # column limited to the caller's branches
     exclude: tuple[str, ...] = ()
     builder: str | None = None  # custom materialisation
+    branch_nullable: bool = False  # NULL branch = business-wide row, visible to every branch
+    live_sql: str | None = None  # extra predicate a row must satisfy to be served
+    gone_sql: str | None = None  # extra condition that turns a row into a tombstone
 
 
 # Snapshot order: reference data first, so a half-applied snapshot is still self-consistent.
@@ -168,6 +171,14 @@ ENTITIES: tuple[Entity, ...] = (
     Entity("register_shift", "register_shifts", _REGISTER_SHIFT_PERMS, branch_col="branch_id", builder="register_shift"),
     Entity("sale_summary", "sales", _SALE_PERMS, branch_col="branch_id", builder="sale_summary"),
     Entity("customer_balance", "customers", ("customers.view", "sales.create"), builder="customer_balance"),
+    Entity("receipt_layout", "receipt_layouts", None),
+    Entity("receipt_layout_assignment", "receipt_layout_assignments", None,
+           branch_col="branch_id", branch_nullable=True),
+    # Stock per batch/expiry, derived from FIFO layers that still hold stock.
+    Entity("stock_batch", "purchase_lines", ("inventory.view", "sales.create"),
+           branch_col="branch_id", builder="stock_batch",
+           live_sql="(t.batch_number IS NOT NULL OR t.expiry_date IS NOT NULL)",
+           gone_sql="t.qty_remaining <= 0"),
 )
 ENTITY_BY_NAME = {e.name: e for e in ENTITIES}
 # Aliases for convenience / backward-compatibility
@@ -242,8 +253,12 @@ async def _select_rows(
 ) -> list[dict[str, Any]]:
     where = ["t.business_id = :business_id"]
     params: dict[str, Any] = {"business_id": scope.business_id, "limit": limit}
+    if entity.live_sql:
+        where.append(entity.live_sql)
     if snapshot:
         where.append("t.deleted_at IS NULL")
+        if entity.gone_sql:
+            where.append(f"NOT ({entity.gone_sql})")
         if after_id is not None:
             where.append("t.id > :after_id")
             params["after_id"] = after_id
@@ -254,7 +269,10 @@ async def _select_rows(
         order = "t.change_seq"
     if scope.branches is not None:
         if entity.branch_col:
-            where.append(f"t.{entity.branch_col} = ANY(CAST(:branches AS uuid[]))")
+            cond = f"t.{entity.branch_col} = ANY(CAST(:branches AS uuid[]))"
+            if entity.branch_nullable:
+                cond = f"(t.{entity.branch_col} IS NULL OR {cond})"
+            where.append(cond)
             params["branches"] = scope.branches
         elif entity.name == "user":
             where.append(
@@ -274,8 +292,9 @@ async def _select_rows(
         where.append("t.sold_at >= :history_cutoff")
         params["history_cutoff"] = cutoff
     exclude = [*_BOOKKEEPING, *entity.exclude]
+    gone = "t.deleted_at IS NOT NULL" + (f" OR ({entity.gone_sql})" if entity.gone_sql else "")
     sql = (
-        f"SELECT t.id, t.change_seq AS seq, (t.deleted_at IS NOT NULL) AS is_deleted, "
+        f"SELECT t.id, t.change_seq AS seq, ({gone}) AS is_deleted, "
         f"(to_jsonb(t) - CAST(:exclude AS text[]))::text AS data FROM {entity.table} t "  # noqa: S608
         f"WHERE {' AND '.join(where)} ORDER BY {order} LIMIT :limit"
     )
@@ -332,6 +351,7 @@ async def _materialise(
             state = sub.compute_state(business)
             contact = sub.contact_from_settings(await sub.load_platform_settings(db))
             cfg_json = data.get("config_json") or {}
+            extra_settings: dict[str, Any] = {}
             receipt_footer = cfg_json.get("receipt_footer")
             tax_labels = cfg_json.get("tax_labels")
             app_settings_rows = (
@@ -339,7 +359,9 @@ async def _materialise(
                     text(
                         "SELECT setting_key, setting_value FROM app_settings "
                         "WHERE business_id = :b AND branch_id IS NULL AND deleted_at IS NULL "
-                        "AND setting_key IN ('receipt.footer_text', 'tax.labels')"
+                        "AND (setting_key IN ('receipt.footer_text', 'tax.labels') "
+                        "OR setting_key LIKE 'sales.invoice_%' OR setting_key = 'receipt.number_prefix' "
+                        "OR setting_key = 'inventory.pick_policy' OR setting_key = 'inventory.expired_sale')"
                     ),
                     {"b": user.business_id},
                 )
@@ -352,11 +374,14 @@ async def _materialise(
                     receipt_footer = str(val) if val is not None else None
                 elif k == "tax.labels" and tax_labels is None:
                     tax_labels = val if isinstance(val, dict) else {}
+                elif k in receipt_settings.DEFAULTS:
+                    extra_settings[k] = val
 
             tax_cfg = await load_tax_settings(db, user.business_id)
+            number_cfg = {**receipt_settings.DEFAULTS, **extra_settings}
             built[row["id"]] = {
                 # tax.* and ui.hide_zero_decimals so offline devices price like the server.
-                "app_settings": tax_cfg.as_settings_map(),
+                "app_settings": {**tax_cfg.as_settings_map(), **number_cfg},
                 "business_name": business.name,
                 "legal_name": business.legal_name,
                 "currency_code": business.currency_code,
@@ -385,6 +410,20 @@ async def _materialise(
                     "days_left": state.days_left,
                     "contact": contact,
                 },
+            }
+    elif entity.builder == "stock_batch":
+        for row in live:
+            d = row["data"]
+            built[row["id"]] = {
+                "id": d.get("id"),
+                "branch_id": d.get("branch_id"),
+                "product_id": d.get("product_id"),
+                "variation_id": d.get("variation_id"),
+                "batch_no": d.get("batch_number"),
+                "expiry_date": d.get("expiry_date"),
+                "qty_remaining": d.get("qty_remaining"),
+                "cost_per_unit": d.get("cost_per_unit"),
+                "received_at": d.get("created_at"),
             }
     elif entity.builder == "role":
         roles = (

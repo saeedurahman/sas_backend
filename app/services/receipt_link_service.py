@@ -126,6 +126,34 @@ async def issue_link(
     return IssuedLink(build_url(token, request_base_url), link.expires_at, token)
 
 
+async def link_url_for_sale(
+    db: AsyncSession,
+    business_id: UUID,
+    sale_id: UUID,
+    created_by: UUID,
+    request_base_url: str | None,
+) -> str:
+    """URL of a live public link for the sale: reuse the newest valid one, else issue one."""
+    now = datetime.now(timezone.utc)
+    link = (
+        await db.execute(
+            select(ReceiptLink)
+            .where(
+                ReceiptLink.business_id == business_id,
+                ReceiptLink.sale_id == sale_id,
+                ReceiptLink.revoked_at.is_(None),
+                ReceiptLink.expires_at > now,
+            )
+            .order_by(ReceiptLink.created_at.desc())
+            .limit(1)
+        )
+    ).scalar_one_or_none()
+    if link is not None:
+        return build_url(make_token(link.id), request_base_url)
+    sale = await _load_sale(db, business_id, sale_id)
+    return (await issue_link(db, business_id, sale, created_by, request_base_url)).url
+
+
 async def issue_for_sale_id(
     db: AsyncSession,
     business_id: UUID,

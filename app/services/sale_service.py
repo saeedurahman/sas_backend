@@ -50,9 +50,12 @@ from app.services.discount_engine import (
 )
 from app.services.price_service import apply_sale_price_rules, get_product_price
 from app.services.audit_helper import log_audit
+from app.services.receipt_settings import inventory_policy
 from app.services.fifo_service import (
     allocate_sale_line_fifo,
+    allocation_differs,
     create_sale_line_stock_movements,
+    record_sale_line_batches,
     maybe_notify_fifo_shortfall,
     restore_sale_line_inventory,
 )
@@ -65,10 +68,10 @@ from app.services.tax_service import resolve_line_tax_rates
 from app.services.pricing_engine import determine_sale_status, price_cart
 from app.services.tax_settings import load_tax_settings
 from app.services.return_service import get_returned_qty_by_sale_line_ids
+from app.services.receipt_settings import generate_sale_number
 from app.services.stock_service import (
     _now,
     check_sufficient_stock,
-    generate_document_number,
     get_allow_negative_stock,
     lock_stock_positions,
     verify_branch,
@@ -576,11 +579,11 @@ async def create_sale(
         if not allow_negative:
             await _assert_stock_available(db, business_id, data.branch_id, data.lines)
 
-        sale_number = await generate_document_number(
-            db, business_id, "INV", Sale, Sale.sale_number
-        )
+        sale_number, sale_seq = await generate_sale_number(db, business_id)
 
         line_snapshots: list[dict] = []
+        _pick_policy, expired_mode = await inventory_policy(db, business_id)
+        sale_flags: list[str] = []
 
         for line_index, line_data in enumerate(data.lines):
             preview_line = pricing.lines[line_index]
@@ -591,7 +594,17 @@ async def create_sale(
                 line_data.product_id,
                 line_data.variation_id,
                 line_data.qty,
+                expired_mode=expired_mode,
+                pick_policy=_pick_policy,
             )
+            if (
+                expired_mode == "warn"
+                and any(c.expired for c in consumptions)
+                and "expired_batch_sold" not in sale_flags
+            ):
+                sale_flags.append("expired_batch_sold")
+            if allocation_differs(line_data.batches, consumptions) and "batch_mismatch" not in sale_flags:
+                sale_flags.append("batch_mismatch")
             consumed_from_layers = line_data.qty - short_qty
             line_snapshots.append(
                 {
@@ -617,6 +630,7 @@ async def create_sale(
             register_shift_id=shift.id,
             price_list_id=data.price_list_id,
             sale_number=sale_number,
+            sale_seq=sale_seq,
             sale_type=data.sale_type.value,
             status=sale_status.value,
             sold_at=sold_at,
@@ -626,6 +640,7 @@ async def create_sale(
             tax_rounding_mode=pricing.tax_rounding_mode,
             rounding_amount=pricing.rounding_amount,
             tax_label=pricing.tax_label,
+            sync_flags=sale_flags,
             created_by=created_by,
             created_at=now,
             updated_at=now,
@@ -706,6 +721,10 @@ async def create_sale(
                 consumptions=snapshot["consumptions"],
                 created_by=created_by,
                 movement_at=sold_at,
+            )
+            await record_sale_line_batches(
+                db, business_id=business_id, sale_line_id=sale_line.id,
+                consumptions=snapshot["consumptions"],
             )
             short_qty = snapshot["short_qty"]
             if short_qty > _ZERO:

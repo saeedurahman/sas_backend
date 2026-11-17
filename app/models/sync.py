@@ -32,6 +32,7 @@ class SyncDevice(Base):
     )
     revoked_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
     revoked_by: Mapped[uuid.UUID | None] = mapped_column(Uuid(as_uuid=True), nullable=True)
+    short_code: Mapped[str | None] = mapped_column(String(4), nullable=True)
 
 
 class SyncOp(Base):

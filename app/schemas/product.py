@@ -48,11 +48,13 @@ class CreateUnitRequest(BaseSchema):
     name: str = Field(min_length=1, max_length=50)
     symbol: str = Field(min_length=1, max_length=10)
     is_base_unit: bool = False
+    allows_decimal: bool = False  # kg/litre/metre style units; receipts print qty decimals only then
 
 
 class UpdateUnitRequest(BaseSchema):
     name: str | None = Field(default=None, min_length=1, max_length=50)
     symbol: str | None = Field(default=None, min_length=1, max_length=10)
+    allows_decimal: bool | None = None
     is_active: bool | None = None
 
 
@@ -117,6 +119,8 @@ class CreateProductRequest(BaseSchema):
     description: str | None = None
     image_url: str | None = None
     shelf_life_days: int | None = None
+    track_expiry: bool = False
+    name_secondary: str | None = Field(default=None, max_length=255)
     min_stock_level: Decimal | None = None
     max_stock_level: Decimal | None = None
     variations: list[CreateVariationRequest] = Field(
@@ -146,6 +150,8 @@ class UpdateProductRequest(BaseSchema):
     description: str | None = None
     image_url: str | None = None
     shelf_life_days: int | None = None
+    track_expiry: bool | None = None
+    name_secondary: str | None = Field(default=None, max_length=255)
     min_stock_level: Decimal | None = None
     max_stock_level: Decimal | None = None
 
@@ -210,6 +216,7 @@ class UnitResponse(ProductAuditSchema):
     name: str
     symbol: str
     is_base_unit: bool
+    allows_decimal: bool = False
     is_active: bool
 
     @model_validator(mode="before")
@@ -223,6 +230,7 @@ class UnitResponse(ProductAuditSchema):
             "name": data.name,
             "symbol": data.symbol,
             "is_base_unit": data.is_base_unit,
+            "allows_decimal": data.allows_decimal,
             "is_active": data.deleted_at is None,
             "created_at": data.created_at,
             "updated_at": data.updated_at,
@@ -361,6 +369,8 @@ class ProductResponse(ProductAuditSchema):
     description: str | None
     image_url: str | None
     shelf_life_days: int | None
+    track_expiry: bool = False
+    name_secondary: str | None = None
     min_stock_level: Decimal | None
     max_stock_level: Decimal | None
     category: CategoryResponse | None = None

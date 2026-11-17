@@ -11,7 +11,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from app.models.sales import TaxRate
 from app.models.settings import AppSetting
 from app.schemas.settings import BulkUpsertSettingsRequest, UpsertSettingRequest
-from app.services import tax_settings
+from app.services import receipt_settings, tax_settings
 from app.services.audit_helper import log_audit
 from app.services.stock_service import verify_branch
 
@@ -194,6 +194,14 @@ async def _upsert_one(
                     detail="tax.default_rate_id must be one of this business's tax rates",
                 )
 
+    if key in receipt_settings.SETTING_KEYS:
+        if item.branch_id is not None:
+            raise HTTPException(
+                status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+                detail=f"{key} is a business-wide setting and cannot be set per branch",
+            )
+        value = receipt_settings.validate_setting_payload(key, value)
+
     now = _now()
     result = await db.execute(
         select(AppSetting).where(
@@ -296,7 +304,7 @@ def with_tax_defaults(
     ]
     present = {r.setting_key for r in rows}
     epoch = datetime(1970, 1, 1, tzinfo=timezone.utc)
-    for key, default in tax_settings.DEFAULTS.items():
+    for key, default in {**tax_settings.DEFAULTS, **receipt_settings.DEFAULTS}.items():
         if key in present:
             continue
         out.append(

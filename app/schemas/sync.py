@@ -32,6 +32,8 @@ class PullResponse(BaseSchema):
     full_resync_reason: str | None = None
     permissions_version: str
     entities: list[str]  # entity types this user receives
+    device_short_code: str | None = None  # this device's register code (receipt numbers)
+    number_prefix: str = ""  # receipt.number_prefix setting
     restricted: bool = False  # blocked subscription: only the expired-screen data is served
 
 
@@ -78,6 +80,7 @@ class PushResponse(BaseSchema):
     batch_id: str
     server_time: datetime
     results: list[OpResult]
+    device_short_code: str | None = None
 
 
 class OpEnvelope(BaseSchema):
@@ -149,6 +152,14 @@ class SaleLineModifierPayload(BaseSchema):
         return self
 
 
+class SaleLineBatchPayload(BaseSchema):
+    """The device's batch allocation for a line; the server consumes by its own policy."""
+
+    batch_no: str | None = Field(default=None, max_length=100)
+    expiry_date: date | None = None
+    qty: Decimal
+
+
 class SaleLinePayload(BaseSchema):
     id: UUID | None = None  # client line id, so a later return can reference the line
     product_id: UUID
@@ -162,6 +173,7 @@ class SaleLinePayload(BaseSchema):
     notes: str | None = None
     line_order: int | None = None
     modifiers: list[SaleLineModifierPayload] = Field(default_factory=list)
+    batches: list[SaleLineBatchPayload] = Field(default_factory=list)
 
     @model_validator(mode="after")
     def _check(self) -> "SaleLinePayload":
@@ -325,10 +337,15 @@ class DeviceResponse(BaseSchema):
     device_id: str
     name: str | None = None
     app_version: str | None = None
+    short_code: str | None = None
     last_user_id: UUID | None = None
     first_seen_at: datetime
     last_seen_at: datetime
     revoked_at: datetime | None = None
+
+
+class DeviceUpdate(BaseSchema):
+    short_code: str = Field(min_length=2, max_length=4)
 
 
 class FlaggedSale(BaseSchema):

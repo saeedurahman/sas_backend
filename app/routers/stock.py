@@ -2,7 +2,7 @@ from uuid import UUID
 
 from fastapi import APIRouter, Depends, Query, status
 
-from app.branch_scope import required_branch_query, scoped_branch_query
+from app.branch_scope import allowed_branch_ids, required_branch_query, scoped_branch_query
 from app.database import get_db
 from app.dependencies import require_permission
 from app.models.user import User
@@ -18,6 +18,26 @@ from app.services.stock_service import (
 )
 
 router = APIRouter(prefix="/stock", tags=["Stock"])
+
+
+@router.get("/expiry-report", status_code=status.HTTP_200_OK)
+async def expiry_report_endpoint(
+    within_days: int = Query(default=30, ge=0, le=730),
+    branch_id: UUID | None = Depends(scoped_branch_query),
+    current_user: User = Depends(require_permission("inventory.view")),
+    db=Depends(get_db),
+):
+    """Expired stock and stock expiring within ``within_days`` days, with value at layer cost."""
+    from app.services.expiry_report import expiry_report
+
+    if branch_id is not None:
+        branches: list[UUID] | None = [branch_id]
+    else:
+        branches = allowed_branch_ids(current_user)
+        branches = list(branches) if branches is not None else None
+    return await expiry_report(
+        db, current_user.business_id, within_days=within_days, branch_ids=branches
+    )
 
 
 @router.get(

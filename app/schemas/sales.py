@@ -1,4 +1,4 @@
-from datetime import datetime
+from datetime import date, datetime
 from decimal import Decimal
 from typing import Any
 from uuid import UUID
@@ -147,6 +147,12 @@ class CreateDiscountSchemeRequest(BaseSchema):
         return self
 
 
+class SaleLineBatchRequest(BaseSchema):
+    batch_no: str | None = Field(default=None, max_length=100)
+    expiry_date: date | None = None
+    qty: Decimal
+
+
 class CreateSaleLineRequest(BaseSchema):
     product_id: UUID
     variation_id: UUID | None = None
@@ -161,6 +167,7 @@ class CreateSaleLineRequest(BaseSchema):
     notes: str | None = None
     line_order: int = 0
     modifier_ids: list[UUID] = Field(default_factory=list)
+    batches: list[SaleLineBatchRequest] = Field(default_factory=list)
 
     @field_validator("qty")
     @classmethod

@@ -81,6 +81,13 @@ PRICES_INCLUDE_TAX_BY_CODE: dict[str, bool] = {
 }
 
 
+def pharmacy_inventory_settings(business_type_code: str) -> list[tuple[str, str]]:
+    """Pharmacies sell the earliest-expiring batch first and refuse expired stock."""
+    if business_type_code == "pharmacy":
+        return [("inventory.pick_policy", "fefo"), ("inventory.expired_sale", "block")]
+    return []
+
+
 def default_prices_include_tax(business_type_code: str) -> bool:
     return PRICES_INCLUDE_TAX_BY_CODE.get(business_type_code, False)
 

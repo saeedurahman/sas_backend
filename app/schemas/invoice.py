@@ -26,10 +26,22 @@ class CustomerInfoForInvoice(BaseSchema):
     tax_id: str | None = None
 
 
+class InvoiceLineBatch(BaseSchema):
+    batch_no: str | None = None
+    expiry_date: date | None = None
+    qty: Decimal
+
+
 class InvoiceLineItem(BaseSchema):
     line_order: int
     product_name: str
+    product_name_secondary: str | None = None
+    # Only set when the variation has a real name (never "Default" / empty).
     variation_name: str | None = None
+    sku: str | None = None
+    barcode: str | None = None
+    unit_allows_decimal: bool = False
+    batches: list[InvoiceLineBatch] = Field(default_factory=list)
     qty: Decimal
     unit: str | None = None
     unit_price: Decimal
@@ -96,6 +108,12 @@ class InvoiceData(BaseSchema):
     summary: InvoiceSummary
     receipt_footer: str | None = None
     printed_at: datetime
+    register_name: str | None = None
+    # Customer ledger, shown as "owed" amounts (positive = customer owes the shop).
+    customer_previous_balance: Decimal | None = None
+    customer_balance_after: Decimal | None = None
+    # The sale exists on the server, so a public receipt link can point at it.
+    synced: bool = True
 
 
 class ThermalLineItem(BaseSchema):
@@ -117,6 +135,8 @@ class ThermalReceiptData(BaseSchema):
     payments: list[InvoicePaymentItem]
     footer: str | None = None
     paper_size: str
+    # The same receipt rendered with the business's "print" layout (see receipt_render).
+    receipt: dict | None = None
 
 
 class ExportSalesRequest(BaseSchema):

@@ -1,3 +1,4 @@
+import re
 from typing import Any
 from uuid import UUID
 
@@ -118,6 +119,18 @@ class UpdateBusinessRequest(BaseSchema):
     tax_id: str | None = Field(default=None, max_length=100)
     address_line1: str | None = Field(default=None, max_length=255)
     logo_url: str | None = None
+
+    @field_validator("tax_id")
+    @classmethod
+    def check_tax_id(cls, value: str | None) -> str | None:
+        """The NTN/registration number only; a tax label or rate ("GST 17%") is not one."""
+        if value is None:
+            return None
+        if "%" in value or (
+            re.search(r"\b(gst|vat|sales\s*tax)\b", value, re.I) and re.search(r"\d", value)
+        ):
+            raise ValueError("tax_id must be the registration number (NTN), not a tax label or rate")
+        return value
 
     @field_validator("phone")
     @classmethod

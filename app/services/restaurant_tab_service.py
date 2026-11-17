@@ -40,7 +40,9 @@ from app.services.fifo_service import (
     allocate_sale_line_fifo,
     create_sale_line_stock_movements,
     maybe_notify_fifo_shortfall,
+    record_sale_line_batches,
 )
+from app.services.receipt_settings import inventory_policy
 from app.services.invoice_service import _round2
 from app.services.pricing_engine import (
     calculate_line_total,
@@ -56,6 +58,7 @@ from app.services.restaurant_table_service import (
     get_dining_table_by_id,
     transition_table_status,
 )
+from app.services.receipt_settings import generate_sale_number
 from app.services.stock_service import (
     _now,
     check_sufficient_stock,
@@ -347,9 +350,7 @@ async def open_tab(
 
     now = _now()
     cfg = await load_tax_settings(db, business_id)
-    sale_number = await generate_document_number(
-        db, business_id, "INV", Sale, Sale.sale_number
-    )
+    sale_number, sale_seq = await generate_sale_number(db, business_id)
 
     try:
         sale = Sale(
@@ -359,6 +360,7 @@ async def open_tab(
             price_list_id=data.price_list_id,
             table_id=data.table_id,
             sale_number=sale_number,
+            sale_seq=sale_seq,
             sale_type=SaleTypeEnum.dine_in.value,
             status=SaleStatusEnum.held.value,
             sold_at=now,
@@ -707,6 +709,7 @@ async def complete_tab(
                 db, business_id, sale.branch_id, active_lines
             )
 
+        _pick, _expired_mode = await inventory_policy(db, business_id)
         for line in active_lines:
             cost_per_unit, consumptions, short_qty = await allocate_sale_line_fifo(
                 db,
@@ -715,7 +718,13 @@ async def complete_tab(
                 line.product_id,
                 line.variation_id,
                 line.qty,
+                expired_mode=_expired_mode,
+                pick_policy=_pick,
             )
+            if _expired_mode == "warn" and any(c.expired for c in consumptions):
+                flags_now = list(sale.sync_flags or [])
+                if "expired_batch_sold" not in flags_now:
+                    sale.sync_flags = [*flags_now, "expired_batch_sold"]
             line.cost_per_unit = cost_per_unit
             line.cost_estimated = short_qty > Decimal("0")
             line.updated_at = now
@@ -730,6 +739,9 @@ async def complete_tab(
                 consumptions=consumptions,
                 created_by=completed_by,
                 movement_at=sold_at,
+            )
+            await record_sale_line_batches(
+                db, business_id=business_id, sale_line_id=line.id, consumptions=consumptions
             )
             if short_qty > Decimal("0"):
                 fallback_cost = next(

@@ -96,6 +96,10 @@ class Unit(Base, AuditMixin, SoftDeleteMixin, SyncMixin):
     name: Mapped[str] = mapped_column(String(50), nullable=False)
     symbol: Mapped[str] = mapped_column(String(10), nullable=False)
     is_base_unit: Mapped[bool] = mapped_column(Boolean, nullable=False, default=False)
+    # Quantities of this unit may carry decimals (kg, litre, metre ...); others print as whole numbers.
+    allows_decimal: Mapped[bool] = mapped_column(
+        Boolean, nullable=False, default=False, server_default="false"
+    )
     sync_status: Mapped[str] = mapped_column(
         sync_status_enum, nullable=False, default="synced"
     )
@@ -179,6 +183,12 @@ class Product(Base, AuditMixin, SoftDeleteMixin, SyncMixin):
     )
     name: Mapped[str] = mapped_column(String(255), nullable=False)
     sku: Mapped[str | None] = mapped_column(String(100), nullable=True)
+    # Optional second-language (e.g. Urdu) name printed on receipts.
+    name_secondary: Mapped[str | None] = mapped_column(String(255), nullable=True)
+    # Pharmacy: batches of this product carry an expiry date.
+    track_expiry: Mapped[bool] = mapped_column(
+        Boolean, nullable=False, default=False, server_default="false"
+    )
     product_type: Mapped[str] = mapped_column(product_type_enum, nullable=False)
     tracking_type: Mapped[str] = mapped_column(tracking_type_enum, nullable=False)
     is_sellable: Mapped[bool] = mapped_column(Boolean, nullable=False, default=True)

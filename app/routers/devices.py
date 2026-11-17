@@ -5,7 +5,7 @@ from fastapi import APIRouter, Depends
 from app.database import get_db
 from app.dependencies import require_owner
 from app.models.user import User
-from app.schemas.sync import DeviceResponse
+from app.schemas.sync import DeviceResponse, DeviceUpdate
 from app.services import sync_devices
 
 router = APIRouter(prefix="/devices", tags=["Devices"])
@@ -25,4 +25,17 @@ async def revoke_device(
     """The device gets 403 ``device_revoked`` on its next pull/push."""
     return await sync_devices.revoke_device(
         db, current_user.business_id, device_id, current_user.id
+    )
+
+
+@router.put("/{device_id}", response_model=DeviceResponse)
+async def update_device(
+    device_id: str,
+    data: DeviceUpdate,
+    current_user: User = Depends(require_owner),
+    db=Depends(get_db),
+):
+    """Edit the register code (2-4 chars, unique per business) used in receipt numbers."""
+    return await sync_devices.set_short_code(
+        db, current_user.business_id, device_id, data.short_code, current_user.id
     )

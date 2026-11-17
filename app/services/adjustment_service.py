@@ -214,6 +214,8 @@ async def create_stock_adjustment(
                     created_by=created_by,
                     source="adjustment",
                     created_at=adjusted_at,
+                    batch_number=line_data.batch_number,
+                    expiry_date=line_data.expiry_date,
                 )
                 adj_line.cost_per_unit = layer.cost_per_unit
                 await create_stock_movement(

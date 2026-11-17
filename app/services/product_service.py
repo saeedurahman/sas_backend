@@ -397,6 +397,8 @@ async def create_product(
             description=data.description,
             image_url=data.image_url,
             shelf_life_days=data.shelf_life_days,
+            track_expiry=data.track_expiry,
+            name_secondary=data.name_secondary,
             is_tax_exempt=data.is_tax_exempt,
             tax_rate_id=data.tax_rate_id,
             min_stock_level=data.min_stock_level,
@@ -453,6 +455,10 @@ async def update_product(
         product.image_url = data.image_url
     if data.shelf_life_days is not None:
         product.shelf_life_days = data.shelf_life_days
+    if data.track_expiry is not None:
+        product.track_expiry = data.track_expiry
+    if "name_secondary" in data.model_fields_set:
+        product.name_secondary = data.name_secondary or None
     tax_before = {
         "tax_rate_id": str(product.tax_rate_id) if product.tax_rate_id else None,
         "is_tax_exempt": product.is_tax_exempt,

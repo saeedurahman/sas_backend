@@ -20,7 +20,7 @@ from app.schemas.settings import (
     UpsertSettingRequest,
 )
 from app.services.pricing_engine import price_cart
-from app.services.tax_settings import DEFAULTS, load_tax_settings
+from app.services.tax_settings import load_tax_settings
 from app.services.settings_service import (
     can_read_all_settings,
     is_pos_readable_setting,
@@ -155,10 +155,17 @@ async def get_setting_endpoint(
     setting = await get_setting(
         db, current_user.business_id, setting_key, branch_id
     )
-    if setting is None and setting_key in DEFAULTS:
-        return with_tax_defaults([], current_user.business_id)[
-            sorted(DEFAULTS).index(setting_key)
-        ]
+    if setting is None:
+        default_row = next(
+            (
+                row
+                for row in with_tax_defaults([], current_user.business_id)
+                if row["setting_key"] == setting_key
+            ),
+            None,
+        )
+        if default_row is not None:
+            return default_row
     if setting is None:
         raise HTTPException(
             status_code=status.HTTP_404_NOT_FOUND,

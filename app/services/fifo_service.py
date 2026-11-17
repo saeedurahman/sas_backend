@@ -3,10 +3,11 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
-from datetime import datetime, timedelta, timezone
+from datetime import date, datetime, timedelta, timezone
 from decimal import ROUND_HALF_UP, Decimal
 from uuid import UUID
 
+from fastapi import HTTPException, status
 from sqlalchemy import select, text
 from sqlalchemy.ext.asyncio import AsyncSession
 
@@ -36,6 +37,9 @@ class FifoLayerConsumption:
     purchase_line_id: UUID | None
     qty: Decimal
     cost_per_unit: Decimal
+    batch_number: str | None = None
+    expiry_date: date | None = None
+    expired: bool = False  # the layer was already past its expiry when consumed
 
 
 def compute_weighted_cost_per_unit(
@@ -106,10 +110,22 @@ async def consume_fifo_layers(
     product_id: UUID,
     variation_id: UUID | None,
     qty: Decimal,
+    *,
+    pick_policy: str = "fifo",
+    expired_mode: str = "allow",
+    today: date | None = None,
 ) -> tuple[list[FifoLayerConsumption], Decimal]:
-    """Consume the branch's oldest layers first; return slices and any uncovered shortfall."""
+    """Consume the branch's layers; return slices and any uncovered shortfall.
+
+    ``pick_policy``: ``fifo`` = oldest layer first; ``fefo`` = earliest expiry first (no expiry
+    last), then oldest. Costing stays per layer either way.
+    ``expired_mode``: ``block`` skips expired layers and raises 400 ``expired_batch`` when only
+    expired stock could cover the quantity; ``warn``/``allow`` consume them (slices carry
+    ``expired=True`` so the caller can flag the sale).
+    """
     if qty <= _ZERO:
         return [], _ZERO
+    today = today or datetime.now(timezone.utc).date()
 
     filters = [
         PurchaseLine.business_id == business_id,
@@ -123,15 +139,29 @@ async def consume_fifo_layers(
     else:
         filters.append(PurchaseLine.variation_id == variation_id)
 
-    result = await db.execute(
-        select(PurchaseLine)
-        .where(*filters)
+    if pick_policy == "fefo":
+        order = (
+            PurchaseLine.expiry_date.asc().nulls_last(),
+            PurchaseLine.created_at.asc(),
+            PurchaseLine.id.asc(),
+        )
+    else:
         # Age only: ordering by updated_at let a partial consumption push a layer
         # behind newer ones.
-        .order_by(PurchaseLine.created_at.asc(), PurchaseLine.id.asc())
-        .with_for_update()
+        order = (PurchaseLine.created_at.asc(), PurchaseLine.id.asc())
+    result = await db.execute(
+        select(PurchaseLine).where(*filters).order_by(*order).with_for_update()
     )
     layers = list(result.scalars().all())
+    skipped_expired = Decimal("0")
+    if expired_mode == "block":
+        usable = []
+        for layer in layers:
+            if layer.expiry_date is not None and layer.expiry_date < today:
+                skipped_expired += layer.qty_remaining
+            else:
+                usable.append(layer)
+        layers = usable
 
     now = datetime.now(timezone.utc)
     remaining = qty
@@ -150,9 +180,23 @@ async def consume_fifo_layers(
                 purchase_line_id=layer.id,
                 qty=take,
                 cost_per_unit=Decimal(str(layer.cost_per_unit)),
+                batch_number=layer.batch_number,
+                expiry_date=layer.expiry_date,
+                expired=layer.expiry_date is not None and layer.expiry_date < today,
             )
         )
         remaining -= take
+
+    if expired_mode == "block" and remaining > _ZERO and skipped_expired > _ZERO:
+        raise HTTPException(
+            status.HTTP_400_BAD_REQUEST,
+            detail={
+                "code": "expired_batch",
+                "message": "Not enough unexpired stock; the remaining stock of this product has expired.",
+                "product_id": str(product_id),
+                "expired_qty": str(skipped_expired),
+            },
+        )
 
     return consumptions, remaining
 
@@ -290,6 +334,9 @@ async def allocate_sale_line_fifo(
     product_id: UUID,
     variation_id: UUID | None,
     qty: Decimal,
+    *,
+    expired_mode: str = "allow",
+    pick_policy: str | None = None,
 ) -> tuple[Decimal, list[FifoLayerConsumption], Decimal]:
     """Layer consumption + fallback slice for any shortfall; returns weighted unit cost.
 
@@ -297,8 +344,13 @@ async def allocate_sale_line_fifo(
     product's last known cost, never zero by default; callers flag the line
     ``cost_estimated`` whenever it is positive.
     """
+    if pick_policy is None:
+        from app.services.receipt_settings import inventory_policy
+
+        pick_policy, _ = await inventory_policy(db, business_id)
     layer_consumptions, short_qty = await consume_fifo_layers(
-        db, business_id, branch_id, product_id, variation_id, qty
+        db, business_id, branch_id, product_id, variation_id, qty,
+        pick_policy=pick_policy, expired_mode=expired_mode,
     )
     slices = list(layer_consumptions)
     if short_qty > _ZERO:
@@ -683,3 +735,53 @@ async def get_fifo_cost_from_db(
         return Decimal(str(cost))
     except Exception:
         return None
+
+
+def allocation_differs(
+    device_batches: list | None, consumptions: list[FifoLayerConsumption]
+) -> bool:
+    """True when a device-reported batch allocation disagrees with what the server consumed.
+
+    Only batch number and quantity are compared; ``None`` (device sent nothing) never differs.
+    """
+    if not device_batches:
+        return False
+
+    def norm(batch_no: str | None) -> str:
+        return (batch_no or "").strip().upper()
+
+    device: dict[str, Decimal] = {}
+    for b in device_batches:
+        key = norm(getattr(b, "batch_no", None))
+        device[key] = device.get(key, _ZERO) + Decimal(str(b.qty))
+    server: dict[str, Decimal] = {}
+    for c in consumptions:
+        if c.purchase_line_id is None:
+            continue
+        key = norm(c.batch_number)
+        server[key] = server.get(key, _ZERO) + c.qty
+    return device != server
+
+
+async def record_sale_line_batches(
+    db: AsyncSession,
+    *,
+    business_id: UUID,
+    sale_line_id: UUID,
+    consumptions: list[FifoLayerConsumption],
+) -> None:
+    """Store the ACTUAL allocation (what receipts print): one row per consumed batch layer."""
+    for c in consumptions:
+        if c.purchase_line_id is None or (c.batch_number is None and c.expiry_date is None):
+            continue
+        await db.execute(
+            text(
+                "INSERT INTO sale_line_batches "
+                "(id, business_id, sale_line_id, layer_id, batch_no, expiry_date, qty) "
+                "VALUES (gen_random_uuid(), :b, :l, :layer, :bn, :exp, :qty)"
+            ),
+            {
+                "b": business_id, "l": sale_line_id, "layer": c.purchase_line_id,
+                "bn": c.batch_number, "exp": c.expiry_date, "qty": c.qty,
+            },
+        )

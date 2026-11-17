@@ -20,9 +20,11 @@ from app.models.settings import AppSetting
 from app.models.user import Role, User, UserRole
 from app.schemas.auth import RegisterBusinessRequest
 from app.services.auth_service import hash_password
+from app.services.receipt_layout_service import seed_default_layouts
 from app.services.onboarding_presets import (
     build_onboarding_config_row,
     default_prices_include_tax,
+    pharmacy_inventory_settings,
 )
 from app.services.role_permission_seed import ensure_standard_roles_and_permissions
 
@@ -213,6 +215,7 @@ async def register_new_business(
             ("tax.rounding_mode", "none"),
             ("tax.show_breakdown_on_receipt", True),
             ("tax.label", "GST"),
+            *pharmacy_inventory_settings(data.business_type_code),
         ):
             db.add(
                 AppSetting(
@@ -224,6 +227,11 @@ async def register_new_business(
                     updated_at=now,
                 )
             )
+
+        # Four receipt layouts (one per design); pharmacies print batch and expiry.
+        await seed_default_layouts(
+            db, business.id, pharmacy=data.business_type_code == "pharmacy", actor=user.id
+        )
 
         role_result = await db.execute(
             select(Role).where(

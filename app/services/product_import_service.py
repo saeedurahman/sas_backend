@@ -12,7 +12,7 @@ cost of the opening-stock layer.
 from __future__ import annotations
 
 from dataclasses import dataclass
-from datetime import datetime, timezone
+from datetime import date, datetime, timezone
 from decimal import ROUND_HALF_UP, Decimal
 from typing import Any
 from uuid import UUID
@@ -59,7 +59,26 @@ PRODUCT_IMPORT_ALIASES: dict[str, tuple[str, ...]] = {
     "tax_rate_name": ("tax_rate", "tax_name"),
     "tax_exempt": ("is_tax_exempt", "exempt"),
     "opening_stock": ("stock", "opening_balance", "opening_qty", "qty", "quantity"),
+    "batch_no": ("batch", "batch_number", "lot"),
+    "expiry_date": ("expiry", "exp_date", "expiration_date"),
 }
+
+
+def _parse_expiry(raw: str) -> date:
+    """YYYY-MM-DD, DD-MM-YYYY, DD/MM/YYYY or MM/YYYY (month end)."""
+    import calendar
+
+    text_ = raw.strip()
+    for fmt in ("%Y-%m-%d", "%d-%m-%Y", "%d/%m/%Y"):
+        try:
+            return datetime.strptime(text_, fmt).date()
+        except ValueError:
+            pass
+    try:
+        parsed = datetime.strptime(text_, "%m/%Y")
+        return date(parsed.year, parsed.month, calendar.monthrange(parsed.year, parsed.month)[1])
+    except ValueError:
+        raise ValueError(f"expiry_date '{raw}' is not a valid date (use YYYY-MM-DD)") from None
 
 
 class ProductImportRequest(ImportRequest):
@@ -81,6 +100,8 @@ class _Plan:
     price: Decimal | None = None
     cost: Decimal | None = None
     opening: Decimal | None = None
+    batch_no: str | None = None
+    expiry: date | None = None
     changed_name: bool = False
     changed_category: bool = False
     changed_price: bool = False
@@ -293,6 +314,13 @@ async def import_products(
                     plan.cost = value.quantize(_CENT, rounding=ROUND_HALF_UP)
                 else:
                     plan.opening = value
+        if v.get("batch_no"):
+            plan.batch_no = str(v["batch_no"]).strip()[:100] or None
+        if v.get("expiry_date"):
+            try:
+                plan.expiry = _parse_expiry(str(v["expiry_date"]))
+            except ValueError as exc:
+                result.error(str(exc))
         if result.errors:
             continue
 
@@ -499,7 +527,8 @@ async def import_products(
             if plan.opening and plan.opening > 0:
                 opening_lines.append(
                     CreateAdjustmentLineRequest(
-                        product_id=pid, qty_delta=plan.opening, cost_per_unit=plan.cost
+                        product_id=pid, qty_delta=plan.opening, cost_per_unit=plan.cost,
+                        batch_number=plan.batch_no, expiry_date=plan.expiry,
                     )
                 )
 

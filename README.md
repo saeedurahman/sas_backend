@@ -806,3 +806,142 @@ content, at most `UPLOAD_MAX_IMAGE_BYTES`) → `201 {"url": "..."}`. With `CLOUD
 ### Phase 5 tests
 
 `tests/integration/phase5/` (receipt links, exports, price lists, product import, uploads).
+
+## Receipt layouts, numbering and pharmacy batches
+
+An invoice is a sale rendered with a **layout**. A layout is business data (`receipt_layouts`), assigned per channel
+(`print`, `whatsapp`, `link`) and optionally per branch. ONE render model
+(`build_receipt_model(sale, layout, channel)` in `app/services/receipt_render.py`) feeds the HTML, PDF and WhatsApp
+text renderers and the public `/r/{token}` page. Migration: `027_receipt_layouts` (idempotent, seeds existing businesses).
+
+Designs: `thermal_classic`, `thermal_compact` (papers `roll58` / `roll80`), `a4_tax_invoice`, `a4_elegant` (paper `a4`).
+Thermal PDFs are exactly 58 / 80 mm wide with an exact height; A4 designs are A4. Every business gets all four layouts;
+`thermal_classic` is the default for all three channels. Pharmacy presets turn `items.show_batch` / `show_expiry` on.
+
+### Layout config (`config`, JSONB, validated, unknown keys rejected, defaults filled in)
+
+```json
+{
+  "v": 1,
+  "header": {"show_logo": true, "show_business_name": true, "show_address": true, "show_phone": true,
+             "show_ntn": true, "ntn_label": "NTN", "extra_lines": []},
+  "meta": {"show_number": true, "number_source": "register", "show_datetime": true, "show_cashier": true,
+           "show_branch": false, "show_register": false, "show_customer": true, "show_customer_phone": false,
+           "walkin_label": "Walk-in"},
+  "items": {"show_name": true, "show_variation": true, "show_sku": false, "show_barcode": false, "show_unit": false,
+            "show_qty": true, "show_unit_price": true, "show_line_discount": true, "show_line_total": true,
+            "show_batch": false, "show_expiry": false, "name_language": "primary"},
+  "totals": {"show_subtotal": true, "show_discount": true, "show_tax_breakdown": true, "show_rounding": true,
+             "show_includes_tax_note": true, "show_payments": true, "show_change": true,
+             "show_previous_balance": false, "show_balance_after": false},
+  "footer": {"text_en": "", "text_ur": "", "show_powered_by": false, "show_qr": true},
+  "labels": {"total": {"en": "Total", "ur": "کل"}},
+  "style": {"font_scale": 1.0, "show_dividers": true, "compact_items": false}
+}
+```
+
+* `header.extra_lines`: at most 3 lines. `meta.number_source`: `register` | `official`. `items.name_language`:
+  `primary` | `secondary` | `both`. `style.font_scale`: 0.8-1.4.
+* `labels` is a partial map of `{key: {"en", "ur"}}`; keys must be known (`GET /receipt-layouts/designs` lists the
+  defaults for every key: receipt, tax_invoice, invoice, number, date, cashier, customer, item, qty, price, amount, sku,
+  barcode, batch, expiry, subtotal, discount, tax, rounding, total, paid, balance_due, change, payment methods, ...).
+  Labels print bilingual ("Total / کل") when both languages exist.
+* Per-design defaults differ (e.g. `thermal_compact`: `compact_items`, `font_scale` 0.9, no cashier/customer/QR).
+
+### API (all `settings.manage`; changes are audited with before/after)
+
+| Method | Path | Notes |
+|---|---|---|
+| GET | `/receipt-layouts` | list |
+| POST | `/receipt-layouts` | `{"name","design","paper"?,"config"?}` -> 201; 422 on a bad config or a design/paper mismatch |
+| GET/PUT/DELETE | `/receipt-layouts/{id}` | PUT `{"name"?,"paper"?,"config"?,"is_active"?}`; deleting / deactivating a layout that is assigned -> 409 |
+| POST | `/receipt-layouts/{id}/duplicate` | `{"name"?}` -> 201 |
+| GET | `/receipt-layouts/designs` | `{"designs":[{design,paper options,default config...}],"channels":["print","whatsapp","link"]}` |
+| GET | `/receipt-layouts/assignments` | list |
+| PUT | `/receipt-layouts/assignments` | upsert; `layout_id: null` removes a branch override (the business default cannot be removed) |
+| POST | `/receipt-layouts/preview` | see below |
+
+Layout response: `{"id","business_id","name","design","paper","config","is_active","created_at","updated_at"}`.
+
+Assignments: `PUT {"assignments":[{"channel":"whatsapp","branch_id":"<uuid>|null","layout_id":"<uuid>|null"}]}`;
+`GET` rows are `{"id","branch_id","channel","layout_id","updated_at"}`. `branch_id: null` = business default. Resolution
+for a sale: the branch assignment for the channel, else the business default.
+
+Preview: `POST /receipt-layouts/preview {"layout_id"?|"design"?, "paper"?, "config"?, "sale_id"?, "channel"?: "print"}`
+returns `{"mock": bool, "model": {...}, "html": "...", "text": "..."}`. Without `sale_id` a built-in sample sale (Urdu
+names, a batch with expiry, tax, discount, cash change) is used. `config` previews unsaved edits.
+
+Receipts: `GET /invoice/{sale_id}/receipt?channel=print|whatsapp|link&format=json|html|pdf|text` (`sales.view`);
+`GET /invoice/{id}/thermal` now also carries `"receipt"` (the print model); `/r/{token}` uses the `link` layout.
+
+### Render model (`format=json`)
+
+`{"v":1,"channel","layout":{"id","name","design"},"paper":{"code","width_mm","a4"},"style","currency","is_void",
+"title","header":{"logo_url","business_name","address","phone","ntn":{"label","value"}|null,"extra_lines"},
+"meta":[{"key","label","value"}],"columns","items":[{"name","name_secondary","sku","barcode","unit","qty","unit_price",
+"discount","line_total","batches":[{"batch_no","expiry","qty"}]}],"totals":[{"key","label","value","strong"}],
+"payments","notes","footer":{"lines","powered_by"},"qr":{"content"}|null,"link","show_dividers"}`.
+
+Rules: no internal sync/status text; ONE receipt number per `meta.number_source` (`register` = `client_receipt_no`, else
+the official `sale_number`; falls back to the other); the name is the PRODUCT name (the variation only when it is not
+"Default"/empty); quantities have no decimals unless the unit has `allows_decimal`; NTN prints with its label from the
+business `tax_id` (a value that looks like a tax label/rate is dropped, never printed); tax and rounding come from the
+sale snapshot; expiry prints `MM/YYYY`; the QR is the public receipt link and is omitted unless the sale is synced (and
+always omitted on the `link` channel); the `link` channel never prints customer, cashier or balances.
+The server draws the QR only if the optional `segno` package is installed (`pip install segno`); without it the model's
+`qr.content` still carries the URL for the client to draw.
+
+### Receipt numbers
+
+* Register number (device): `sync_devices.short_code` (2-4 chars, auto `C1`, `C2`, ... in registration order, unique per
+  business case-insensitively). Returned as `device_short_code` on `GET /sync/pull` and `POST /sync/push`, and as
+  `short_code` on `GET /devices`. Owner edit: `PUT /devices/{device_id} {"short_code": "SH1"}` (409 `short_code_taken`,
+  422 for bad length/characters). The app builds `"{short_code}-{counter:04d}"`, prefixed with the `number_prefix`
+  returned by pull (setting `receipt.number_prefix`, empty by default). `client_receipt_no` stays unique per business.
+* Official number (server `sale_number`), settings `sales.invoice_prefix` (default `INV`), `sales.invoice_digits`
+  (default 4), `sales.invoice_start` (default 1). Neither digits nor start configured -> the long-standing daily
+  `INV-YYYYMMDD-####`. Once either is set: one continuous counter `PREFIX-0001`; `sales.sale_seq` stores the numeric counter
+  so numbers sort numerically past the digit width. Existing numbers never change. All three keys, plus
+  `receipt.number_prefix`, `inventory.pick_policy` and `inventory.expired_sale`, are business-wide `app_settings`
+  (422 on invalid values) and are also in the sync `settings` entity under `app_settings`.
+
+### Pharmacy: batch, expiry, FEFO
+
+* Layers (`purchase_lines`) carry `batch_number` / `expiry_date`; purchase receipts, adjustments (`qty_delta > 0`) and the
+  product CSV import (`batch_no`, `expiry_date` columns, with `opening_stock`) accept them. `batch_no` is accepted as an
+  alias of `batch_number` on input. `products.track_expiry` / `name_secondary` and `units.allows_decimal` are in the
+  product / unit create, update and response shapes.
+* `inventory.pick_policy`: `fifo` (default) | `fefo` (earliest expiry first, no expiry last, then oldest). Costing stays per
+  layer. `inventory.expired_sale`: `block` (online sale of expired stock -> `400 {"detail":{"code":"expired_batch"}}`,
+  unexpired stock is used when it covers the quantity) | `warn` (default: accepted, flag `expired_batch_sold`) |
+  `allow`. Pharmacy businesses registered from now on start with `fefo` + `block`; existing businesses keep their settings.
+* Offline replay (`sale.create`) always accepts; an expired batch is flagged `expired_batch_sold`.
+* `sale.create` lines (and online `POST /sales` lines) may carry the device's allocation:
+  `"batches": [{"batch_no": "B2407", "expiry_date": "2027-05-31", "qty": "2"}]`. The server consumes by its own policy and
+  stores the ACTUAL allocation in `sale_line_batches` (`sale_line_id, layer_id, batch_no, expiry_date, qty`); a difference
+  adds the flag `batch_mismatch` (never a rejection). Receipts print batch/expiry from the stored allocation.
+* New flags: `expired_batch_sold`, `batch_mismatch` (in `sync_flags`, `GET /sync/flags`).
+
+Sync entity `stock_batch` (branch scoped; `inventory.view` or `sales.create`), derived from layers that still hold stock:
+
+```json
+{"entity": "stock_batch", "id": "<layer id>", "op": "upsert", "seq": 1234,
+ "data": {"id": "<layer id>", "branch_id": "<uuid>", "product_id": "<uuid>", "variation_id": "<uuid>|null",
+          "batch_no": "B2407", "expiry_date": "2027-05-31", "qty_remaining": "4.0000",
+          "cost_per_unit": "8.0000", "received_at": "2026-11-01T09:00:00Z"}}
+```
+
+A layer that is sold out (or deleted) arrives as `op: "delete"`; only layers with a batch number or expiry appear.
+Sync entities `receipt_layout` (all columns of the layout row) and `receipt_layout_assignment`
+(`id, branch_id|null, channel, layout_id`; a business-default row with `branch_id: null` is visible to every branch) are
+served to every signed-in user.
+
+Reports: `GET /stock/expiry-report?within_days=30&branch_id=` (`inventory.view`) ->
+`{"as_of","within_days","expired":[row],"near_expiry":[row],"totals":{"expired_qty","expired_value","near_expiry_qty","near_expiry_value"}}`
+with `row = {layer_id, product_id, product, variation, sku, branch_id, branch, batch_no, expiry_date, days_to_expiry, qty, cost_per_unit, value}`.
+Export dataset `expiry` (`GET /export/expiry`, `reports.export` + `inventory.view`): expired stock plus stock expiring in 90 days.
+
+### Receipt tests
+
+`tests/unit/test_receipt_render.py` (render rules, no server) and `tests/integration/receipt/` (layouts API, numbering,
+batches). `tax_id` on `PUT /business/me` now rejects tax-label text such as "GST 17%" (422).

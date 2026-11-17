@@ -8,7 +8,8 @@ from app.database import get_db
 from app.services.business_time import get_business_tz
 from app.services.invoice_service import get_invoice_data
 from app.services.receipt_link_service import LinkProblem, resolve_link
-from app.services.receipt_render import error_page, render_html, render_pdf
+from app.services.receipt_layout_service import resolve_layout
+from app.services.receipt_render import build_receipt_model, error_page, render_html, render_pdf
 
 router = APIRouter(tags=["Public receipt"])
 
@@ -45,9 +46,11 @@ async def public_receipt(
         )
 
     zone = await get_business_tz(db, link.business_id)
+    layout = await resolve_layout(db, link.business_id, invoice.branch_id, "link")
+    model = build_receipt_model(invoice, layout, "link", zone=zone)
     if format == "pdf":
         return Response(
-            render_pdf(invoice, zone),
+            render_pdf(model),
             media_type="application/pdf",
             headers={
                 "Content-Disposition": f'inline; filename="receipt-{invoice.sale_number}.pdf"',
@@ -56,5 +59,5 @@ async def public_receipt(
             },
         )
     return HTMLResponse(
-        render_html(invoice, zone, pdf_href=f"/r/{token}?format=pdf"), headers=_HTML_HEADERS
+        render_html(model, pdf_href=f"/r/{token}?format=pdf"), headers=_HTML_HEADERS
     )

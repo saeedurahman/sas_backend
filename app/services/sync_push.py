@@ -71,7 +71,9 @@ from app.services.customer_service import (
 from app.services.expense_service import create_expense
 from app.services.fifo_service import (
     allocate_sale_line_fifo,
+    allocation_differs,
     create_sale_line_stock_movements,
+    record_sale_line_batches,
 )
 from app.services.notification_service import create_notification
 from app.services.price_service import get_product_price
@@ -91,8 +93,8 @@ from app.services.register_service import (
 from app.services.restaurant_tab_service import _encode_sale_line_notes
 from app.services.return_service import create_sale_return
 from app.services.sale_service import void_sale
+from app.services.receipt_settings import generate_sale_number
 from app.services.stock_service import (
-    generate_document_number,
     get_stock_balance,
     lock_stock_positions,
     verify_branch,
@@ -118,6 +120,8 @@ FLAG_UNKNOWN_MODIFIER = "unknown_modifier"
 FLAG_ROUNDING = "rounding_mismatch"
 FLAG_TOTAL = "total_mismatch"
 FLAG_SETTINGS = "settings_mismatch"
+FLAG_EXPIRED = "expired_batch_sold"
+FLAG_BATCH = "batch_mismatch"
 ALL_FLAGS = (
     FLAG_PRICE,
     FLAG_TAX,
@@ -131,6 +135,8 @@ ALL_FLAGS = (
     FLAG_ROUNDING,
     FLAG_TOTAL,
     FLAG_SETTINGS,
+    FLAG_EXPIRED,
+    FLAG_BATCH,
 )
 
 # Stable error codes.
@@ -706,15 +712,20 @@ async def _h_sale_create(ctx: Ctx, db, p: SaleCreatePayload, op: OpEnvelope) -> 
                 raise OpReject(E_STOCK, "Insufficient stock for a replayed sale", retryable=True)
             flag(FLAG_OVERSOLD)
 
-    official_number = await generate_document_number(db, ctx.business_id, "INV", Sale, Sale.sale_number)
+    official_number, official_seq = await generate_sale_number(db, ctx.business_id)
 
     snapshots = []
     for line in p.lines:
         cost, consumptions, short = await allocate_sale_line_fifo(
-            db, ctx.business_id, p.branch_id, line.product_id, line.variation_id, line.qty
+            db, ctx.business_id, p.branch_id, line.product_id, line.variation_id, line.qty,
+            expired_mode="allow",  # already sold: always accepted, only flagged
         )
         if short > _ZERO:
             flag(FLAG_COST)
+        if any(c.expired for c in consumptions):
+            flag(FLAG_EXPIRED)
+        if allocation_differs(line.batches, consumptions):
+            flag(FLAG_BATCH)
         snapshots.append((cost, consumptions, short))
 
     sale = Sale(
@@ -725,6 +736,7 @@ async def _h_sale_create(ctx: Ctx, db, p: SaleCreatePayload, op: OpEnvelope) -> 
         register_shift_id=usable_shift.id if usable_shift else None,
         price_list_id=p.price_list_id,
         sale_number=official_number,
+        sale_seq=official_seq,
         sale_type=p.sale_type.value,
         status=determine_sale_status(total_amount, total_applied).value,
         sold_at=sold_at,
@@ -843,6 +855,9 @@ async def _h_sale_create(ctx: Ctx, db, p: SaleCreatePayload, op: OpEnvelope) -> 
             consumptions=consumptions,
             created_by=ctx.user_id,
             movement_at=sold_at,
+        )
+        await record_sale_line_batches(
+            db, business_id=ctx.business_id, sale_line_id=sale_line.id, consumptions=consumptions
         )
 
     if customer is not None and credit_amount > _ZERO:

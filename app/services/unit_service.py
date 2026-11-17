@@ -63,6 +63,7 @@ async def create_unit(
         name=data.name,
         symbol=data.symbol,
         is_base_unit=data.is_base_unit,
+        allows_decimal=data.allows_decimal,
         created_by=created_by,
         created_at=now,
         updated_at=now,
@@ -87,6 +88,8 @@ async def update_unit(
         unit.name = data.name
     if data.symbol is not None:
         unit.symbol = data.symbol
+    if data.allows_decimal is not None:
+        unit.allows_decimal = data.allows_decimal
     if data.is_active is not None and not data.is_active:
         unit.deleted_at = now
         unit.deleted_by = updated_by
