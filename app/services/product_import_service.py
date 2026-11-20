@@ -26,6 +26,7 @@ from app.models.enums import AdjustmentReasonEnum
 from app.models.inventory import StockMovement
 from app.models.sales import TaxRate
 from app.services.audit_helper import log_audit
+from app.services.barcode_utils import barcode_forms, match_candidates, normalize_barcode
 from app.models.product import (
     Barcode,
     Category,
@@ -157,7 +158,8 @@ async def import_products(
     }
 
     skus = {r.values["sku"] for r in rows if r.values.get("sku")}
-    codes = {r.values["barcode"] for r in rows if r.values.get("barcode")}
+    # Any spelling of a barcode matches (UPC-A 12 / EAN-13 / GTIN-14, see barcode_utils).
+    codes = {c for r in rows if r.values.get("barcode") for c in match_candidates(r.values["barcode"])}
     # sku/barcode uniqueness in the database also covers soft-deleted rows, so look at all.
     by_sku: dict[str, Product] = {}
     if skus:
@@ -171,16 +173,18 @@ async def import_products(
         }
     by_code: dict[str, Barcode] = {}
     if codes:
-        by_code = {
-            b.barcode: b
-            for b in (
-                await db.execute(
-                    select(Barcode).where(
-                        Barcode.business_id == business_id, Barcode.barcode.in_(codes)
-                    )
+        for b in (
+            await db.execute(
+                select(Barcode).where(
+                    Barcode.business_id == business_id, Barcode.barcode.in_(codes)
                 )
-            ).scalars()
-        }
+            )
+        ).scalars():
+            for spelling in (b.barcode, *barcode_forms(b.barcode)):
+                # live rows win over a soft-deleted twin
+                cur = by_code.get(spelling)
+                if cur is None or (cur.deleted_at is not None and b.deleted_at is None):
+                    by_code[spelling] = b
     matched_ids = {p.id for p in by_sku.values() if p.deleted_at is None} | {
         b.product_id for b in by_code.values() if b.deleted_at is None
     }
@@ -264,13 +268,16 @@ async def import_products(
         if name and not 2 <= len(name) <= 255:
             result.error("name must be 2-255 characters")
         for value, seen, label in ((sku, seen_sku, "sku"), (code, seen_code, "barcode")):
-            if value and value in seen:
-                result.error(f"duplicate {label} '{value}' (first used in row {seen[value]})")
+            key = (normalize_barcode(value).canonical or value) if label == "barcode" and value else value
+            if value and key in seen:
+                result.error(f"duplicate {label} '{value}' (first used in row {seen[key]})")
             elif value:
-                seen[value] = row.number
+                seen[key] = row.number
 
         sku_hit = by_sku.get(sku) if sku else None
-        code_hit = by_code.get(code) if code else None
+        code_hit = (
+            next((by_code[c] for c in match_candidates(code) if c in by_code), None) if code else None
+        )
         if sku_hit is not None and sku_hit.deleted_at is not None:
             result.error(f"sku '{sku}' belongs to a deleted product")
         if code_hit is not None and code_hit.deleted_at is not None:
@@ -379,7 +386,7 @@ async def import_products(
         if plan.price is not None and current_price.get(product.id) != plan.price:
             plan.changed_price = True
             changes.append("price")
-        if code and code not in product_barcodes.get(product.id, set()):
+        if code and not set(match_candidates(code)) & product_barcodes.get(product.id, set()):
             plan.add_barcode = True
             changes.append("barcode")
         if unit_text and unit_id != product.base_unit_id:

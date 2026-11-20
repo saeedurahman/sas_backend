@@ -20,6 +20,7 @@ from app.schemas.settings import (
     UpsertSettingRequest,
 )
 from app.services.pricing_engine import price_cart
+from app.services.quick_add_settings import effective_defaults as quick_add_defaults
 from app.services.tax_settings import load_tax_settings
 from app.services.settings_service import (
     can_read_all_settings,
@@ -42,7 +43,9 @@ async def list_settings(
     db=Depends(get_db),
 ):
     settings_rows = await get_settings(db, current_user.business_id, branch_id)
-    items = with_tax_defaults(settings_rows, current_user.business_id)
+    items = with_tax_defaults(
+        settings_rows, current_user.business_id, await quick_add_defaults(db, current_user.business_id)
+    )
     if can_read_all_settings(_user_permission_keys(current_user)):
         return items
     return [row for row in items if is_pos_readable_setting(row["setting_key"])]
@@ -159,7 +162,9 @@ async def get_setting_endpoint(
         default_row = next(
             (
                 row
-                for row in with_tax_defaults([], current_user.business_id)
+                for row in with_tax_defaults(
+                    [], current_user.business_id, await quick_add_defaults(db, current_user.business_id)
+                )
                 if row["setting_key"] == setting_key
             ),
             None,

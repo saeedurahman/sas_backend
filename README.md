@@ -37,6 +37,9 @@ uvicorn main:app --reload --port 8000
 | `RATE_LIMIT_REGISTER_IP` | `3/hour` | `/auth/register` |
 | `RATE_LIMIT_PIN_CHANGE_USER` / `RATE_LIMIT_PASSWORD_CHANGE_USER` | `5/minute` | Self-service PIN/password changes and admin resets |
 | `RATE_LIMIT_CHECK_ALERTS_USER` | `6/minute` | `/notifications/check-alerts` |
+| `QUICK_ADD_MAX_LINES` | `300` | Most lines in one `POST /products/quick-add` (413 above) |
+| `QUICK_ADD_MAX_BODY_BYTES` | `1048576` | Largest Quick Add request body (413 above) |
+| `RATE_LIMIT_QUICK_ADD_USER` | `30/minute` | Per user on `/products/quick-add` |
 | `TRUST_FORWARDED_FOR` | `false` | Use the first `X-Forwarded-For` address as the client IP. Enable only behind a proxy you control that overwrites the header |
 | `MAX_REQUEST_BODY_BYTES` | `2097152` | Larger bodies get `413` |
 | `LOG_LEVEL` | `INFO` | JSON logs to stdout; bodies, headers, query strings and secrets are never logged |
@@ -813,6 +816,118 @@ adjustment (skipped for products that already have stock history).
 `row` is the file line (header = 1). Applying with errors and `on_error: "abort"` (the default) writes nothing and answers
 `422 {"detail": {"code": "import_has_errors", "message": "...", "report": {...}}}`; `on_error: "skip"` applies the valid rows.
 More than `IMPORT_MAX_ROWS` rows → 413.
+
+### Quick Add by scan
+
+Add ~100 products with opening or purchased stock in minutes: scan, confirm cost/price/expiry, repeat, send once.
+Migration `029_quick_add` adds `products.pack_size` (text, 50) and `products.mrp` (numeric 15,2); both are plain product
+fields (create/update/read, sync pull).
+
+**Barcode normalization** (`app/services/barcode_utils.py`, the only place that does it): digits only (spaces, dashes,
+a leading `]E0`-style scanner prefix and Arabic-Indic digits are handled); EAN-8, UPC-A, EAN-13 and GTIN-14 check digits
+are validated, an unknown length or a bad check digit only sets `valid: false` and is never rejected. A UPC-A (12) is
+stored/compared as EAN-13 with a leading `0`; a GTIN-14 is kept as is and its 13-digit base form is also tried **for lookup
+only** (a case code is never treated as a duplicate of its unit and Quick Add never adds stock through it). Codes containing
+letters are custom codes: kept verbatim, matched exactly. Uniqueness checks, `GET /products/barcode/{code}`, sale scan
+lookups, price-list import and product import all match across these spellings (`036000291452` = `0036000291452`).
+
+**`GET /products/lookup?barcode=<code>[&branch_id=]`** (`products.view`). One indexed query on `barcodes (business_id, barcode)`
+plus lateral joins; only the caller's own business is searched. `stock_on_hand` is the given branch's, or the sum of the
+branches the caller can access when `branch_id` is omitted.
+
+```json
+{"found": true,
+ "barcode": {"input": " 036000291452 ", "normalized": "0036000291452", "valid": true, "format": "UPCA", "matched_barcode": "0036000291452"},
+ "product": {"id": "uuid", "name": "Lux Soap 100g", "variation_id": "uuid",
+             "unit": {"id": "uuid", "name": "Piece", "symbol": "pc"},
+             "sale_price": "70.00", "cost_price": "50.0000", "stock_on_hand": "12.0000",
+             "track_expiry": false, "image_url": null},
+ "suggestion": null}
+```
+
+Not found: `{"found": false, "barcode": {...}, "product": null, "suggestion": null}`. `sale_price` is the default price list's
+price (`null` = no price yet), `cost_price` the last known cost (`null` = never had one). `suggestion` is the extension point
+for a future Master Catalogue / Open Food Facts source; when wired in it carries
+`{"source", "name", "brand", "unit_hint", "pack_size", "category_hint", "image_url", "mrp"}`.
+
+**`POST /products/quick-add`**: permissions `products.create` + `inventory.adjust` (opening stock), or `products.create` +
+`inventory.purchase_orders.create` + `inventory.purchase_orders.receive` when `mode` is `purchase` with a `supplier_id`
+(the spec's "purchases.create" does not exist; these are the keys the PO and GRN endpoints use). `update_existing_prices: true`
+on an existing product also needs `products.update` (otherwise that line fails with `forbidden`). Honours `Idempotency-Key`
+(a replay returns the stored response with `Idempotent-Replay: true`; same key + different body = 409). Rate limited per user
+(`RATE_LIMIT_QUICK_ADD_USER`).
+
+```json
+{"mode": "opening_stock",
+ "supplier_id": null,
+ "branch_id": "uuid (optional when the business has one branch or you are pinned to one)",
+ "lines": [
+   {"client_line_id": "c1", "barcode": "8964000370018", "name": "Lux Soap 100g", "brand": "Lux",
+    "category_id": null, "unit_id": null, "pack_size": "100g", "qty": "12", "cost_price": "50", "sale_price": "70",
+    "mrp": "75", "tax_rate_id": null, "is_tax_exempt": false, "track_expiry": true,
+    "batch_no": "B-17", "expiry_date": "2027-06-30", "image_url": null, "update_existing_prices": false}]}
+```
+
+```json
+{"created": 1, "updated": 1, "failed": 1,
+ "purchase_id": null, "receipt_id": null, "adjustment_id": "uuid", "quick_add_id": "uuid",
+ "lines": [
+   {"client_line_id": "c1", "status": "created", "product_id": "uuid", "variation_id": "uuid", "error": null, "note": null},
+   {"client_line_id": "c2", "status": "updated", "product_id": "uuid", "variation_id": "uuid", "error": null, "note": "duplicate_barcode_merged"},
+   {"client_line_id": "c3", "status": "error", "product_id": null, "variation_id": null,
+    "error": {"code": "expiry_required", "message": "expiry_date is required for a product that tracks expiry"}, "note": null}]}
+```
+
+In purchase mode `purchase_id` (the purchase order) and `receipt_id` (its goods receipt) are set and `adjustment_id` is null.
+`receipt_id` and `quick_add_id` (the audit reference) are additions to the requested shape.
+
+Rules, per line (each line runs in its own savepoint; a bad line never blocks the others; the response is `200` whenever the
+request itself is valid, `422` for a malformed body, `413` above `QUICK_ADD_MAX_LINES` lines or `QUICK_ADD_MAX_BODY_BYTES`):
+
+* The normalized barcode matches one of the business's products: stock is added to it, `status: "updated"`. Sale price,
+  `mrp` and `pack_size` are touched only when `update_existing_prices` (the price through the price service); the stock
+  layer always carries the line's own `cost_price`.
+* Otherwise a product is created with a default variation, the barcode, `category_id` (default none), `unit_id` (default the
+  business's "Piece" unit, created once if missing), `brand` (matched by name, created if missing), `track_expiry`, `mrp`,
+  `pack_size`. Tax inherits the business default (`tax_rate_id` null) unless given. The sale price goes to the default
+  "Retail" price list through the price service; `sale_price` 0 writes no item (the product then shows in `needs_attention`).
+* `qty` 0 creates/updates the product without stock. A missing `cost_price` or `sale_price` counts as 0.
+* Error codes (`lines[].error.code`): `name_required`, `invalid_name`, `barcode_required`, `invalid_barcode`,
+  `invalid_qty`, `invalid_cost_price`, `invalid_sale_price`, `invalid_mrp`, `invalid_expiry_date`, `expiry_required`
+  (`track_expiry` product with `qty > 0`), `batch_required` (setting `inventory.require_batch`), `invalid_category`,
+  `invalid_unit`, `invalid_tax_rate`, `barcode_deleted` (the code belongs to a soft-deleted product), `forbidden`,
+  `conflict`, `internal_error`, `stock_failed`.
+* The same barcode twice in one request is merged: the first line creates, later ones add stock with
+  `note: "duplicate_barcode_merged"`.
+* Stock: `mode: "purchase"` with a `supplier_id` creates **one purchase order + one goods receipt** for every line with
+  `qty > 0` (FIFO layers with cost, batch, expiry; the supplier payable via the normal GRN path). Otherwise **one
+  `opening_balance` stock adjustment**. Both use the existing services; stock is posted at product level (like product
+  import). If posting fails after the products were saved (not expected, every line was validated) the products stay and the
+  stock lines come back as `stock_failed` with their `product_id`; re-scan them (with a new Idempotency-Key) and the codes
+  match the existing products, so only stock is added.
+* Audit: one `audit_logs` row per request (`new_values.event = "quick_add"`: actor, mode, supplier, branch, counts, created
+  product ids, purchase/receipt/adjustment ids); the created products, prices and documents keep their usual audit rows.
+* Sync: everything is stamped by the normal triggers, so created products, variations, barcodes and price-list items arrive
+  in `/sync/pull` and `/sync/snapshot`.
+
+**Settings** (`GET/PUT /settings`; `settings.manage` to write, readable by POS roles; audited like the tax settings with
+before/after/actor; business-wide only; included in the sync `settings` entity as `app_settings`):
+
+| Key | Values | Default |
+|---|---|---|
+| `pricing.default_margin_percent` | number 0 to 1000 | `15` |
+| `pricing.suggested_price_rounding` | `none`, `nearest_1`, `nearest_5`, `nearest_10` | `nearest_1` |
+| `quick_add.ask_cost` | bool | `true` |
+| `quick_add.ask_expiry` | bool | follows the business type: `true` for pharmacies, else `false` |
+| `inventory.require_batch` | bool (extra key for "batch required if a business setting requires it") | `false` |
+
+The client suggests `sale = cost × (1 + margin/100)`, rounded by `suggested_price_rounding`; the server never applies it.
+
+**Products needing attention.** `GET /products?needs_attention=true|false` (combines with `search`, `category_id`, paging).
+Every product in the list and detail responses carries `"needs_attention": true` and `"missing": ["category", "image", "price"]`
+(any subset; `price` = no live default-price-list item above 0). Also new on products: `pack_size`, `mrp`.
+
+Tests: `tests/unit/test_barcode_utils.py`, `tests/integration/quick_add/`.
 
 ### Image upload
 

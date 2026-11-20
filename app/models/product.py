@@ -189,6 +189,9 @@ class Product(Base, AuditMixin, SoftDeleteMixin, SyncMixin):
     track_expiry: Mapped[bool] = mapped_column(
         Boolean, nullable=False, default=False, server_default="false"
     )
+    # Display-only catalog facts (migration 029): pack size text and printed max retail price.
+    pack_size: Mapped[str | None] = mapped_column(String(50), nullable=True)
+    mrp: Mapped[Decimal | None] = mapped_column(Numeric(15, 2), nullable=True)
     product_type: Mapped[str] = mapped_column(product_type_enum, nullable=False)
     tracking_type: Mapped[str] = mapped_column(tracking_type_enum, nullable=False)
     is_sellable: Mapped[bool] = mapped_column(Boolean, nullable=False, default=True)

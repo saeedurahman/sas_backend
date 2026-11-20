@@ -1,12 +1,20 @@
 from uuid import UUID
 
-from fastapi import APIRouter, Depends, HTTPException, Query, status
+from fastapi import APIRouter, Depends, HTTPException, Query, Request, status
 
+from app.core.config import settings
+from app.core.idempotency import run_idempotent
+from app.core.rate_limit import enforce_rate_limit
 from app.database import get_db
-from app.branch_scope import assert_branch_access
-from app.dependencies import _user_permission_keys, require_permission
+from app.branch_scope import (
+    assert_branch_access,
+    effective_branch,
+    guard_body_branches,
+)
+from app.dependencies import _user_permission_keys, allowed_branch_ids, require_permission
 from app.models.user import User
 from app.schemas.auth import MessageResponse
+from app.schemas.quick_add import ProductLookupResponse, QuickAddRequest, QuickAddResponse
 from app.schemas.product import (
     BarcodeResponse,
     CreateBarcodeRequest,
@@ -24,6 +32,7 @@ from app.services.product_import_service import (
     import_products,
     resolve_import_branch,
 )
+from app.services.quick_add_service import lookup_barcode, run_quick_add
 from app.services.product_service import (
     add_barcode,
     add_variation,
@@ -78,6 +87,10 @@ async def list_products(
     brand_id: UUID | None = Query(default=None),
     is_active: bool | None = Query(default=None),
     search: str | None = Query(default=None),
+    needs_attention: bool | None = Query(
+        default=None,
+        description="true = only products missing a category, an image or a sale price; false = the complete ones",
+    ),
     skip: int = Query(default=0, ge=0),
     limit: int = Query(default=50, le=200),
     current_user: User = Depends(require_permission("products.view")),
@@ -92,12 +105,105 @@ async def list_products(
         search,
         skip,
         limit,
+        needs_attention,
     )
     return PaginatedProductResponse(
         total=total,
         skip=skip,
         limit=limit,
         items=[ProductListResponse.model_validate(p) for p in products],
+    )
+
+
+@router.get(
+    "/lookup",
+    response_model=ProductLookupResponse,
+    status_code=status.HTTP_200_OK,
+)
+async def lookup_product_by_barcode(
+    barcode: str = Query(min_length=1, max_length=100),
+    branch_id: UUID | None = Query(default=None),
+    current_user: User = Depends(require_permission("products.view")),
+    db=Depends(get_db),
+):
+    """Scan lookup: normalizes the barcode and returns this business's product (or ``found: false``).
+
+    ``stock_on_hand`` is the given branch's; without ``branch_id`` it sums the branches you can access.
+    """
+    if branch_id is not None:
+        assert_branch_access(current_user, branch_id)
+        branch_ids: list[UUID] | None = [branch_id]
+    else:
+        allowed = allowed_branch_ids(current_user)
+        branch_ids = None if allowed is None else sorted(allowed, key=str)
+    return await lookup_barcode(db, current_user.business_id, barcode, branch_ids)
+
+
+@router.post(
+    "/quick-add",
+    response_model=QuickAddResponse,
+    status_code=status.HTTP_200_OK,
+    dependencies=[Depends(guard_body_branches)],
+)
+async def quick_add_endpoint(
+    request: Request,
+    data: QuickAddRequest,
+    current_user: User = Depends(require_permission("products.create")),
+    db=Depends(get_db),
+):
+    """Add many products (and their opening / purchased stock) from a scan session.
+
+    Each line succeeds or fails on its own (``lines[].status``); the response is always 200 once the
+    request itself is valid. Honours ``Idempotency-Key``.
+    """
+    keys = _user_permission_keys(current_user)
+    purchase = data.mode == "purchase" and data.supplier_id is not None
+    needed = (
+        ("inventory.purchase_orders.create", "inventory.purchase_orders.receive")
+        if purchase
+        else ("inventory.adjust",)
+    )
+    for key in needed:
+        if key not in keys:
+            raise HTTPException(
+                status_code=status.HTTP_403_FORBIDDEN, detail=f"Permission required: {key}"
+            )
+    enforce_rate_limit("quick-add", str(current_user.id), settings.rate_limit_quick_add_user)
+    declared = request.headers.get("content-length")
+    if declared and declared.isdigit() and int(declared) > settings.quick_add_max_body_bytes:
+        raise HTTPException(
+            status_code=status.HTTP_413_REQUEST_ENTITY_TOO_LARGE,
+            detail=f"Request body is larger than {settings.quick_add_max_body_bytes} bytes",
+        )
+    if len(data.lines) > settings.quick_add_max_lines:
+        raise HTTPException(
+            status_code=status.HTTP_413_REQUEST_ENTITY_TOO_LARGE,
+            detail=f"At most {settings.quick_add_max_lines} lines per request",
+        )
+    branch_id = effective_branch(current_user, data.branch_id)
+    if branch_id is None:
+        branch_id = await resolve_import_branch(db, current_user.business_id, None)
+    if branch_id is None:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="branch_id is required: this business has more than one branch",
+        )
+    can_update_prices = "products.update" in keys
+    return await run_idempotent(
+        request,
+        business_id=current_user.business_id,
+        user_id=current_user.id,
+        body=data,
+        response_model=QuickAddResponse,
+        success_status=200,
+        handler=lambda: run_quick_add(
+            db,
+            current_user.business_id,
+            current_user.id,
+            data,
+            branch_id=branch_id,
+            can_update_prices=can_update_prices,
+        ),
     )
 
 

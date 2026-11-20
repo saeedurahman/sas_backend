@@ -208,6 +208,14 @@ class Settings(BaseSettings):
     price_bulk_max_items: int = Field(
         default=2000, ge=1, validation_alias="PRICE_BULK_MAX_ITEMS"
     )
+    # POST /products/quick-add: lines per request, request body cap and per-user rate limit.
+    quick_add_max_lines: int = Field(default=300, ge=1, validation_alias="QUICK_ADD_MAX_LINES")
+    quick_add_max_body_bytes: int = Field(
+        default=1024 * 1024, ge=1024, validation_alias="QUICK_ADD_MAX_BODY_BYTES"
+    )
+    rate_limit_quick_add_user: str = Field(
+        default="30/minute", validation_alias="RATE_LIMIT_QUICK_ADD_USER"
+    )
     # Analytics date range cap in days (Phase 6a).
     analytics_max_range_days: int = Field(
         default=400, ge=1, validation_alias="ANALYTICS_MAX_RANGE_DAYS"

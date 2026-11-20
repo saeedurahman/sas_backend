@@ -5,7 +5,7 @@ from datetime import datetime, timezone
 from uuid import UUID
 
 from fastapi import HTTPException, status
-from sqlalchemy import func, or_, select
+from sqlalchemy import exists, func, or_, select
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.orm import noload, selectinload
@@ -14,6 +14,7 @@ from app.models.product import (
     Barcode,
     Brand,
     Category,
+    PriceList,
     PriceListItem,
     Product,
     ProductLocation,
@@ -22,6 +23,7 @@ from app.models.product import (
 )
 from app.models.sales import TaxRate
 from app.services.audit_helper import log_audit
+from app.services.barcode_utils import match_candidates, normalize_barcode
 from app.schemas.product import (
     CreateBarcodeRequest,
     CreateProductRequest,
@@ -148,12 +150,15 @@ async def _check_barcode_unique(
     business_id: UUID,
     barcode_value: str,
 ) -> None:
+    # Any spelling of the same item counts (UPC-A 12 / EAN-13 / GTIN-14, see barcode_utils).
     result = await db.execute(
-        select(Barcode.id).where(
+        select(Barcode.id)
+        .where(
             Barcode.business_id == business_id,
-            Barcode.barcode == barcode_value,
+            Barcode.barcode.in_(match_candidates(barcode_value)),
             Barcode.deleted_at.is_(None),
         )
+        .limit(1)
     )
     if result.scalar_one_or_none() is not None:
         raise HTTPException(
@@ -219,6 +224,56 @@ async def _verify_unit(
         )
 
 
+def _has_sale_price():
+    """EXISTS: a live default-price-list item above 0 for the product."""
+    return exists().where(
+        PriceListItem.business_id == Product.business_id,
+        PriceListItem.product_id == Product.id,
+        PriceListItem.deleted_at.is_(None),
+        PriceListItem.unit_price > 0,
+        PriceListItem.price_list_id.in_(
+            select(PriceList.id).where(
+                PriceList.business_id == Product.business_id,
+                PriceList.is_default.is_(True),
+                PriceList.deleted_at.is_(None),
+            )
+        ),
+    )
+
+
+def _missing_image_clause():
+    return func.coalesce(func.btrim(Product.image_url), "") == ""
+
+
+def needs_attention_clause():
+    """Products still to finish after a fast scan session: no category, no image or no price."""
+    return or_(Product.category_id.is_(None), _missing_image_clause(), ~_has_sale_price())
+
+
+async def attach_attention(db: AsyncSession, products: list[Product]) -> None:
+    """Set the read-only ``needs_attention`` / ``missing`` used by the product responses."""
+    if not products:
+        return
+    ids = [p.id for p in products]
+    priced = set(
+        (
+            await db.execute(
+                select(Product.id).where(Product.id.in_(ids), _has_sale_price())
+            )
+        ).scalars()
+    )
+    for p in products:
+        missing: list[str] = []
+        if p.category_id is None:
+            missing.append("category")
+        if not (p.image_url or "").strip():
+            missing.append("image")
+        if p.id not in priced:
+            missing.append("price")
+        p.missing = missing
+        p.needs_attention = bool(missing)
+
+
 async def get_products(
     db: AsyncSession,
     business_id: UUID,
@@ -228,6 +283,7 @@ async def get_products(
     search: str | None = None,
     skip: int = 0,
     limit: int = 50,
+    needs_attention: bool | None = None,
 ) -> tuple[list[Product], int]:
     filters = [
         Product.business_id == business_id,
@@ -242,6 +298,10 @@ async def get_products(
     if search:
         pattern = f"%{search}%"
         filters.append(or_(Product.name.ilike(pattern), Product.sku.ilike(pattern)))
+    if needs_attention is True:
+        filters.append(needs_attention_clause())
+    elif needs_attention is False:
+        filters.append(~needs_attention_clause())
 
     count_result = await db.execute(
         select(func.count()).select_from(Product).where(*filters)
@@ -256,7 +316,9 @@ async def get_products(
         .offset(skip)
         .limit(limit)
     )
-    return list(result.scalars().unique().all()), total
+    products = list(result.scalars().unique().all())
+    await attach_attention(db, products)
+    return products, total
 
 
 async def get_product_by_id(
@@ -282,6 +344,7 @@ async def get_product_by_id(
             detail="Product not found",
         )
     await attach_tax_info(db, product)
+    await attach_attention(db, [product])
     return product
 
 
@@ -396,7 +459,9 @@ async def _create_inline_barcodes(
         return
 
     values = [b.barcode for b, _ in entries]
-    if len(set(values)) != len(values):
+    # Two spellings of one item in the same request are a duplicate too.
+    keys = [normalize_barcode(v).canonical or v for v in values]
+    if len(set(keys)) != len(keys):
         raise HTTPException(
             status_code=status.HTTP_400_BAD_REQUEST,
             detail="Duplicate barcode in request",
@@ -425,75 +490,98 @@ async def _create_inline_barcodes(
         )
 
 
+async def create_product_in_session(
+    db: AsyncSession,
+    business_id: UUID,
+    data: CreateProductRequest,
+    created_by: UUID,
+    *,
+    now: datetime | None = None,
+) -> Product:
+    """Validate and add a product, its variations and barcodes to the session.
+
+    Flushes but never commits or rolls back: the caller owns the transaction (``create_product``
+    commits it; Quick Add runs one call per line inside its own savepoint). Raises HTTPException
+    for invalid input and lets IntegrityError (a concurrent sku/barcode winner) propagate.
+    """
+    now = now or datetime.now(timezone.utc)
+
+    if data.category_id is not None:
+        await _verify_category(db, data.category_id, business_id)
+    if data.brand_id is not None:
+        await _verify_brand(db, data.brand_id, business_id)
+    if data.base_unit_id is None:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="base_unit_id is required",
+        )
+    unit_result = await db.execute(
+        select(Unit.id).where(
+            Unit.id == data.base_unit_id,
+            Unit.business_id == business_id,
+            Unit.deleted_at.is_(None),
+        )
+    )
+    if unit_result.scalar_one_or_none() is None:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="Unit not found or does not belong to this business",
+        )
+    if data.sku:
+        await _check_sku_unique(db, business_id, data.sku)
+    if data.tax_rate_id is not None:
+        await _verify_tax_rate(db, data.tax_rate_id, business_id)
+
+    product = Product(
+        business_id=business_id,
+        category_id=data.category_id,
+        brand_id=data.brand_id,
+        base_unit_id=data.base_unit_id,
+        name=data.name,
+        sku=data.sku,
+        product_type=data.product_type.value,
+        tracking_type=data.tracking_type.value,
+        is_sellable=data.is_sellable,
+        is_purchasable=data.is_purchasable,
+        is_active=True,
+        description=data.description,
+        image_url=data.image_url,
+        shelf_life_days=data.shelf_life_days,
+        track_expiry=data.track_expiry,
+        name_secondary=data.name_secondary,
+        pack_size=data.pack_size,
+        mrp=data.mrp,
+        is_tax_exempt=data.is_tax_exempt,
+        tax_rate_id=data.tax_rate_id,
+        min_stock_level=data.min_stock_level,
+        max_stock_level=data.max_stock_level,
+        created_by=created_by,
+        created_at=now,
+        updated_at=now,
+    )
+    db.add(product)
+    await db.flush()
+
+    created_variations = await _create_variations(db, product, data.variations, created_by, now)
+    await _create_inline_barcodes(
+        db, product, data.barcodes, created_variations, created_by, now
+    )
+    await db.flush()
+    # Callers (Quick Add) need the default variation id without another query.
+    product.default_variation_id = next(
+        (v.id for v, _ in created_variations if v.is_default), created_variations[0][0].id
+    )
+    return product
+
+
 async def create_product(
     db: AsyncSession,
     business_id: UUID,
     data: CreateProductRequest,
     created_by: UUID,
 ) -> Product:
-    now = datetime.now(timezone.utc)
-
     try:
-        if data.category_id is not None:
-            await _verify_category(db, data.category_id, business_id)
-        if data.brand_id is not None:
-            await _verify_brand(db, data.brand_id, business_id)
-        if data.base_unit_id is None:
-            raise HTTPException(
-                status_code=status.HTTP_400_BAD_REQUEST,
-                detail="base_unit_id is required",
-            )
-        unit_result = await db.execute(
-            select(Unit.id).where(
-                Unit.id == data.base_unit_id,
-                Unit.business_id == business_id,
-                Unit.deleted_at.is_(None),
-            )
-        )
-        if unit_result.scalar_one_or_none() is None:
-            raise HTTPException(
-                status_code=status.HTTP_400_BAD_REQUEST,
-                detail="Unit not found or does not belong to this business",
-            )
-        if data.sku:
-            await _check_sku_unique(db, business_id, data.sku)
-        if data.tax_rate_id is not None:
-            await _verify_tax_rate(db, data.tax_rate_id, business_id)
-
-        product = Product(
-            business_id=business_id,
-            category_id=data.category_id,
-            brand_id=data.brand_id,
-            base_unit_id=data.base_unit_id,
-            name=data.name,
-            sku=data.sku,
-            product_type=data.product_type.value,
-            tracking_type=data.tracking_type.value,
-            is_sellable=data.is_sellable,
-            is_purchasable=data.is_purchasable,
-            is_active=True,
-            description=data.description,
-            image_url=data.image_url,
-            shelf_life_days=data.shelf_life_days,
-            track_expiry=data.track_expiry,
-            name_secondary=data.name_secondary,
-            is_tax_exempt=data.is_tax_exempt,
-            tax_rate_id=data.tax_rate_id,
-            min_stock_level=data.min_stock_level,
-            max_stock_level=data.max_stock_level,
-            created_by=created_by,
-            created_at=now,
-            updated_at=now,
-        )
-        db.add(product)
-        await db.flush()
-
-        created_variations = await _create_variations(
-            db, product, data.variations, created_by, now
-        )
-        await _create_inline_barcodes(
-            db, product, data.barcodes, created_variations, created_by, now
-        )
+        product = await create_product_in_session(db, business_id, data, created_by)
         await db.commit()
     except HTTPException:
         await db.rollback()
@@ -549,6 +637,10 @@ async def update_product(
         product.track_expiry = data.track_expiry
     if "name_secondary" in data.model_fields_set:
         product.name_secondary = data.name_secondary or None
+    if "pack_size" in data.model_fields_set:
+        product.pack_size = data.pack_size or None
+    if "mrp" in data.model_fields_set:
+        product.mrp = data.mrp
     tax_before = {
         "tax_rate_id": str(product.tax_rate_id) if product.tax_rate_id else None,
         "is_tax_exempt": product.is_tax_exempt,
@@ -756,14 +848,19 @@ async def search_by_barcode(
     business_id: UUID,
     barcode_value: str,
 ) -> Product:
+    # Exact spelling first, then equivalent forms (UPC-A <-> EAN-13 <-> GTIN-14 ...).
+    candidates = match_candidates(barcode_value, lookup=True)
     result = await db.execute(
-        select(Barcode).where(
-            Barcode.barcode == barcode_value,
+        select(Barcode)
+        .where(
+            Barcode.barcode.in_(candidates),
             Barcode.business_id == business_id,
             Barcode.deleted_at.is_(None),
         )
+        .options(*_barcode_options())
     )
-    barcode = result.scalar_one_or_none()
+    hits = {b.barcode: b for b in result.scalars().all()}
+    barcode = next((hits[c] for c in candidates if c in hits), None)
     if barcode is None:
         raise HTTPException(
             status_code=status.HTTP_404_NOT_FOUND,

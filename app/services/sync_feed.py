@@ -34,7 +34,7 @@ from app.dependencies import (
     user_roles_for_response,
 )
 from app.models.user import Role, RolePermission, User, UserRole
-from app.services import receipt_settings, subscription as sub
+from app.services import quick_add_settings, receipt_settings, subscription as sub
 from app.services.tax_settings import load_tax_settings
 
 DEFAULT_LIMIT = 500
@@ -384,6 +384,8 @@ async def _materialise(
 
             tax_cfg = await load_tax_settings(db, user.business_id)
             number_cfg = {**receipt_settings.DEFAULTS, **extra_settings}
+            # pricing.* / quick_add.* (ask_expiry defaults by business type), so offline devices match.
+            number_cfg.update(await quick_add_settings.load_settings(db, user.business_id))
             built[row["id"]] = {
                 # tax.* and ui.hide_zero_decimals so offline devices price like the server.
                 "app_settings": {**tax_cfg.as_settings_map(), **number_cfg},

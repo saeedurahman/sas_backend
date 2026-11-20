@@ -258,6 +258,76 @@ async def _verify_product(
         )
 
 
+async def upsert_price_item(
+    db: AsyncSession,
+    business_id: UUID,
+    price_list_id: UUID,
+    product_id: UUID,
+    variation_id: UUID | None,
+    unit_price: Decimal,
+    min_qty: Decimal,
+    actor: UUID,
+) -> PriceListItem:
+    """Create / revive / update one price-list item and audit it. Flushes, never commits."""
+    now = datetime.now(timezone.utc)
+    stmt = select(PriceListItem).where(
+        PriceListItem.price_list_id == price_list_id,
+        PriceListItem.product_id == product_id,
+        PriceListItem.business_id == business_id,
+        PriceListItem.min_qty == min_qty,
+    )
+    if variation_id is None:
+        stmt = stmt.where(PriceListItem.variation_id.is_(None))
+    else:
+        stmt = stmt.where(PriceListItem.variation_id == variation_id)
+
+    # Soft-deleted rows still hold the unique key: revive one instead of inserting a twin.
+    result = await db.execute(stmt.order_by(PriceListItem.deleted_at.is_(None).desc()))
+    item = result.scalars().first()
+
+    old_price = item.unit_price if item is not None and item.deleted_at is None else None
+    if item is not None:
+        item.unit_price = unit_price
+        item.min_qty = min_qty
+        item.deleted_at = None
+        item.deleted_by = None
+        item.updated_by = actor
+        item.updated_at = now
+    else:
+        item = PriceListItem(
+            business_id=business_id,
+            price_list_id=price_list_id,
+            product_id=product_id,
+            variation_id=variation_id,
+            unit_price=unit_price,
+            min_qty=min_qty,
+            created_by=actor,
+            created_at=now,
+            updated_at=now,
+        )
+        db.add(item)
+    await db.flush()
+
+    await log_audit(
+        db,
+        business_id=business_id,
+        user_id=actor,
+        branch_id=None,  # price lists are business-wide
+        action="update" if old_price is not None else "create",
+        table_name="price_list_items",
+        record_id=item.id,
+        old_values=None if old_price is None else {"unit_price": str(old_price)},
+        new_values={
+            "price_list_id": str(price_list_id),
+            "product_id": str(product_id),
+            "variation_id": str(variation_id) if variation_id else None,
+            "unit_price": str(unit_price),
+            "min_qty": str(min_qty),
+        },
+    )
+    return item
+
+
 async def set_price(
     db: AsyncSession,
     price_list_id: UUID,
@@ -274,61 +344,9 @@ async def set_price(
             detail="Price cannot be negative",
         )
 
-    now = datetime.now(timezone.utc)
-    stmt = select(PriceListItem).where(
-        PriceListItem.price_list_id == price_list_id,
-        PriceListItem.product_id == data.product_id,
-        PriceListItem.business_id == business_id,
-        PriceListItem.min_qty == data.min_qty,
-    )
-    if data.variation_id is None:
-        stmt = stmt.where(PriceListItem.variation_id.is_(None))
-    else:
-        stmt = stmt.where(PriceListItem.variation_id == data.variation_id)
-
-    # Soft-deleted rows still hold the unique key: revive one instead of inserting a twin.
-    result = await db.execute(stmt.order_by(PriceListItem.deleted_at.is_(None).desc()))
-    item = result.scalars().first()
-
-    old_price = item.unit_price if item is not None and item.deleted_at is None else None
-    if item is not None:
-        item.unit_price = data.unit_price
-        item.min_qty = data.min_qty
-        item.deleted_at = None
-        item.deleted_by = None
-        item.updated_by = created_by
-        item.updated_at = now
-    else:
-        item = PriceListItem(
-            business_id=business_id,
-            price_list_id=price_list_id,
-            product_id=data.product_id,
-            variation_id=data.variation_id,
-            unit_price=data.unit_price,
-            min_qty=data.min_qty,
-            created_by=created_by,
-            created_at=now,
-            updated_at=now,
-        )
-        db.add(item)
-        await db.flush()
-
-    await log_audit(
-        db,
-        business_id=business_id,
-        user_id=created_by,
-        branch_id=None,  # price lists are business-wide
-        action="update" if old_price is not None else "create",
-        table_name="price_list_items",
-        record_id=item.id,
-        old_values=None if old_price is None else {"unit_price": str(old_price)},
-        new_values={
-            "price_list_id": str(price_list_id),
-            "product_id": str(data.product_id),
-            "variation_id": str(data.variation_id) if data.variation_id else None,
-            "unit_price": str(data.unit_price),
-            "min_qty": str(data.min_qty),
-        },
+    item = await upsert_price_item(
+        db, business_id, price_list_id, data.product_id, data.variation_id,
+        data.unit_price, data.min_qty, created_by,
     )
     await db.commit()
     await db.refresh(item)

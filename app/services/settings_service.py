@@ -11,7 +11,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from app.models.sales import TaxRate
 from app.models.settings import AppSetting
 from app.schemas.settings import BulkUpsertSettingsRequest, UpsertSettingRequest
-from app.services import receipt_settings, tax_settings
+from app.services import quick_add_settings, receipt_settings, tax_settings
 from app.services.audit_helper import log_audit
 from app.services.stock_service import verify_branch
 
@@ -54,7 +54,7 @@ NOTIFICATION_SETTINGS = {
 
 # Keys any signed-in POS user may read without settings.view (receipt printing,
 # tax display, POS behaviour). Everything else needs settings.view.
-POS_READABLE_PREFIXES = ("receipt.", "tax.")
+POS_READABLE_PREFIXES = ("receipt.", "tax.", "pricing.", "quick_add.")
 POS_READABLE_SETTINGS = BUSINESS_SETTINGS | SALE_SETTINGS | {"ui.hide_zero_decimals"}
 
 
@@ -203,6 +203,15 @@ async def _upsert_one(
             )
         value = receipt_settings.validate_setting_payload(key, value)
 
+    is_quick_key = key in quick_add_settings.SETTING_KEYS
+    if is_quick_key:
+        if item.branch_id is not None:
+            raise HTTPException(
+                status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+                detail=f"{key} is a business-wide setting and cannot be set per branch",
+            )
+        value = quick_add_settings.validate_setting_payload(key, value)
+
     now = _now()
     result = await db.execute(
         select(AppSetting).where(
@@ -256,6 +265,27 @@ async def _upsert_one(
                     "applies_to": "new_sales_only",
                 },
             )
+    if is_quick_key:
+        defaults = await quick_add_settings.effective_defaults(db, business_id)
+        before = quick_add_settings.effective_value(key, old_stored, defaults)
+        after = quick_add_settings.effective_value(key, value, defaults)
+        if before != after:
+            await log_audit(
+                db,
+                business_id=business_id,
+                user_id=updated_by,
+                branch_id=None,
+                action="update",
+                table_name="app_settings",
+                record_id=row.id,
+                old_values={"setting_key": key, "value": before},
+                new_values={
+                    "event": "quick_add_setting_changed",
+                    "setting_key": key,
+                    "value": after,
+                    "changed_by": str(updated_by),
+                },
+            )
     return row
 
 
@@ -289,9 +319,15 @@ async def bulk_upsert_settings(
 
 
 def with_tax_defaults(
-    rows: list[AppSetting], business_id: UUID
+    rows: list[AppSetting],
+    business_id: UUID,
+    quick_add_defaults: dict[str, Any] | None = None,
 ) -> list[dict[str, Any]]:
-    """Setting rows as response dicts, plus the tax/ui keys that have no row yet."""
+    """Setting rows as response dicts, plus the tax/ui/receipt/quick-add keys that have no row yet.
+
+    ``quick_add_defaults`` carries the business-type aware defaults (``quick_add.ask_expiry``);
+    without it the static defaults are used.
+    """
     out: list[dict[str, Any]] = [
         {
             "id": r.id,
@@ -305,7 +341,11 @@ def with_tax_defaults(
     ]
     present = {r.setting_key for r in rows}
     epoch = datetime(1970, 1, 1, tzinfo=timezone.utc)
-    for key, default in {**tax_settings.DEFAULTS, **receipt_settings.DEFAULTS}.items():
+    for key, default in {
+        **tax_settings.DEFAULTS,
+        **receipt_settings.DEFAULTS,
+        **(quick_add_defaults or quick_add_settings.DEFAULTS),
+    }.items():
         if key in present:
             continue
         out.append(

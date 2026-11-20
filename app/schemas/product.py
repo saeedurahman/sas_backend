@@ -131,6 +131,8 @@ class CreateProductRequest(BaseSchema):
     shelf_life_days: int | None = None
     track_expiry: bool = False
     name_secondary: str | None = Field(default=None, max_length=255)
+    pack_size: str | None = Field(default=None, max_length=50)
+    mrp: Decimal | None = Field(default=None, ge=0, max_digits=15, decimal_places=2)
     min_stock_level: Decimal | None = None
     max_stock_level: Decimal | None = None
     variations: list[CreateVariationRequest] = Field(
@@ -165,6 +167,8 @@ class UpdateProductRequest(BaseSchema):
     shelf_life_days: int | None = None
     track_expiry: bool | None = None
     name_secondary: str | None = Field(default=None, max_length=255)
+    pack_size: str | None = Field(default=None, max_length=50)
+    mrp: Decimal | None = Field(default=None, ge=0, max_digits=15, decimal_places=2)
     min_stock_level: Decimal | None = None
     max_stock_level: Decimal | None = None
 
@@ -363,6 +367,9 @@ class ProductListResponse(BaseSchema):
     image_url: str | None = None
     tax_rate_id: UUID | None = None
     is_tax_exempt: bool = False
+    # Quick Add follow-up: true while the category, image or a sale price above 0 is missing.
+    needs_attention: bool = False
+    missing: list[str] = Field(default_factory=list)  # subset of ["category", "image", "price"]
 
 
 class PaginatedProductResponse(BaseSchema):
@@ -392,6 +399,10 @@ class ProductResponse(ProductAuditSchema):
     shelf_life_days: int | None
     track_expiry: bool = False
     name_secondary: str | None = None
+    pack_size: str | None = None
+    mrp: Decimal | None = None
+    needs_attention: bool = False
+    missing: list[str] = Field(default_factory=list)
     min_stock_level: Decimal | None
     max_stock_level: Decimal | None
     category: CategoryBrief | None = None

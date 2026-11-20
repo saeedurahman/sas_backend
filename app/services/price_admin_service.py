@@ -20,6 +20,7 @@ from app.core.config import settings
 from app.models.product import Barcode, PriceList, PriceListItem, Product, ProductVariation
 from app.models.sales import Customer
 from app.services.audit_helper import log_audit
+from app.services.barcode_utils import barcode_forms, match_candidates
 from app.services.import_common import (
     ImportRequest,
     RowResult,
@@ -536,7 +537,8 @@ async def import_prices(
     rows, unknown = parse_table(body.csv, body.rows, PRICE_IMPORT_ALIASES)
 
     skus = {r.values["sku"] for r in rows if r.values.get("sku")}
-    barcodes = {r.values["barcode"] for r in rows if r.values.get("barcode")}
+    # Any spelling of a barcode matches (UPC-A 12 / EAN-13 / GTIN-14, see barcode_utils).
+    barcodes = {c for r in rows if r.values.get("barcode") for c in match_candidates(r.values["barcode"])}
     by_sku: dict[str, tuple[UUID, UUID | None, str]] = {}
     if skus:
         for p in (
@@ -576,7 +578,9 @@ async def import_prices(
                 )
             )
         ).all():
-            by_barcode[b.barcode] = (b.product_id, b.variation_id, b.name)
+            entry = (b.product_id, b.variation_id, b.name)
+            for spelling in (b.barcode, *barcode_forms(b.barcode)):
+                by_barcode.setdefault(spelling, entry)
 
     existing_rows = (
         await db.execute(
@@ -600,7 +604,11 @@ async def import_prices(
             result.error("sku or barcode is required")
             continue
         hit = by_sku.get(v["sku"]) if v.get("sku") else None
-        hit_bc = by_barcode.get(v["barcode"]) if v.get("barcode") else None
+        hit_bc = (
+            next((by_barcode[c] for c in match_candidates(v["barcode"]) if c in by_barcode), None)
+            if v.get("barcode")
+            else None
+        )
         if v.get("sku") and hit is None:
             result.error(f"unknown sku '{v['sku']}'")
         if v.get("barcode") and hit_bc is None:
